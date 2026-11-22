@@ -1,0 +1,22 @@
+[package]
+name = "slskr-web"
+description = "slskr web UI (Leptos, client-side rendered)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+slskr-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { workspace = true, features = ["clock", "wasmbind"] }
+leptos = { version = "0.8", features = ["csr"] }
+leptos_router = "0.8"
+# Must match the wasm-bindgen-cli version shipped by nixpkgs (see flake.nix).
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlInputElement", "HtmlTextAreaElement", "Storage", "WebSocket", "MessageEvent", "CloseEvent", "ErrorEvent", "MediaQueryList", "Location", "DomTokenList", "KeyboardEvent", "Event", "EventTarget", "Headers", "Request", "RequestInit", "Response", "Url", "BinaryType", "Blob", "File", "FileList", "Navigator", "Clipboard", "ScrollIntoViewOptions", "ScrollBehavior"] }
+gloo-net = { version = "0.7", default-features = false, features = ["http", "json"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+console_error_panic_hook = "0.1"

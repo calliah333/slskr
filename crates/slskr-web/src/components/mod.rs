@@ -1,0 +1,11 @@
+pub mod app;
+mod app_footer;
+pub mod browse;
+pub mod chat;
+pub mod dashboard;
+mod login_form;
+pub mod rooms;
+pub mod search;
+pub mod system;
+pub mod transfers;
+pub mod users;

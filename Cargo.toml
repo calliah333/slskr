@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/soulseek", "crates/slskr-api", "crates/slskr", "crates/slskr-web"]
+default-members = ["crates/soulseek", "crates/slskr-api", "crates/slskr"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.88"
+
+[workspace.dependencies]
+soulseek = { path = "crates/soulseek" }
+slskr-api = { path = "crates/slskr-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+
+[profile.release]
+lto = "thin"
+
+[profile.release.package.slskr-web]
+opt-level = "z"
