@@ -38,8 +38,6 @@ pub struct Options {
     #[serde(skip)]
     pub show_environment_variables: bool,
     #[serde(skip)]
-    pub generate_certificate: bool,
-    #[serde(skip)]
     pub generate_secret: bool,
     pub debug: bool,
     pub headless: bool,
@@ -51,7 +49,6 @@ pub struct Options {
     pub app_directory: String,
     #[serde(skip)]
     pub configuration_file: String,
-    pub relay: RelayOptions,
     /// Obsolete; non-null is a validation error in slskd.
     pub permissions: Option<serde_json::Value>,
     pub directories: DirectoriesOptions,
@@ -71,9 +68,6 @@ pub struct Options {
     pub metrics: MetricsOptions,
     pub feature: FeatureOptions,
     pub soulseek: SoulseekOptions,
-    /// Obsolete (renamed `integrations`).
-    pub integration: Option<serde_json::Value>,
-    pub integrations: IntegrationsOptions,
 }
 
 impl Default for Options {
@@ -82,7 +76,6 @@ impl Default for Options {
             show_version: false,
             show_help: false,
             show_environment_variables: false,
-            generate_certificate: false,
             generate_secret: false,
             debug: false,
             headless: false,
@@ -92,7 +85,6 @@ impl Default for Options {
             flags: FlagsOptions::default(),
             app_directory: String::new(),
             configuration_file: String::new(),
-            relay: RelayOptions::default(),
             permissions: None,
             directories: DirectoriesOptions::default(),
             shares: SharesOptions::default(),
@@ -109,8 +101,6 @@ impl Default for Options {
             metrics: MetricsOptions::default(),
             feature: FeatureOptions::default(),
             soulseek: SoulseekOptions::default(),
-            integration: None,
-            integrations: IntegrationsOptions::default(),
         }
     }
 }
@@ -135,13 +125,6 @@ impl Options {
     pub fn redact(&self) -> Options {
         let mut o = self.clone();
 
-        redact_opt(&mut o.relay.controller.api_key);
-        redact_opt(&mut o.relay.controller.secret);
-        for agent in o.relay.agents.values_mut() {
-            redact_opt(&mut agent.instance_name);
-            redact_opt(&mut agent.secret);
-        }
-
         redact_opt(&mut o.logger.loki);
         redact_str(&mut o.metrics.authentication.password);
 
@@ -155,23 +138,6 @@ impl Options {
         for key in auth.api_keys.values_mut() {
             redact_opt(&mut key.key);
         }
-        redact_opt(&mut o.web.https.certificate.password);
-
-        let integrations = &mut o.integrations;
-        redact_opt(&mut integrations.vpn.gluetun.password);
-        redact_opt(&mut integrations.vpn.gluetun.api_key);
-        for hook in integrations.webhooks.values_mut() {
-            redact_opt(&mut hook.call.url);
-            for header in &mut hook.call.headers {
-                redact_opt(&mut header.value);
-            }
-        }
-        for script in integrations.scripts.values_mut() {
-            redact_opt(&mut script.run.command);
-            redact_opt(&mut script.run.args);
-        }
-        redact_opt(&mut integrations.ftp.password);
-        redact_opt(&mut integrations.pushbullet.access_token);
 
         o
     }
@@ -196,60 +162,7 @@ pub struct FlagsOptions {
     pub volatile: bool,
     pub case_sensitive_reg_ex: bool,
     pub legacy_windows_tcp_keepalive: bool,
-    pub optimistic_relay_file_info: bool,
     pub no_sqlite_pooling: bool,
-}
-
-/// Relay options.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RelayOptions {
-    pub enabled: bool,
-    /// `controller`, `agent` or `debug`.
-    pub mode: String,
-    pub controller: RelayControllerOptions,
-    pub agents: BTreeMap<String, RelayAgentOptions>,
-}
-
-impl Default for RelayOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mode: "controller".to_string(),
-            controller: RelayControllerOptions::default(),
-            agents: BTreeMap::new(),
-        }
-    }
-}
-
-/// Controller connection settings (agent mode).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RelayControllerOptions {
-    pub address: Option<String>,
-    pub ignore_certificate_errors: bool,
-    pub api_key: Option<String>,
-    pub secret: Option<String>,
-    pub downloads: bool,
-}
-
-/// An agent permitted to connect (controller mode).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RelayAgentOptions {
-    pub instance_name: Option<String>,
-    pub secret: Option<String>,
-    pub cidr: String,
-}
-
-impl Default for RelayAgentOptions {
-    fn default() -> Self {
-        Self {
-            instance_name: None,
-            secret: None,
-            cidr: "0.0.0.0/0,::/0".to_string(),
-        }
-    }
 }
 
 /// Download directories.
@@ -763,8 +676,6 @@ impl Default for DistributedNetworkOptions {
 pub struct WebOptions {
     pub port: i32,
     pub ip_address: Option<String>,
-    pub socket: Option<String>,
-    pub https: HttpsOptions,
     pub url_base: String,
     pub content_path: String,
     pub logging: bool,
@@ -776,8 +687,6 @@ impl Default for WebOptions {
         Self {
             port: 5030,
             ip_address: None,
-            socket: None,
-            https: HttpsOptions::default(),
             url_base: "/".to_string(),
             content_path: "wwwroot".to_string(),
             logging: false,
@@ -850,222 +759,6 @@ impl Default for ApiKeyOptions {
     }
 }
 
-/// HTTPS listener.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct HttpsOptions {
-    pub disabled: bool,
-    pub port: i32,
-    pub ip_address: Option<String>,
-    pub force: bool,
-    pub certificate: CertificateOptions,
-}
-
-impl Default for HttpsOptions {
-    fn default() -> Self {
-        Self {
-            disabled: false,
-            port: 5031,
-            ip_address: None,
-            force: false,
-            certificate: CertificateOptions::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CertificateOptions {
-    pub pfx: Option<String>,
-    pub password: Option<String>,
-}
-
-/// Third-party integrations.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct IntegrationsOptions {
-    pub vpn: VpnOptions,
-    pub webhooks: BTreeMap<String, WebhookOptions>,
-    pub scripts: BTreeMap<String, ScriptOptions>,
-    pub ftp: FtpOptions,
-    pub pushbullet: PushbulletOptions,
-}
-
-/// VPN integration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VpnOptions {
-    pub enabled: bool,
-    pub port_forwarding: bool,
-    pub polling_interval: i32,
-    pub gluetun: GluetunVpnOptions,
-}
-
-impl Default for VpnOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            port_forwarding: false,
-            polling_interval: 2500,
-            gluetun: GluetunVpnOptions::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct GluetunVpnOptions {
-    pub version: i32,
-    pub url: Option<String>,
-    pub timeout: i32,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub api_key: Option<String>,
-}
-
-impl Default for GluetunVpnOptions {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            url: None,
-            timeout: 1000,
-            username: None,
-            password: None,
-            api_key: None,
-        }
-    }
-}
-
-/// A webhook.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct WebhookOptions {
-    /// Event type names.
-    pub on: Vec<String>,
-    pub call: WebhookHttpOptions,
-    pub timeout: i32,
-    pub retry: WebhookRetryOptions,
-}
-
-impl Default for WebhookOptions {
-    fn default() -> Self {
-        Self {
-            on: Vec::new(),
-            call: WebhookHttpOptions::default(),
-            timeout: 5000,
-            retry: WebhookRetryOptions::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct WebhookHttpOptions {
-    pub url: Option<String>,
-    pub headers: Vec<WebhookHttpHeader>,
-    pub ignore_certificate_errors: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct WebhookHttpHeader {
-    pub name: Option<String>,
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct WebhookRetryOptions {
-    pub attempts: i32,
-}
-
-impl Default for WebhookRetryOptions {
-    fn default() -> Self {
-        Self { attempts: 1 }
-    }
-}
-
-/// A script hook.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ScriptOptions {
-    /// Event type names.
-    pub on: Vec<String>,
-    pub run: ScriptRunOptions,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ScriptRunOptions {
-    pub command: Option<String>,
-    pub executable: Option<String>,
-    pub args: Option<String>,
-    pub arglist: Option<Vec<String>>,
-}
-
-/// FTP upload of completed downloads.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct FtpOptions {
-    pub enabled: bool,
-    pub address: Option<String>,
-    pub port: i32,
-    /// `none`, `implicit`, `explicit` or `auto`.
-    pub encryption_mode: String,
-    pub ignore_certificate_errors: bool,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub remote_path: String,
-    pub overwrite_existing: bool,
-    pub connection_timeout: i32,
-    pub retry_attempts: i32,
-}
-
-impl Default for FtpOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: None,
-            port: 21,
-            encryption_mode: "auto".to_string(),
-            ignore_certificate_errors: false,
-            username: None,
-            password: None,
-            remote_path: "/".to_string(),
-            overwrite_existing: true,
-            connection_timeout: 5000,
-            retry_attempts: 3,
-        }
-    }
-}
-
-/// Pushbullet notifications.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PushbulletOptions {
-    pub enabled: bool,
-    pub access_token: Option<String>,
-    pub notification_prefix: String,
-    pub notify_on_private_message: bool,
-    pub notify_on_room_mention: bool,
-    pub retry_attempts: i32,
-    pub cooldown_time: i32,
-}
-
-impl Default for PushbulletOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            access_token: None,
-            notification_prefix: "From slskd:".to_string(),
-            notify_on_private_message: true,
-            notify_on_room_mention: true,
-            retry_attempts: 3,
-            cooldown_time: 900_000,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,10 +788,6 @@ mod tests {
             "${SOURCE_DIRECTORY}"
         );
         assert_eq!(v["throttling"]["search"]["incoming"]["circuitBreaker"], 500);
-        assert_eq!(
-            v["integrations"]["pushbullet"]["notificationPrefix"],
-            "From slskd:"
-        );
     }
 
     #[test]
@@ -1108,7 +797,6 @@ mod tests {
         assert_eq!(o.soulseek.username.as_deref(), Some("u"));
         assert_eq!(o.soulseek.port, 2271);
         assert_eq!(o.web.port, 1);
-        assert_eq!(o.web.https.port, 5031);
     }
 
     #[test]

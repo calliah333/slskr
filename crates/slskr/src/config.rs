@@ -46,7 +46,6 @@ impl OptionsStore {
             std::path::MAIN_SEPARATOR,
         );
         local.web.ip_address = Some("127.0.0.1".to_owned());
-        local.web.https.disabled = true;
         if let Some(content) = std::env::var_os("SLSKR_CONTENT_PATH") {
             local.web.content_path = content.to_string_lossy().into_owned();
         }
@@ -517,11 +516,7 @@ fn normalize(value: Value, named_map: bool) -> Result<Value> {
                     return Err(anyhow!("configuration keys must be strings"));
                 };
                 let key = if named_map { key } else { camel_key(&key) };
-                let names = !named_map
-                    && matches!(
-                        key.as_str(),
-                        "apiKeys" | "agents" | "userDefined" | "webhooks" | "scripts"
-                    );
+                let names = !named_map && matches!(key.as_str(), "apiKeys" | "userDefined");
                 ensure!(
                     output
                         .insert(Value::String(key.clone()), normalize(value, names)?)
@@ -739,54 +734,10 @@ pub(crate) const SOURCES: &[(&str, &str, Option<char>, &str, char)] = &[
         'b',
     ),
     (
-        "OPTIMISTIC_RELAY_FILE_INFO",
-        "optimistic-relay-file-info",
-        None,
-        "flags.optimisticRelayFileInfo",
-        'b',
-    ),
-    (
         "NO_SQLITE_POOLING",
         "no-sqlite-pooling",
         None,
         "flags.noSqlitePooling",
-        'b',
-    ),
-    ("RELAY", "relay", Some('r'), "relay.enabled", 'b'),
-    ("RELAY_MODE", "relay-mode", Some('m'), "relay.mode", 's'),
-    (
-        "CONTROLLER_ADDRESS",
-        "controller-address",
-        None,
-        "relay.controller.address",
-        's',
-    ),
-    (
-        "CONTROLLER_IGNORE_CERTIFICATE_ERRORS",
-        "controller-ignore-certificate-errors",
-        None,
-        "relay.controller.ignoreCertificateErrors",
-        'b',
-    ),
-    (
-        "CONTROLLER_API_KEY",
-        "controller-api-key",
-        None,
-        "relay.controller.apiKey",
-        's',
-    ),
-    (
-        "CONTROLLER_SECRET",
-        "controller-secret",
-        None,
-        "relay.controller.secret",
-        's',
-    ),
-    (
-        "CONTROLLER_DOWNLOADS",
-        "controller-downloads",
-        None,
-        "relay.controller.downloads",
         'b',
     ),
     (
@@ -1113,7 +1064,6 @@ pub(crate) const SOURCES: &[(&str, &str, Option<char>, &str, char)] = &[
         "web.ipAddress",
         's',
     ),
-    ("HTTP_SOCKET", "http-socket", None, "web.socket", 's'),
     ("URL_BASE", "url-base", None, "web.urlBase", 's'),
     ("CONTENT_PATH", "content-path", None, "web.contentPath", 's'),
     ("HTTP_LOGGING", "http-logging", None, "web.logging", 'b'),
@@ -1157,200 +1107,6 @@ pub(crate) const SOURCES: &[(&str, &str, Option<char>, &str, char)] = &[
         "jwt-ttl",
         None,
         "web.authentication.jwt.ttl",
-        'i',
-    ),
-    ("NO_HTTPS", "no-https", None, "web.https.disabled", 'b'),
-    ("HTTPS_PORT", "https-port", Some('L'), "web.https.port", 'i'),
-    (
-        "HTTPS_IP_ADDRESS",
-        "https-ip-address",
-        None,
-        "web.https.ipAddress",
-        's',
-    ),
-    (
-        "HTTPS_FORCE",
-        "force-https",
-        Some('f'),
-        "web.https.force",
-        'b',
-    ),
-    (
-        "HTTPS_CERT_PFX",
-        "https-cert-pfx",
-        None,
-        "web.https.certificate.pfx",
-        's',
-    ),
-    (
-        "HTTPS_CERT_PASSWORD",
-        "https-cert-password",
-        None,
-        "web.https.certificate.password",
-        's',
-    ),
-    ("VPN", "vpn", None, "integrations.vpn.enabled", 'b'),
-    (
-        "VPN_PORT_FORWARDING",
-        "vpn-port-forwarding",
-        None,
-        "integrations.vpn.portForwarding",
-        'b',
-    ),
-    (
-        "VPN_POLLING_INTERVAL",
-        "vpn-polling-interval",
-        None,
-        "integrations.vpn.pollingInterval",
-        'i',
-    ),
-    (
-        "VPN_GLUETUN_URL",
-        "vpn-gluetun-url",
-        None,
-        "integrations.vpn.gluetun.url",
-        's',
-    ),
-    (
-        "VPN_GLUETUN_TIMEOUT",
-        "vpn-gluetun-timeout",
-        None,
-        "integrations.vpn.gluetun.timeout",
-        'i',
-    ),
-    (
-        "VPN_GLUETUN_USERNAME",
-        "vpn-gluetun-username",
-        None,
-        "integrations.vpn.gluetun.username",
-        's',
-    ),
-    (
-        "VPN_GLUETUN_PASSWORD",
-        "vpn-gluetun-password",
-        None,
-        "integrations.vpn.gluetun.password",
-        's',
-    ),
-    (
-        "VPN_GLUETUN_API_KEY",
-        "vpn-gluetun-api-key",
-        None,
-        "integrations.vpn.gluetun.apiKey",
-        's',
-    ),
-    ("FTP", "ftp", None, "integrations.ftp.enabled", 'b'),
-    (
-        "FTP_ADDRESS",
-        "ftp-address",
-        None,
-        "integrations.ftp.address",
-        's',
-    ),
-    ("FTP_PORT", "ftp-port", None, "integrations.ftp.port", 'i'),
-    (
-        "FTP_ENCRYPTION_MODE",
-        "ftp-encryption-mode",
-        None,
-        "integrations.ftp.encryptionMode",
-        's',
-    ),
-    (
-        "FTP_IGNORE_CERTIFICATE_ERRORS",
-        "ftp-ignore-certificate-errors",
-        None,
-        "integrations.ftp.ignoreCertificateErrors",
-        'b',
-    ),
-    (
-        "FTP_USERNAME",
-        "ftp-username",
-        None,
-        "integrations.ftp.username",
-        's',
-    ),
-    (
-        "FTP_PASSWORD",
-        "ftp-password",
-        None,
-        "integrations.ftp.password",
-        's',
-    ),
-    (
-        "FTP_REMOTE_PATH",
-        "ftp-remote-path",
-        None,
-        "integrations.ftp.remotePath",
-        's',
-    ),
-    (
-        "FTP_OVERWRITE_EXISTING",
-        "ftp-overwrite-existing",
-        None,
-        "integrations.ftp.overwriteExisting",
-        'b',
-    ),
-    (
-        "FTP_CONNECTION_TIMEOUT",
-        "ftp-connection-timeout",
-        None,
-        "integrations.ftp.connectionTimeout",
-        'i',
-    ),
-    (
-        "FTP_RETRY_ATTEMPTS",
-        "ftp-retry-attempts",
-        None,
-        "integrations.ftp.retryAttempts",
-        'i',
-    ),
-    (
-        "PUSHBULLET",
-        "pushbullet",
-        None,
-        "integrations.pushbullet.enabled",
-        'b',
-    ),
-    (
-        "PUSHBULLET_ACCESS_TOKEN",
-        "pushbullet-token",
-        None,
-        "integrations.pushbullet.accessToken",
-        's',
-    ),
-    (
-        "PUSHBULLET_NOTIFICATION_PREFIX",
-        "pushbullet-prefix",
-        None,
-        "integrations.pushbullet.notificationPrefix",
-        's',
-    ),
-    (
-        "PUSHBULLET_NOTIFY_ON_PRIVATE_MESSAGE",
-        "pushbullet-notify-on-pm",
-        None,
-        "integrations.pushbullet.notifyOnPrivateMessage",
-        'b',
-    ),
-    (
-        "PUSHBULLET_NOTIFY_ON_ROOM_MENTION",
-        "pushbullet-notify-on-room-mention",
-        None,
-        "integrations.pushbullet.notifyOnRoomMention",
-        'b',
-    ),
-    (
-        "PUSHBULLET_RETRY_ATTEMPTS",
-        "pushbullet-retry-attempts",
-        None,
-        "integrations.pushbullet.retryAttempts",
-        'i',
-    ),
-    (
-        "PUSHBULLET_COOLDOWN_TIME",
-        "pushbullet-cooldown",
-        None,
-        "integrations.pushbullet.cooldownTime",
         'i',
     ),
 ];
@@ -1467,21 +1223,12 @@ fn validate(options: &Options) -> Result<()> {
         ("permissions", options.permissions.is_some()),
         ("global", options.global.is_some()),
         ("groups", options.groups.is_some()),
-        ("integration", options.integration.is_some()),
     ] {
         ensure!(!set, "obsolete configuration section `{obsolete}`");
     }
     let web = &options.web;
     u16::try_from(web.port).context("web.port must be between 0 and 65535")?;
     http_ips(web.ip_address.as_deref())?;
-    if !web.https.disabled {
-        u16::try_from(web.https.port).context("web.https.port must be between 0 and 65535")?;
-        http_ips(web.https.ip_address.as_deref()).context("invalid web.https.ip_address")?;
-    }
-    ensure!(
-        !web.https.force || !web.https.disabled,
-        "forcing HTTPS requires an HTTPS listener"
-    );
     let base = web.url_base.trim_end_matches('/');
     ensure!(
         web.url_base.starts_with('/') && (base.is_empty() || valid_web_path(base)),

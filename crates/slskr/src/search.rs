@@ -605,18 +605,11 @@ fn without_responses(mut search: Search) -> Search {
     search
 }
 
-fn local_service(state: &AppState) -> ApiResult<&SearchService> {
-    if state.services.relay.is_agent() {
-        return Err(ApiError::Forbidden(
-            "Searches are not available on a relay agent".into(),
-        ));
-    }
-    Ok(&state.services.search)
-}
-
 async fn list(_: Authenticated, State(state): State<AppState>) -> ApiResult<Json<Vec<Search>>> {
     Ok(Json(
-        local_service(&state)?
+        state
+            .services
+            .search
             .0
             .list()
             .into_iter()
@@ -630,7 +623,7 @@ async fn create(
     State(state): State<AppState>,
     body: Result<Json<SearchRequest>, JsonRejection>,
 ) -> ApiResult<Json<Search>> {
-    let service = local_service(&state)?;
+    let service = &state.services.search;
     let Json(body) = body.map_err(|error| {
         let status = error.status();
         let status = if status == StatusCode::UNPROCESSABLE_ENTITY {
@@ -656,7 +649,9 @@ async fn get_one(
     Path(id): Path<Uuid>,
     Query(query): Query<Include>,
 ) -> ApiResult<Json<Search>> {
-    let search = local_service(&state)?
+    let search = state
+        .services
+        .search
         .get(&id.to_string(), query.include_responses)
         .await?;
     Ok(Json(without_responses(search)))
@@ -668,7 +663,9 @@ async fn responses(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<dto::SearchResponse>>> {
     Ok(Json(
-        local_service(&state)?
+        state
+            .services
+            .search
             .get(&id.to_string(), true)
             .await?
             .responses
@@ -681,7 +678,7 @@ async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    local_service(&state)?.cancel(&id.to_string())?;
+    state.services.search.cancel(&id.to_string())?;
     Ok(StatusCode::OK)
 }
 
@@ -690,7 +687,7 @@ async fn remove(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    local_service(&state)?.remove(id.to_string()).await?;
+    state.services.search.remove(id.to_string()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

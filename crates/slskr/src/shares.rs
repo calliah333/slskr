@@ -5,7 +5,6 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Write},
-    ops::Bound::{Excluded, Unbounded},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -39,7 +38,6 @@ use crate::{
 };
 
 mod audio;
-mod relay;
 mod scan;
 use scan::ShareSpec;
 
@@ -184,12 +182,9 @@ pub struct ShareService(Arc<Inner>);
 struct Inner {
     core: Core,
     snapshot: RwLock<Option<Arc<Snapshot>>>,
-    relay_snapshots: RwLock<Arc<relay::Snapshots>>,
     active: Mutex<Option<CancellationToken>>,
     cache_path: Option<PathBuf>,
-    relay_cache: Option<PathBuf>,
     changed: watch::Sender<()>,
-    relay_changed: watch::Sender<()>,
 }
 
 impl ShareService {
@@ -216,30 +211,23 @@ impl ShareService {
                 }
             }
         });
-        let relay_cache =
-            (!options.flags.volatile).then(|| core.paths.data_dir.join("relay-shares"));
         Ok(Self(Arc::new(Inner {
             core: core.clone(),
             snapshot: RwLock::new(snapshot),
-            relay_snapshots: RwLock::new(Arc::new(BTreeMap::new())),
             active: Mutex::new(None),
             cache_path,
-            relay_cache,
             changed: watch::channel(()).0,
-            relay_changed: watch::channel(()).0,
         })))
     }
 
-    pub fn start(&self, app: AppState) {
+    pub fn start(&self) {
         self.refresh_state();
         let core = &self.0.core;
         let startup = core.options.get();
         let mut options = core.options.subscribe();
         let mut events = core.client.subscribe();
         let mut changed = self.0.changed.subscribe();
-        let mut relay_changed = self.0.relay_changed.subscribe();
         let service = self.clone();
-        let relay = app.services.relay.clone();
         tokio::spawn(async move {
             let mut configured = ScanOptions::new(&options.borrow_and_update());
             let hour = Duration::from_secs(3600);
@@ -255,11 +243,6 @@ impl ShareService {
                         _ => {}
                     },
                     update = changed.changed() => {
-                        if update.is_err() { break; }
-                        relay.synchronize_shares();
-                        service.announce().await;
-                    },
-                    update = relay_changed.changed() => {
                         if update.is_err() { break; }
                         service.announce().await;
                     },
@@ -305,11 +288,10 @@ impl ShareService {
     fn refresh_state(&self) {
         let active = self.0.active.lock().unwrap();
         let snapshot = self.snapshot();
-        let remotes = self.relay_snapshots();
-        let counts = total_counts(snapshot.as_deref(), &remotes);
+        let counts = snapshot.as_deref().map_or((0, 0), snapshot_counts);
         self.0.core.state.update(|s| {
             let state = &mut s.shares;
-            state.hosts = Some(share_hosts(&remotes));
+            state.hosts = Some(vec![LOCAL.into()]);
             state.ready = active.is_none() && snapshot.is_some();
             state.scan_pending = snapshot.is_none() || state.faulted || state.cancelled;
             state.directories = state_count(counts.0);
@@ -420,8 +402,6 @@ impl ShareService {
     fn finish_scan(&self, result: Result<()>, cancelled: bool) -> Result<()> {
         let snapshot = self.snapshot();
         let (directories, files) = snapshot.as_deref().map_or((0, 0), snapshot_counts);
-        let remotes = self.relay_snapshots();
-        let totals = total_counts(snapshot.as_deref(), &remotes);
         self.0.core.state.update(|s| {
             s.shares.scanning = false;
             s.shares.ready = snapshot.is_some();
@@ -429,9 +409,9 @@ impl ShareService {
             s.shares.cancelled = cancelled;
             s.shares.faulted = !cancelled && result.is_err();
             s.shares.scan_progress = if result.is_ok() { 1.0 } else { 0.0 };
-            s.shares.hosts = Some(share_hosts(&remotes));
-            s.shares.directories = state_count(totals.0);
-            s.shares.files = state_count(totals.1);
+            s.shares.hosts = Some(vec![LOCAL.into()]);
+            s.shares.directories = state_count(directories);
+            s.shares.files = state_count(files);
         });
         match &result {
             Ok(()) => {
@@ -465,137 +445,21 @@ impl ShareService {
         self.snapshot_for(&self.0.core.options.get())
     }
 
-    fn relay_snapshots(&self) -> Arc<relay::Snapshots> {
-        self.0.relay_snapshots.read().unwrap().clone()
-    }
-
-    pub fn export_relay(&self, path: &Path) -> Result<serde_json::Value> {
-        let options = self.0.core.options.get();
-        let snapshot = self.snapshot_for(&options);
-        let metadata = serde_json::to_value(local_shares(&options, snapshot.as_deref()))?;
-        relay::export(path, snapshot.as_deref(), &options.shares)?;
-        Ok(metadata)
-    }
-
-    pub fn import_relay(
-        &self,
-        agent: &str,
-        metadata: serde_json::Value,
-        path: &Path,
-        closed: &CancellationToken,
-    ) -> Result<()> {
-        ensure!(!closed.is_cancelled(), "relay agent disconnected");
-        relay::validate_agent(agent)?;
-        let snapshot = relay::import(path, metadata)?;
-        let cache = self
-            .0
-            .relay_cache
-            .as_deref()
-            .map(|directory| relay::stage_cache(directory, agent, &snapshot))
-            .transpose()?;
-        let mut remotes = self.0.relay_snapshots.write().unwrap();
-        // Deactivation takes this same lock, so a disconnected agent cannot
-        // republish its shares after the controller removes them.
-        ensure!(!closed.is_cancelled(), "relay agent disconnected");
-        if let Some((temp, path)) = cache {
-            temp.persist(path)?;
-        }
-        Arc::make_mut(&mut *remotes).insert(agent.to_owned(), Arc::new(snapshot));
-        drop(remotes);
-        self.refresh_state();
-        self.0.relay_changed.send_replace(());
-        Ok(())
-    }
-
-    pub(crate) fn deactivate_relay(&self, agent: &str) {
-        let mut remotes = self.0.relay_snapshots.write().unwrap();
-        if !remotes.contains_key(agent) {
-            return;
-        }
-        Arc::make_mut(&mut *remotes).remove(agent);
-        drop(remotes);
-        self.refresh_state();
-        self.0.relay_changed.send_replace(());
-    }
-
-    pub fn resolve_relay(&self, filename: &str) -> Option<(String, u64)> {
-        let remote = normalize_remote(filename).ok()?;
-        let (parent, name) = remote.rsplit_once('\\')?;
-        let options = self.0.core.options.get();
-        let local = self.0.snapshot.read().unwrap();
-        // The local manifest takes precedence even if resolving its file on
-        // disk fails (removed, moved, or replaced since the last scan).
-        if local.as_deref().is_some_and(|snapshot| {
-            snapshot.options.matches(&options) && contains_file(snapshot.files(parent), name)
-        }) {
-            return None;
-        }
-        self.relay_snapshots().iter().find_map(|(agent, snapshot)| {
-            snapshot
-                .find_file(parent, name)
-                .map(|file| (agent.clone(), file.size))
-        })
-    }
-
     pub fn counts(&self) -> (u32, u32) {
-        total_counts(self.snapshot().as_deref(), &self.relay_snapshots())
+        self.snapshot().as_deref().map_or((0, 0), snapshot_counts)
     }
 
     pub fn browse(&self) -> Result<soulseek::BrowseResponse> {
-        let local = self.snapshot();
-        let remotes = self.relay_snapshots();
-        let directories = if remotes.is_empty() {
-            local
-                .iter()
-                .flat_map(|snapshot| {
-                    snapshot
-                        .shares
-                        .values()
-                        .flat_map(ShareContents::directories)
-                })
-                .collect()
-        } else {
-            let mut merged = BTreeMap::new();
-            if let Some(local) = &local {
-                for share in local.shares.values() {
-                    for (name, files) in &share.directories {
-                        merged.insert(
-                            name.as_str(),
-                            files
-                                .iter()
-                                .map(|file| file.wire(file.name.clone()))
-                                .collect::<Vec<_>>(),
-                        );
-                    }
-                }
-            }
-            for (agent, snapshot) in remotes.iter() {
-                for (parent, files) in &snapshot.directories {
-                    let local_files = local
-                        .as_deref()
-                        .map_or(&[][..], |snapshot| snapshot.files(parent));
-                    let merged_files = merged.entry(parent.as_str()).or_default();
-                    merged_files.extend(
-                        files
-                            .iter()
-                            .filter(|file| {
-                                !is_shadowed(&remotes, agent, parent, &file.name, local_files)
-                            })
-                            .map(|file| file.wire(file.name.clone())),
-                    );
-                }
-            }
-            merged
-                .into_iter()
-                .map(|(name, mut files)| {
-                    files.sort_unstable_by(|a, b| a.filename.cmp(&b.filename));
-                    soulseek::Directory {
-                        name: name.into(),
-                        files,
-                    }
-                })
-                .collect()
-        };
+        let directories = self
+            .snapshot()
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot
+                    .shares
+                    .values()
+                    .flat_map(ShareContents::directories)
+            })
+            .collect();
         Ok(soulseek::BrowseResponse {
             directories,
             locked_directories: Vec::new(),
@@ -608,24 +472,7 @@ impl ShareService {
         let local_files = local
             .as_deref()
             .map_or(&[][..], |snapshot| snapshot.files(&name));
-        let mut result = directory(&name, local_files);
-        let remotes = self.relay_snapshots();
-        for (agent, snapshot) in remotes.iter() {
-            if let Some(files) = snapshot.directories.get(name.as_ref()) {
-                result.files.extend(
-                    files
-                        .iter()
-                        .filter(|file| {
-                            !is_shadowed(&remotes, agent, &name, &file.name, local_files)
-                        })
-                        .map(|file| file.wire(file.name.clone())),
-                );
-            }
-        }
-        result
-            .files
-            .sort_unstable_by(|a, b| a.filename.cmp(&b.filename));
-        Ok(vec![result])
+        Ok(vec![directory(&name, local_files)])
     }
 
     pub fn resolve_file(&self, remote_filename: &str) -> Result<(PathBuf, u64)> {
@@ -657,8 +504,7 @@ impl ShareService {
         if collect.is_full() {
             return Ok(collect.matches);
         }
-        let local = self.snapshot();
-        if let Some(snapshot) = &local {
+        if let Some(snapshot) = &self.snapshot() {
             'local: for share in snapshot.shares.values() {
                 for (parent, files) in &share.directories {
                     if files.is_empty() {
@@ -674,44 +520,13 @@ impl ShareService {
                 }
             }
         }
-        if collect.is_full() {
-            return Ok(collect.matches);
-        }
-        let remotes = self.relay_snapshots();
-        'remote: for (agent, snapshot) in remotes.iter() {
-            for (parent, files) in &snapshot.directories {
-                if files.is_empty() {
-                    continue;
-                }
-                collect.parent(parent);
-                let local_files = local
-                    .as_deref()
-                    .map_or(&[][..], |snapshot| snapshot.files(parent));
-                for file in files {
-                    if !is_shadowed(&remotes, agent, parent, &file.name, local_files) {
-                        collect.file(&file.name, |filename| file.wire(filename));
-                        if collect.is_full() {
-                            break 'remote;
-                        }
-                    }
-                }
-            }
-        }
         Ok(collect.matches)
     }
 
     pub fn shares(&self) -> SharesByHost {
         let options = self.0.core.options.get();
         let snapshot = self.snapshot_for(&options);
-        let remotes = self.relay_snapshots();
-        let mut shares =
-            BTreeMap::from([(LOCAL.into(), local_shares(&options, snapshot.as_deref()))]);
-        shares.extend(
-            remotes
-                .iter()
-                .map(|(agent, snapshot)| (agent.clone(), snapshot.shares.clone())),
-        );
-        shares
+        BTreeMap::from([(LOCAL.into(), local_shares(&options, snapshot.as_deref()))])
     }
 }
 
@@ -741,44 +556,6 @@ impl SearchMatches<'_> {
         }
         self.filename.truncate(prefix);
     }
-}
-
-fn contains_file(files: &[ShareFile], name: &str) -> bool {
-    files
-        .binary_search_by(|file| file.name.as_str().cmp(name))
-        .is_ok()
-}
-
-fn is_shadowed(
-    remotes: &relay::Snapshots,
-    agent: &str,
-    parent: &str,
-    name: &str,
-    local: &[ShareFile],
-) -> bool {
-    contains_file(local, name)
-        || remotes
-            .range::<str, _>((Unbounded, Excluded(agent)))
-            .any(|(_, earlier)| earlier.find_file(parent, name).is_some())
-}
-
-fn share_hosts(remotes: &relay::Snapshots) -> Vec<String> {
-    std::iter::once(LOCAL.into())
-        .chain(remotes.keys().cloned())
-        .collect()
-}
-
-fn total_counts(local: Option<&Snapshot>, remotes: &relay::Snapshots) -> (u32, u32) {
-    remotes.values().fold(
-        local.map_or((0, 0), snapshot_counts),
-        |(directories, files), remote| {
-            let (remote_directories, remote_files) = remote.counts();
-            (
-                directories.saturating_add(remote_directories),
-                files.saturating_add(remote_files),
-            )
-        },
-    )
 }
 
 fn snapshot_counts(snapshot: &Snapshot) -> (u32, u32) {
@@ -818,52 +595,6 @@ fn local_shares(options: &Options, snapshot: Option<&Snapshot>) -> Vec<Share> {
     specs
         .into_iter()
         .map(|spec| share_model(spec, snapshot))
-        .collect()
-}
-
-fn relay_share<'a>(
-    snapshots: &'a relay::Snapshots,
-    id: &str,
-) -> Option<(&'a relay::Snapshot, &'a Share)> {
-    snapshots.values().find_map(|snapshot| {
-        snapshot
-            .shares
-            .iter()
-            .find(|share| share.id == id)
-            .map(|share| (snapshot.as_ref(), share))
-    })
-}
-
-fn relay_contents(snapshot: &relay::Snapshot, share: &Share) -> Vec<slskr_api::users::Directory> {
-    if share.is_excluded {
-        return Vec::new();
-    }
-    let Some(root) = share.remote_path.as_deref() else {
-        return Vec::new();
-    };
-    let root = root.trim_end_matches('\\');
-    let prefix = format!("{root}\\");
-    let root_dir = snapshot
-        .directories
-        .get_key_value(root)
-        .filter(|(_, files)| !files.is_empty());
-    root_dir
-        .into_iter()
-        .chain(
-            snapshot
-                .directories
-                .range::<str, _>((std::ops::Bound::Included(prefix.as_str()), Unbounded))
-                .take_while(|(name, _)| name.starts_with(&prefix)),
-        )
-        .map(|(name, files)| {
-            convert_directory(soulseek::Directory {
-                name: name.clone(),
-                files: files
-                    .iter()
-                    .map(|file| file.wire(file.name.clone()))
-                    .collect(),
-            })
-        })
         .collect()
 }
 
@@ -960,10 +691,7 @@ async fn share(
             service.snapshot_for(&options).as_deref(),
         )));
     }
-    let remotes = service.relay_snapshots();
-    relay_share(&remotes, &id)
-        .map(|(_, share)| Json(share.clone()))
-        .ok_or_else(|| ApiError::NotFound(String::new()))
+    Err(ApiError::NotFound(String::new()))
 }
 
 async fn contents(
@@ -988,10 +716,7 @@ async fn share_contents(
 ) -> ApiResult<Json<Vec<slskr_api::users::Directory>>> {
     let options = s.core.options.get();
     let Some(spec) = scan::specs(&options.shares.directories).find(|spec| spec.id() == id) else {
-        let remotes = s.services.shares.relay_snapshots();
-        return relay_share(&remotes, &id)
-            .map(|(snapshot, share)| Json(relay_contents(snapshot, share)))
-            .ok_or_else(|| ApiError::NotFound(String::new()));
+        return Err(ApiError::NotFound(String::new()));
     };
     let snapshot = s.services.shares.snapshot_for(&options);
     let directories = snapshot
@@ -1052,7 +777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_snapshots_merge_atomically_without_replacing_the_local_manifest() {
+    async fn local_shares_browse_and_search_within_limits() {
         use crate::{
             app::{Hubs, Paths},
             auth::{Auth, AuthConfig},
@@ -1064,7 +789,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("shared");
         fs::create_dir(&root).unwrap();
-        fs::write(root.join("collision.txt"), b"local").unwrap();
+        fs::write(root.join("first.txt"), b"local").unwrap();
+        fs::write(root.join("second.txt"), b"other").unwrap();
         let config_file = temp.path().join("slskd.yml");
         let options = OptionsStore::load(temp.path(), config_file.clone(), Default::default())
             .await
@@ -1079,7 +805,6 @@ mod tests {
             logs: Hub::new("logs"),
             search: Hub::new("search"),
             metrics: Hub::new("metrics"),
-            relay: Hub::new("relay"),
         };
         let core = Core {
             paths: Paths {
@@ -1109,89 +834,22 @@ mod tests {
         };
         let shares = ShareService::new(&core).unwrap();
         shares.scan(CancellationToken::new()).await.unwrap();
-        let uploaded = temp.path().join("agent.db");
-        relay::export(&uploaded, None, &Default::default()).unwrap();
-        let db = rusqlite::Connection::open(&uploaded).unwrap();
-        db.execute_batch("
-            INSERT INTO directories VALUES ('music', 0), ('music\\albums', 0);
-            INSERT INTO files VALUES
-                ('music\\collision.txt', '/agent/collision.txt', 90, '', 1, 'txt', '[]', 0),
-                ('music\\albums\\remote.txt', '/agent/albums/remote.txt', 80, '', 1, 'txt', '[]', 0);
-        ").unwrap();
-        let metadata = serde_json::json!([
-            {"id":"agent-music","alias":"music","remotePath":"music","directories":1,"files":2}
-        ]);
-        let agent_connection = CancellationToken::new();
-        shares
-            .import_relay("agent", metadata.clone(), &uploaded, &agent_connection)
-            .unwrap();
-        assert_eq!(shares.shares()["agent"][0].id, "agent-music");
-        assert_eq!(
-            shares.resolve_relay("music\\albums\\remote.txt"),
-            Some(("agent".into(), 80))
-        );
-        assert_eq!(shares.resolve_relay("music\\collision.txt"), None);
-        fs::remove_file(root.join("collision.txt")).unwrap();
-        assert!(shares.resolve_file("music\\collision.txt").is_err());
-        assert_eq!(shares.resolve_relay("music\\collision.txt"), None);
-        assert_eq!(shares.browse().unwrap().directories.len(), 2);
+        assert_eq!(shares.shares()["local"][0].alias.as_deref(), Some("music"));
+        assert_eq!(shares.browse().unwrap().directories.len(), 1);
         assert_eq!(shares.list_directory("music").unwrap()[0].files[0].size, 5);
         let found = shares
-            .search(&soulseek::SearchQuery::parse("remote"), usize::MAX)
+            .search(&soulseek::SearchQuery::parse("second"), usize::MAX)
             .unwrap();
-        assert_eq!(found[0].filename, "music\\albums\\remote.txt");
-        // The response limit caps collection, local matches first, and skips relays when full.
+        assert_eq!(found[0].filename, "music\\second.txt");
+        // The response limit caps collection.
         let txt = soulseek::SearchQuery::parse("txt");
         assert_eq!(shares.search(&txt, usize::MAX).unwrap().len(), 2);
         let capped = shares.search(&txt, 1).unwrap();
         assert_eq!(capped.len(), 1);
-        assert_eq!(capped[0].filename, "music\\collision.txt");
+        assert_eq!(capped[0].filename, "music\\first.txt");
         assert!(shares.search(&txt, 0).unwrap().is_empty());
-
-        db.execute("UPDATE files SET size = -1", []).unwrap();
-        drop(db);
-        assert!(
-            shares
-                .import_relay("agent", metadata.clone(), &uploaded, &agent_connection)
-                .is_err()
-        );
-        assert_eq!(
-            shares.resolve_relay("music\\albums\\remote.txt"),
-            Some(("agent".into(), 80))
-        );
-
-        agent_connection.cancel();
-        shares.deactivate_relay("agent");
-        assert!(!shares.shares().contains_key("agent"));
-        assert!(
-            shares
-                .import_relay("agent", metadata, &uploaded, &agent_connection)
-                .is_err()
-        );
-        assert_eq!(
-            fs::read_dir(core.paths.data_dir.join("relay-shares"))
-                .unwrap()
-                .count(),
-            1
-        );
-        let resumed = ShareService::new(&core).unwrap();
-        assert_eq!(resumed.resolve_relay("music\\albums\\remote.txt"), None);
-        assert_eq!(resumed.resolve_relay("music\\collision.txt"), None);
-        let outgoing = temp.path().join("outgoing.db");
-        assert_eq!(
-            resumed
-                .export_relay(&outgoing)
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        let db = rusqlite::Connection::open(outgoing).unwrap();
-        let rows: i64 = db
-            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
+        fs::remove_file(root.join("first.txt")).unwrap();
+        assert!(shares.resolve_file("music\\first.txt").is_err());
     }
 
     #[cfg(unix)]

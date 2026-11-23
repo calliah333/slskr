@@ -9,7 +9,6 @@ use serde::de::DeserializeOwned;
 use slskr_api::{
     application::{State, hub_methods as application_methods},
     options::Options,
-    relay::{RelayClientState, RelayMode},
     telemetry::{CurrentMetrics, hub_methods as metrics_methods},
     transfers::TransferDirection,
 };
@@ -345,29 +344,9 @@ fn AuthenticatedApp(
     }
 }
 
-fn agent_mode(state: RwSignal<State>) -> Memo<bool> {
-    Memo::new(move |_| state.with(|state| state.relay.mode == RelayMode::Agent))
-}
-
 #[component]
 fn HomeRedirect() -> impl IntoView {
-    let state = expect_context::<AppContext>().state;
-    let target = if state.with_untracked(|state| state.relay.mode == RelayMode::Agent) {
-        "/system"
-    } else {
-        "/dashboard"
-    };
-    view! { <Redirect path=target options=NavigateOptions { replace: true, ..Default::default() }/> }
-}
-
-#[component]
-fn NonAgent(children: ChildrenFn) -> impl IntoView {
-    let agent = agent_mode(expect_context::<AppContext>().state);
-    view! {
-        <Show when=move || !agent.get() fallback=HomeRedirect>
-            {children()}
-        </Show>
-    }
+    view! { <Redirect path="/dashboard" options=NavigateOptions { replace: true, ..Default::default() }/> }
 }
 
 #[component]
@@ -384,21 +363,21 @@ fn AppShell(
                 <div class="app-content-body">
                     <Routes fallback=HomeRedirect>
                         <Route path=path!("/dashboard") view=|| view! {
-                            <NonAgent><div class="view"><Dashboard/></div></NonAgent>
+                            <div class="view"><Dashboard/></div>
                         }/>
                         <Route path=path!("/searches/:id?") view=|| view! {
-                            <NonAgent><div class="view"><Searches/></div></NonAgent>
+                            <div class="view"><Searches/></div>
                         }/>
                         <Route path=path!("/downloads") view=|| view! {
-                            <NonAgent><div class="view"><Transfers direction=TransferDirection::Download/></div></NonAgent>
+                            <div class="view"><Transfers direction=TransferDirection::Download/></div>
                         }/>
                         <Route path=path!("/uploads") view=|| view! {
-                            <NonAgent><div class="view"><Transfers direction=TransferDirection::Upload/></div></NonAgent>
+                            <div class="view"><Transfers direction=TransferDirection::Upload/></div>
                         }/>
-                        <Route path=path!("/rooms") view=|| view! { <NonAgent><Rooms/></NonAgent> }/>
-                        <Route path=path!("/chat") view=|| view! { <NonAgent><Chat/></NonAgent> }/>
-                        <Route path=path!("/users") view=|| view! { <NonAgent><Users/></NonAgent> }/>
-                        <Route path=path!("/browse") view=|| view! { <NonAgent><Browse/></NonAgent> }/>
+                        <Route path=path!("/rooms") view=|| view! { <Rooms/> }/>
+                        <Route path=path!("/chat") view=|| view! { <Chat/> }/>
+                        <Route path=path!("/users") view=|| view! { <Users/> }/>
+                        <Route path=path!("/browse") view=|| view! { <Browse/> }/>
                         <Route path=path!("/system/files/:root") view=System/>
                         <Route path=path!("/system/:tab?") view=System/>
                     </Routes>
@@ -434,7 +413,6 @@ fn NavLink(path: &'static str, icon: &'static str, label: &'static str) -> impl 
 #[component]
 fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
     let AppContext { state, dark, .. } = expect_context();
-    let agent = agent_mode(state);
     let canary = Memo::new(move |_| state.with(|state| state.version.is_canary));
     let pending = Memo::new(move |_| {
         state.with(|state| {
@@ -463,23 +441,19 @@ fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
             <Show when=move || canary.get()>
                 <span class="item"><i class="yellow flask icon" aria-hidden="true"></i>"Canary"</span>
             </Show>
-            <Show when=move || agent.get() fallback=|| view! {
-                <NavLink path="/dashboard" icon="chart bar icon" label="Dashboard"/>
-                <NavLink path="/searches" icon="search icon" label="Search"/>
-                <NavLink path="/downloads" icon="download icon" label="Downloads"/>
-                <NavLink path="/uploads" icon="upload icon" label="Uploads"/>
-                <NavLink path="/rooms" icon="comments icon" label="Rooms"/>
-                <NavLink path="/chat" icon="comment icon" label="Chat"/>
-                <NavLink path="/users" icon="users icon" label="Users"/>
-                <NavLink path="/browse" icon="folder open icon" label="Browse"/>
-            }>
-                <span class="item"><i class="detective icon" aria-hidden="true"></i>"Agent Mode"</span>
-            </Show>
+            <NavLink path="/dashboard" icon="chart bar icon" label="Dashboard"/>
+            <NavLink path="/searches" icon="search icon" label="Search"/>
+            <NavLink path="/downloads" icon="download icon" label="Downloads"/>
+            <NavLink path="/uploads" icon="upload icon" label="Uploads"/>
+            <NavLink path="/rooms" icon="comments icon" label="Rooms"/>
+            <NavLink path="/chat" icon="comment icon" label="Chat"/>
+            <NavLink path="/users" icon="users icon" label="Users"/>
+            <NavLink path="/browse" icon="folder open icon" label="Browse"/>
             <div class="right menu">
                 <button type="button" class="item" aria-pressed=move || dark.get().to_string() on:click=toggle_theme>
                     <i class="adjust icon" aria-hidden="true"></i>"Theme"
                 </button>
-                <ConnectButton state=state agent=agent/>
+                <ConnectButton state=state/>
                 <Show when=move || pending.get()>
                     <NavLink path="/system/info" icon="yellow exclamation circle icon" label="Pending Action"/>
                 </Show>
@@ -511,34 +485,13 @@ fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
 }
 
 #[component]
-fn ConnectButton(state: RwSignal<State>, agent: Memo<bool>) -> impl IntoView {
+fn ConnectButton(state: RwSignal<State>) -> impl IntoView {
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
-    let connected = Memo::new(move |_| {
-        state.with(|state| {
-            if agent.get() {
-                state.relay.controller.state == RelayClientState::Connected
-            } else {
-                state.server.is_connected
-            }
-        })
-    });
+    let connected = Memo::new(move |_| state.with(|state| state.server.is_connected));
     let status = Memo::new(move |_| {
         state.with(|state| {
-            if agent.get() {
-                match state.relay.controller.state {
-                    RelayClientState::Connected => ("green plug icon", "Controller Connected"),
-                    RelayClientState::Connecting => (
-                        "yellow sync alternate loading icon",
-                        "Controller Connecting",
-                    ),
-                    RelayClientState::Reconnecting => (
-                        "yellow sync alternate loading icon",
-                        "Controller Reconnecting",
-                    ),
-                    RelayClientState::Disconnected => ("grey plug icon", "Controller Disconnected"),
-                }
-            } else if state.server.is_connected {
+            if state.server.is_connected {
                 let icon = if state.pending_reconnect {
                     "yellow plug icon"
                 } else {
@@ -558,20 +511,16 @@ fn ConnectButton(state: RwSignal<State>, agent: Memo<bool>) -> impl IntoView {
         if !pending.get() {
             return;
         }
-        let agent = agent.get_untracked();
         let connected = connected.get_untracked();
         spawn_local_scoped_with_cancellation(async move {
-            let result = match (agent, connected) {
-                (true, true) => api::delete::<serde_json::Value>("/relay/agent").await,
-                (true, false) => api::put_empty::<serde_json::Value>("/relay/agent").await,
-                (false, true) => {
-                    api::delete_with::<_, serde_json::Value>(
-                        "/server",
-                        "client disconnected from web UI",
-                    )
-                    .await
-                }
-                (false, false) => api::put_empty::<serde_json::Value>("/server").await,
+            let result = if connected {
+                api::delete_with::<_, serde_json::Value>(
+                    "/server",
+                    "client disconnected from web UI",
+                )
+                .await
+            } else {
+                api::put_empty::<serde_json::Value>("/server").await
             };
             if let Err(err) = result {
                 error.set(Some(err.to_string()));

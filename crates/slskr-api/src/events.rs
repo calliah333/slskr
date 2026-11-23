@@ -1,4 +1,4 @@
-//! Events (`GET /api/v0/events`, `POST /api/v0/events/{type}`), webhook/script payloads.
+//! Events (`GET /api/v0/events`, `POST /api/v0/events/{type}`).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

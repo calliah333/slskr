@@ -103,7 +103,6 @@
             ];
             nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
             buildInputs = [
-              pkgs.openssl
               pkgs.sqlite
             ];
             postInstall = ''
@@ -134,7 +133,6 @@
             pkgs.sqlite
             pkgs.pkg-config
           ];
-          buildInputs = [ pkgs.openssl ];
         };
       });
 

@@ -122,13 +122,13 @@ network manager, and a `Waiter` keyed by message kind + discriminator
 Mirrors slskd JSON exactly (camelCase fields, enum string formats, slskd's flags
 enums serialised as comma-separated strings, e.g. `"Completed, Succeeded"`).
 Modules: `application` (State, version), `options` (Options tree), `session`,
-`server`, `logs`, `events`, `telemetry`, `relay`, `search`, `transfers`, `users`,
+`server`, `logs`, `events`, `telemetry`, `search`, `transfers`, `users`,
 `conversations`, `rooms`, `shares`, `files`. No I/O, compiles to wasm.
 
 ## Realtime
 
 Daemon implements the ASP.NET SignalR JSON hub protocol (negotiate endpoint +
-WebSocket transport, `\x1e` record separator) at `/hub/{application,logs,search,metrics,relay}`
+WebSocket transport, `\x1e` record separator) at `/hub/{application,logs,search,metrics}`
 so both the original slskd React UI and the Rust UI work against it. The Rust UI
 contains a minimal SignalR client over `web_sys::WebSocket`.
 

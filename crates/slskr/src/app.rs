@@ -35,9 +35,8 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::Auth, config::OptionsStore, events::EventService, files::FileService,
-    integrations::IntegrationService, logging::LogBuffer, messaging::MessagingService,
-    relay::RelayService, search::SearchService, shares::ShareService, signalr::Hub,
+    auth::Auth, config::OptionsStore, events::EventService, files::FileService, logging::LogBuffer,
+    messaging::MessagingService, search::SearchService, shares::ShareService, signalr::Hub,
     state::StateStore, telemetry::TelemetryService, transfers::TransferService, users::UserService,
 };
 
@@ -63,7 +62,6 @@ pub struct Hubs {
     pub logs: Hub,
     pub search: Hub,
     pub metrics: Hub,
-    pub relay: Hub,
 }
 
 /// Core handles every service may use. Cheap to clone.
@@ -89,8 +87,6 @@ pub struct Services {
     pub transfers: TransferService,
     pub search: SearchService,
     pub messaging: MessagingService,
-    pub relay: RelayService,
-    pub integrations: IntegrationService,
 }
 
 pub struct AppInner {
@@ -112,7 +108,7 @@ struct ConnectionDirective {
 impl AppInner {
     pub(crate) fn new(core: Core, services: Services) -> Self {
         let startup = core.options.startup();
-        let wants_connection = !startup.flags.no_connect && !services.relay.is_agent();
+        let wants_connection = !startup.flags.no_connect;
         let enabled = wants_connection && credentials(startup).is_some();
         if wants_connection && !enabled {
             tracing::warn!(
@@ -163,10 +159,6 @@ impl Deref for AppInner {
 impl AppState {
     /// Starts the watchdog, or resets its delay if it is already enabled.
     pub async fn connect(&self) -> Result<bool> {
-        ensure!(
-            !self.services.relay.is_agent(),
-            "relay agents cannot connect to Soulseek"
-        );
         ensure!(
             !self.shutdown.is_cancelled(),
             "application is shutting down"
@@ -240,14 +232,12 @@ impl AppState {
         });
 
         self.services.users.start(self.clone());
-        self.services.shares.start(self.clone());
+        self.services.shares.start();
         self.services.files.start(self.clone());
         self.services.transfers.start(self.clone());
         self.services.telemetry.start(&self.core);
         self.services.search.start(self.clone());
         self.services.messaging.start(self.clone());
-        self.services.relay.start(self.clone());
-        self.services.integrations.start(self.clone());
 
         let events = self.client.subscribe();
         let watchdog_events = self.client.subscribe();
@@ -269,32 +259,21 @@ impl AppState {
         loop {
             let attempted = *desired.borrow_and_update();
             let enabled = attempted.enabled && self.client.state() == ClientState::DISCONNECTED;
-            let (awaiting_vpn, before) = {
-                let state = states.borrow_and_update();
-                (
-                    enabled
-                        && self.options.startup().integrations.vpn.enabled
-                        && !state.vpn.is_ready,
-                    state.connection_watchdog.clone(),
-                )
-            };
-            let attempt = enabled && !awaiting_vpn;
+            let before = states.borrow_and_update().connection_watchdog.clone();
             let watchdog = ServerConnectionWatchdogState {
                 is_enabled: enabled,
-                is_awaiting_vpn: awaiting_vpn,
-                is_attempting_connection: attempt,
-                next_attempt_at: attempt.then(|| Utc::now() + delay),
+                is_attempting_connection: enabled,
+                next_attempt_at: enabled.then(|| Utc::now() + delay),
             };
             if before != watchdog {
                 self.state
                     .update(|state| state.connection_watchdog = watchdog);
             }
 
-            if !attempt {
+            if !enabled {
                 tokio::select! {
                     _ = self.shutdown.cancelled() => break,
                     result = desired.changed() => if result.is_err() { break },
-                    result = states.changed(), if awaiting_vpn => if result.is_err() { break },
                     disconnected = next_disconnect(&mut events) => match disconnected {
                         Some(true) => self.stop_retrying(attempted),
                         Some(false) => {}
@@ -565,8 +544,6 @@ impl AppState {
             let restart = startup.headless != current.headless
                 || startup.flags != current.flags
                 || startup.logger != current.logger
-                || startup.relay != current.relay
-                || startup.integrations.vpn != current.integrations.vpn
                 || startup.soulseek.diagnostic_level != current.soulseek.diagnostic_level
                 || startup.transfers.upload.slots != current.transfers.upload.slots
                 || startup.transfers.download.slots != current.transfers.download.slots
@@ -576,8 +553,6 @@ impl AppState {
                 || startup.metrics.url != current.metrics.url
                 || initial_web.port != web.port
                 || initial_web.ip_address != web.ip_address
-                || initial_web.socket != web.socket
-                || initial_web.https != web.https
                 || initial_web.url_base != web.url_base
                 || initial_web.content_path != web.content_path
                 || initial_web.logging != web.logging

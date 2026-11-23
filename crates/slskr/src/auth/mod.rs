@@ -450,7 +450,7 @@ fn is_hub_request(parts: &Parts, url_base: &str) -> bool {
 
 /// Caller address from axum's `ConnectInfo`; unspecified when the server was not
 /// started with `into_make_service_with_connect_info`. An unspecified address means
-/// the caller is unknown (e.g. a Unix socket peer) and never satisfies a CIDR-restricted
+/// the caller is unknown and never satisfies a CIDR-restricted
 /// API key.
 pub fn remote_addr(parts: &Parts) -> SocketAddr {
     parts
@@ -599,7 +599,7 @@ impl Auth {
             .ok_or(ApiKeyError::Unknown)?;
 
         let remote = remote.to_canonical();
-        // An unspecified address marks an unknown caller (Unix socket). slskd rejects a null
+        // An unspecified address marks an unknown caller. slskd rejects a null
         // address outright; keys open to a whole address family still accept it here.
         let allowed = if remote.is_unspecified() {
             record.ranges.iter().any(IpRange::is_full)
@@ -771,11 +771,6 @@ pub type RequireReadWrite = RequireRole<{ Role::ReadWrite as u8 }>;
 pub type RequireAdmin = RequireRole<{ Role::Administrator as u8 }>;
 /// `AuthPolicy.JwtOnly` + `AuthRole.AdministratorOnly`.
 pub type RequireAdminJwt = RequireRole<{ Role::Administrator as u8 }, { Policy::JwtOnly as u8 }>;
-/// `AuthPolicy.ApiKeyOnly` + `AuthRole.Any`.
-pub type RequireApiKey = RequireRole<{ Role::ReadOnly as u8 }, { Policy::ApiKeyOnly as u8 }>;
-/// `AuthPolicy.ApiKeyOnly` + `AuthRole.ReadWriteOrAdministrator`.
-pub type RequireReadWriteApiKey =
-    RequireRole<{ Role::ReadWrite as u8 }, { Policy::ApiKeyOnly as u8 }>;
 
 const fn role_from_u8(v: u8) -> Role {
     match v {

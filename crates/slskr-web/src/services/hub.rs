@@ -914,11 +914,6 @@ pub fn create_metrics_hub() -> HubConnection {
     create_hub_connection("metrics")
 }
 
-/// Hub used by relay agents.
-pub fn create_relay_hub() -> HubConnection {
-    create_hub_connection("relay")
-}
-
 #[cfg(test)]
 mod tests {
     use super::negotiate_url;

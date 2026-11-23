@@ -3,7 +3,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::relay::RelayState;
 use crate::server::ServerState;
 
 /// Application hub method names.
@@ -21,8 +20,6 @@ pub struct State {
     pub pending_restart: bool,
     pub server: ServerState,
     pub connection_watchdog: ServerConnectionWatchdogState,
-    pub vpn: VpnState,
-    pub relay: RelayState,
     pub health: HealthState,
     pub user: UserState,
     pub distributed_network: DistributedNetworkState,
@@ -84,20 +81,7 @@ impl Default for VersionState {
 pub struct ServerConnectionWatchdogState {
     pub is_enabled: bool,
     pub is_attempting_connection: bool,
-    pub is_awaiting_vpn: bool,
     pub next_attempt_at: Option<DateTime<Utc>>,
-}
-
-/// VPN integration state.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VpnState {
-    pub is_ready: bool,
-    pub is_connected: bool,
-    #[serde(rename = "publicIPAddress")]
-    pub public_ip_address: Option<String>,
-    pub location: Option<String>,
-    pub forwarded_port: Option<i32>,
 }
 
 /// Logged-in user state.
@@ -181,8 +165,6 @@ mod tests {
             "pendingRestart",
             "server",
             "connectionWatchdog",
-            "vpn",
-            "relay",
             "health",
             "user",
             "distributedNetwork",
@@ -193,7 +175,6 @@ mod tests {
             assert!(v.get(key).is_some(), "missing {key}");
         }
         assert_eq!(v["version"]["isUpdateAvailable"], serde_json::Value::Null);
-        assert!(v["vpn"].get("publicIPAddress").is_some());
         assert!(v["shares"].get("scanProgress").is_some());
         assert!(v["user"]["privileges"].get("privilegesRemaining").is_some());
         assert!(v["distributedNetwork"].get("canAcceptChildren").is_some());

@@ -202,16 +202,7 @@ async fn server(_: Authenticated, State(app): State<AppState>) -> Json<ServerSta
     Json(app.state.get().server)
 }
 
-fn require_non_agent(app: &AppState) -> HttpResult<()> {
-    let relay = &app.options.startup().relay;
-    if relay.enabled && relay.mode.eq_ignore_ascii_case("agent") {
-        return Err(StatusCode::FORBIDDEN.into_response());
-    }
-    Ok(())
-}
-
 async fn connect(_: RequireReadWrite, State(app): State<AppState>) -> HttpResult<StatusCode> {
-    require_non_agent(&app)?;
     let restarted = app
         .connect()
         .await
@@ -229,7 +220,6 @@ async fn disconnect(
     headers: HeaderMap,
     body: Bytes,
 ) -> HttpResult<StatusCode> {
-    require_non_agent(&app)?;
     let message = optional_json::<String>(&headers, &body)?;
     app.disconnect(message.as_deref().unwrap_or("Requested by user"))
         .await;

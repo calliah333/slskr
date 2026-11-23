@@ -12,9 +12,7 @@ use std::{
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
-    pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
-    task::{Context, Poll},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -35,10 +33,7 @@ use soulseek::{
     Error, TransferOptions,
     client::{DownloadOutput, TransferInput, TransferOutput, UploadInput},
 };
-use tokio::{
-    io::{AsyncRead, AsyncSeek, ReadBuf},
-    sync::{Semaphore, oneshot, watch},
-};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -46,7 +41,6 @@ use crate::{
     app::{AppState, Core},
     db::Database,
     events::EventService,
-    relay::RelayService,
     shares::ShareService,
     users::UserService,
 };
@@ -64,7 +58,6 @@ struct Inner {
     events: EventService,
     users: UserService,
     shares: ShareService,
-    relay: OnceLock<RelayService>,
     db: Database,
     runtime: Mutex<Runtime>,
     writes: tokio::sync::Mutex<()>,
@@ -94,43 +87,6 @@ struct Active {
     dirty: bool,
     offset: u64,
     remote_size_invalid: bool,
-}
-
-enum UploadSource {
-    Local(PathBuf),
-    Relay {
-        service: RelayService,
-        agent: String,
-    },
-}
-
-// A relay reader starts at the requested offset; it cannot seek thereafter.
-struct RelayInput<T>(T);
-
-impl<T: AsyncRead + Unpin> AsyncRead for RelayInput<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
-    }
-}
-
-impl<T: Unpin> AsyncSeek for RelayInput<T> {
-    fn start_seek(self: Pin<&mut Self>, _: io::SeekFrom) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Relay input does not support seeking",
-        ))
-    }
-
-    fn poll_complete(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<u64>> {
-        Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Relay input does not support seeking",
-        )))
-    }
 }
 
 #[derive(Default)]
@@ -237,12 +193,10 @@ impl TransferService {
             writes: tokio::sync::Mutex::new(()),
             ready: watch::channel(None).0,
             download_requests: Semaphore::new(2),
-            relay: OnceLock::new(),
         })))
     }
 
     pub fn start(&self, app: AppState) {
-        let _ = self.0.relay.set(app.services.relay.clone());
         let service = self.clone();
         tokio::spawn(async move {
             match store::initialize(service.database()).await {
@@ -345,7 +299,11 @@ impl TransferService {
         {
             return Ok(());
         }
-        let (source, size) = self.upload_source(filename).ok_or("File not shared.")?;
+        let (source, size) = self
+            .0
+            .shares
+            .resolve_file(filename)
+            .map_err(|_| "File not shared.")?;
         if size > i64::MAX as u64 {
             return Err("File too large.".into());
         }
@@ -386,21 +344,6 @@ impl TransferService {
             service.run_upload(transfer, source, cancel, receiver).await;
         });
         Ok(())
-    }
-
-    fn upload_source(&self, filename: &str) -> Option<(UploadSource, u64)> {
-        if let Ok((path, size)) = self.0.shares.resolve_file(filename) {
-            return Some((UploadSource::Local(path), size));
-        }
-        let service = self.0.relay.get()?;
-        let (agent, size) = service.published_file(filename)?;
-        Some((
-            UploadSource::Relay {
-                service: service.clone(),
-                agent,
-            },
-            size,
-        ))
     }
 
     pub fn place_in_queue(&self, username: &str, filename: &str) -> Option<u32> {
@@ -583,7 +526,7 @@ impl TransferService {
     async fn run_upload(
         &self,
         transfer: Transfer,
-        source: UploadSource,
+        source: PathBuf,
         cancel: CancellationToken,
         slot: oneshot::Receiver<()>,
     ) {
@@ -603,76 +546,34 @@ impl TransferService {
     async fn upload(
         &self,
         t: &Transfer,
-        source: UploadSource,
+        local: PathBuf,
         cancel: CancellationToken,
         slot: oneshot::Receiver<()>,
     ) -> soulseek::Result<PathBuf> {
         let size = t.size;
         let filename = t.filename.clone();
         let mut options = self.callbacks(&t.id);
-        let (local, input) = match source {
-            UploadSource::Local(local) => {
-                let expected_path = local.clone();
-                let shares = self.0.shares.clone();
-                let input = UploadInput::Stream {
-                    size,
-                    factory: Box::new(move |_| {
-                        Box::pin(async move {
-                            let file = tokio::task::spawn_blocking(move || {
-                                let (path, size_now) =
-                                    shares.resolve_file(&filename).map_err(stream_error)?;
-                                if path != expected_path || size_now != size {
-                                    return Err(Error::TransferStream(
-                                        "Shared file changed before upload began".into(),
-                                    ));
-                                }
-                                destination::open_shared(&path, size).map_err(Error::from)
-                            })
-                            .await
-                            .map_err(task_error)??;
-                            Ok(Box::new(tokio::fs::File::from_std(file)) as Box<dyn TransferInput>)
-                        })
-                    }),
-                };
-                (local, input)
-            }
-            UploadSource::Relay { service, agent } => {
-                options.seek_input_stream_automatically = false;
-                let local = PathBuf::from(&filename);
-                let optimistic = self.0.core.options.get().flags.optimistic_relay_file_info;
-                let input = UploadInput::Stream {
-                    size,
-                    factory: Box::new(move |offset| {
-                        Box::pin(async move {
-                            if !service
-                                .published_file(&filename)
-                                .is_some_and(|(owner, total)| owner == agent && total == size)
-                            {
-                                return Err(Error::TransferStream(
-                                    "Published relay file changed before upload began".into(),
-                                ));
-                            }
-                            if !optimistic
-                                && service
-                                    .file_info(&agent, &filename)
-                                    .await
-                                    .map_err(stream_error)?
-                                    != Some(size)
-                            {
-                                return Err(Error::TransferStream(
-                                    "Shared relay file changed before upload began".into(),
-                                ));
-                            }
-                            let file = service
-                                .file_stream(&agent, &filename, offset, size - offset)
-                                .await
-                                .map_err(stream_error)?;
-                            Ok(Box::new(RelayInput(file)) as Box<dyn TransferInput>)
-                        })
-                    }),
-                };
-                (local, input)
-            }
+        let expected_path = local.clone();
+        let shares = self.0.shares.clone();
+        let input = UploadInput::Stream {
+            size,
+            factory: Box::new(move |_| {
+                Box::pin(async move {
+                    let file = tokio::task::spawn_blocking(move || {
+                        let (path, size_now) =
+                            shares.resolve_file(&filename).map_err(stream_error)?;
+                        if path != expected_path || size_now != size {
+                            return Err(Error::TransferStream(
+                                "Shared file changed before upload began".into(),
+                            ));
+                        }
+                        destination::open_shared(&path, size).map_err(Error::from)
+                    })
+                    .await
+                    .map_err(task_error)??;
+                    Ok(Box::new(tokio::fs::File::from_std(file)) as Box<dyn TransferInput>)
+                })
+            }),
         };
         let service = self.clone();
         let id = t.id.clone();

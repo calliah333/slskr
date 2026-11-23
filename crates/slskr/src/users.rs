@@ -504,17 +504,8 @@ pub fn routes() -> Router<AppState> {
         .route("/users/{username}/endpoint", get(endpoint))
         .route("/users/{username}/directory", post(directory))
 }
-/// Upstream rejects every `/users` action in relay-agent mode and hides
-/// blacklisted peers from network lookups.
-fn ensure_available(app: &AppState) -> ApiResult<()> {
-    if app.services.relay.is_agent() {
-        return Err(ApiError::Forbidden(String::new()));
-    }
-    Ok(())
-}
-
+/// Upstream hides blacklisted peers from network lookups.
 fn ensure_lookup(app: &AppState, username: &str) -> ApiResult<()> {
-    ensure_available(app)?;
     if app.services.users.is_blacklisted(username, None) {
         return Err(ApiError::NotFound(String::new()));
     }
@@ -536,7 +527,6 @@ async fn browse_status(
     State(s): State<AppState>,
     Path(u): Path<String>,
 ) -> ApiResult<Json<BrowseStatus>> {
-    ensure_available(&s)?;
     s.services
         .users
         .browse_status(&u)
@@ -589,7 +579,6 @@ async fn directory(
     Path(u): Path<String>,
     body: Result<Json<DirectoryContentsRequest>, JsonRejection>,
 ) -> ApiResult<Json<Vec<Directory>>> {
-    ensure_available(&s)?;
     let directory = match body {
         Ok(Json(q)) if !q.directory.is_empty() => q.directory,
         _ => return Err(ApiError::BadRequest(String::new())),

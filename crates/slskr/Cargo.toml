@@ -16,7 +16,7 @@ tracing.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 anyhow = "1"
-axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
 tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -33,17 +33,12 @@ base64 = "0.22"
 sha1 = "0.10"
 sha2 = "0.10"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
-aes = "0.8"
-cbc = "0.1"
-pbkdf2 = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 cap-std = "3"
 cap-fs-ext = "3"
-openssl = "0.10"
-tokio-openssl = "0.6"
-tempfile = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"
+tokio-tungstenite = "0.29"

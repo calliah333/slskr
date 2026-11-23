@@ -23,8 +23,6 @@ src/telemetry/        TelemetryService (metrics hub "Update", prometheus) + /tel
 src/transfers/        TransferService (downloads, uploads, upload queue, governor) + /transfers controller, transfers.db
 src/search/           SearchService + /searches controller + search hub, search.db
 src/messaging/        MessagingService (conversations, rooms) + /conversations, /rooms controllers, messaging.db
-src/relay/            RelayService (controller + agent modes) + /relay controller + relay hub
-src/integrations/     IntegrationService (webhooks, scripts, ftp, pushbullet, ntfy) driven by events
 ```
 
 ## Shared contracts
@@ -81,8 +79,6 @@ TransferService::new(&core, &events, &users, &shares) -> anyhow::Result<Self>
 TelemetryService::new(&core, &transfers) -> anyhow::Result<Self>
 SearchService::new(&core).await -> anyhow::Result<Self>
 MessagingService::new(&core, &events) -> anyhow::Result<Self>
-RelayService::new(&core, &shares, &transfers) -> anyhow::Result<Self>
-IntegrationService::new(&core, &events) -> anyhow::Result<Self>
 ```
 All services are `Clone` (Arc inner). After `AppState` exists, bootstrap calls
 `service.start(app.clone())` (sync fn that spawns background tasks: soulseek event
@@ -128,9 +124,7 @@ then publishes the snapshot and updates `State.shares`. Failed/cancelled scans l
 the previous snapshot intact. Remote paths are normalized and reject traversal;
 resolution canonicalizes both candidate and share root before returning a local path.
 Alias names are a single remote path component. Lofty reads audio properties for
-supported local files without loading tags or cover art. The relay imports validated
-slskd SQLite snapshots and preserves their wire attributes. Disconnect unpublishes
-the agent's shares without deleting its on-disk cache.
+supported local files without loading tags or cover art.
 
 ### transfers.db schema (owned by transfers, read by telemetry)
 ```sql

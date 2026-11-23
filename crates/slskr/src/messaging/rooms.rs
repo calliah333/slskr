@@ -24,7 +24,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{ensure_available, event_header};
+use super::event_header;
 use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
@@ -696,12 +696,10 @@ async fn available(
     _: Authenticated,
     State(app): State<AppState>,
 ) -> ApiResult<Json<Vec<RoomInfo>>> {
-    ensure_available(&app)?;
     Ok(Json(app.services.messaging.rooms.available().await?))
 }
 
 async fn joined(_: Authenticated, State(app): State<AppState>) -> ApiResult<Json<Vec<String>>> {
-    ensure_available(&app)?;
     Ok(Json(app.services.messaging.rooms.names()))
 }
 
@@ -710,7 +708,6 @@ async fn room(
     State(app): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Room>> {
-    ensure_available(&app)?;
     let username = app.client.username();
     app.services
         .messaging
@@ -723,7 +720,6 @@ async fn users(
     State(app): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Vec<UserData>>> {
-    ensure_available(&app)?;
     let username = app.client.username();
     app.services
         .messaging
@@ -736,7 +732,6 @@ async fn messages(
     State(app): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Vec<RoomMessage>>> {
-    ensure_available(&app)?;
     app.services
         .messaging
         .rooms
@@ -748,7 +743,6 @@ async fn ticker(
     State(app): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<String>> {
-    ensure_available(&app)?;
     let username = app.client.username();
     app.services.messaging.rooms.with_room(&name, |room| {
         Json(
@@ -766,7 +760,6 @@ async fn join(
     State(app): State<AppState>,
     Json(name): Json<String>,
 ) -> ApiResult<Response> {
-    ensure_available(&app)?;
     if name.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "The room name must not be blank".into(),
@@ -789,7 +782,6 @@ async fn leave(
     State(app): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     let left = app
         .services
         .messaging
@@ -809,7 +801,6 @@ async fn send_message(
     Path(name): Path<String>,
     Json(message): Json<String>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     app.services.messaging.rooms.with_room(&name, |_| ())?;
     app.client.send_room_message(&name, &message).await?;
     Ok(StatusCode::CREATED)
@@ -821,7 +812,6 @@ async fn set_ticker(
     Path(name): Path<String>,
     Json(message): Json<String>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     app.services.messaging.rooms.with_room(&name, |_| ())?;
     app.client.set_room_ticker(&name, &message).await?;
     Ok(StatusCode::CREATED)
@@ -833,7 +823,6 @@ async fn add_member(
     Path(name): Path<String>,
     Json(username): Json<String>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     let self_username = app.client.username();
     let allowed = app.services.messaging.rooms.with_room(&name, |room| {
         self_username

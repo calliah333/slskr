@@ -17,7 +17,7 @@ use slskr_api::{
 };
 use tokio::sync::broadcast::error::RecvError;
 
-use super::{ensure_available, event_header};
+use super::event_header;
 use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
@@ -435,7 +435,6 @@ async fn list(
     State(app): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Conversation>>> {
-    ensure_available(&app)?;
     Ok(Json(
         app.services
             .messaging
@@ -451,7 +450,6 @@ async fn get_one(
     RoutePath(username): RoutePath<String>,
     Query(q): Query<GetQuery>,
 ) -> ApiResult<Json<Conversation>> {
-    ensure_available(&app)?;
     app.services
         .messaging
         .conversations
@@ -467,7 +465,6 @@ async fn messages(
     RoutePath(username): RoutePath<String>,
     Query(q): Query<MessageQuery>,
 ) -> ApiResult<Json<Vec<PrivateMessage>>> {
-    ensure_available(&app)?;
     app.services
         .messaging
         .conversations
@@ -482,7 +479,6 @@ async fn ack_all(
     State(app): State<AppState>,
     RoutePath(username): RoutePath<String>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     if !app
         .services
         .messaging
@@ -500,7 +496,6 @@ async fn ack_one(
     State(app): State<AppState>,
     RoutePath((username, id)): RoutePath<(String, i32)>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     if !app
         .services
         .messaging
@@ -518,7 +513,6 @@ async fn close(
     State(app): State<AppState>,
     RoutePath(username): RoutePath<String>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     if !app.services.messaging.conversations.close(username).await? {
         return Err(not_found());
     }
@@ -531,7 +525,6 @@ async fn send(
     RoutePath(username): RoutePath<String>,
     Json(message): Json<Option<String>>,
 ) -> ApiResult<StatusCode> {
-    ensure_available(&app)?;
     if app.services.users.is_blacklisted(&username, None) {
         return Ok(StatusCode::OK);
     }

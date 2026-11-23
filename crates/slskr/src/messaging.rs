@@ -10,7 +10,6 @@ use uuid::Uuid;
 use crate::{
     app::{AppState, Core},
     events::EventService,
-    http::{ApiError, ApiResult},
 };
 use conversations::ConversationService;
 use rooms::RoomService;
@@ -37,13 +36,6 @@ impl MessagingService {
 
 pub fn routes() -> axum::Router<AppState> {
     conversations::routes().merge(rooms::routes())
-}
-
-fn ensure_available(app: &AppState) -> ApiResult<()> {
-    if app.services.relay.is_agent() {
-        return Err(ApiError::Forbidden(String::new()));
-    }
-    Ok(())
 }
 
 fn event_header(kind: EventType) -> EventHeader {

@@ -6,7 +6,6 @@
 pub mod protocol;
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -29,8 +28,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, warn};
 
-use crate::auth::remote_addr;
-
 use protocol::{HubMessage, RecordBuffer};
 
 /// Interval between server keep-alive pings.
@@ -48,12 +45,8 @@ const MAX_WEBSOCKET_MESSAGE: usize = 2 * protocol::MAX_BUFFERED;
 
 type InitialMessages = Vec<(String, Vec<Value>)>;
 type OnConnected = dyn Fn() -> InitialMessages + Send + Sync;
-type OnConnection = dyn Fn(&str, IpAddr) -> Result<InitialMessages, String> + Send + Sync;
 type OnInvoke =
     dyn Fn(String, Vec<Value>) -> BoxFuture<'static, Result<Value, String>> + Send + Sync;
-type OnConnectionInvoke =
-    dyn Fn(String, String, Vec<Value>) -> BoxFuture<'static, Result<Value, String>> + Send + Sync;
-type OnDisconnection = dyn Fn(&str) + Send + Sync;
 type Authorizer = dyn Fn(&Parts) -> bool + Send + Sync;
 
 /// A SignalR hub: tracks connected clients and broadcasts invocations to them.
@@ -68,9 +61,6 @@ struct Inner {
     registry: Mutex<Registry>,
     on_connected: RwLock<Option<Arc<OnConnected>>>,
     on_invoke: RwLock<Option<Arc<OnInvoke>>>,
-    on_connection: RwLock<Option<Arc<OnConnection>>>,
-    on_connection_invoke: RwLock<Option<Arc<OnConnectionInvoke>>>,
-    on_disconnection: RwLock<Option<Arc<OnDisconnection>>>,
     authorizer: RwLock<Option<Arc<Authorizer>>>,
 }
 
@@ -166,18 +156,14 @@ impl Drop for Reservation {
     }
 }
 
-/// Removes the live route and cleans up callback state when the connection ends.
+/// Removes the live route when the connection ends.
 struct Registration {
     reservation: Reservation,
-    on_disconnection: Option<Arc<OnDisconnection>>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         lock(&self.reservation.hub.connections).remove(&self.reservation.connection_id);
-        if let Some(callback) = &self.on_disconnection {
-            callback(&self.reservation.connection_id);
-        }
     }
 }
 
@@ -199,9 +185,6 @@ impl Hub {
                 registry: Mutex::new(Registry::default()),
                 on_connected: RwLock::new(None),
                 on_invoke: RwLock::new(None),
-                on_connection: RwLock::new(None),
-                on_connection_invoke: RwLock::new(None),
-                on_disconnection: RwLock::new(None),
                 authorizer: RwLock::new(None),
             }),
         }
@@ -232,31 +215,6 @@ impl Hub {
         });
     }
 
-    /// Queues an invocation for one connection, returning whether it was queued.
-    /// As with broadcasts, a connection with a full queue is dropped.
-    pub fn send_to(&self, connection_id: &str, target: &str, args: Vec<Value>) -> bool {
-        let frame = Utf8Bytes::from(protocol::encode_invocation(target, &args));
-        let mut connections = lock(&self.inner.connections);
-        let Some(tx) = connections.get(connection_id) else {
-            return false;
-        };
-        match tx.try_send(frame) {
-            Ok(()) => true,
-            Err(err) => {
-                connections.remove(connection_id);
-                drop(connections);
-                if matches!(err, TrySendError::Full(_)) {
-                    warn!(
-                        hub = self.inner.name,
-                        connection = connection_id,
-                        "dropping slow SignalR client"
-                    );
-                }
-                false
-            }
-        }
-    }
-
     /// Registers messages sent only to a newly connected client right after the handshake.
     pub fn on_connected(&self, f: impl Fn() -> Vec<(String, Vec<Value>)> + Send + Sync + 'static) {
         write(&self.inner.on_connected, Arc::new(f) as Arc<OnConnected>);
@@ -271,38 +229,6 @@ impl Hub {
         + 'static,
     ) {
         write(&self.inner.on_invoke, Arc::new(f) as Arc<OnInvoke>);
-    }
-
-    /// Registers a connection hook. Successful messages go only to that connection;
-    /// an error closes it after the handshake.
-    pub fn on_connection(
-        &self,
-        f: impl Fn(&str, IpAddr) -> Result<Vec<(String, Vec<Value>)>, String> + Send + Sync + 'static,
-    ) {
-        write(&self.inner.on_connection, Arc::new(f) as Arc<OnConnection>);
-    }
-
-    /// Registers a client-to-server handler with the owning connection ID.
-    /// When set, this handler takes precedence over the generic invocation handler.
-    pub fn on_connection_invoke(
-        &self,
-        f: impl Fn(String, String, Vec<Value>) -> BoxFuture<'static, Result<Value, String>>
-        + Send
-        + Sync
-        + 'static,
-    ) {
-        write(
-            &self.inner.on_connection_invoke,
-            Arc::new(f) as Arc<OnConnectionInvoke>,
-        );
-    }
-
-    /// Registers cleanup for subsequently handshaken connections.
-    pub fn on_disconnection(&self, f: impl Fn(&str) + Send + Sync + 'static) {
-        write(
-            &self.inner.on_disconnection,
-            Arc::new(f) as Arc<OnDisconnection>,
-        );
     }
 
     /// Registers the authorizer checked on negotiate and WebSocket upgrade (401 when it returns false).
@@ -422,7 +348,6 @@ impl Hub {
             },
         };
 
-        let peer_ip = remote_addr(&parts).ip();
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
             // axum's 64 MiB default would let one message far exceed the record cap; allow one
             // maximal record plus room for a few small records batched into the same message.
@@ -433,10 +358,10 @@ impl Hub {
         };
 
         let hub = self.clone();
-        upgrade.on_upgrade(move |socket| hub.run(socket, reservation, peer_ip))
+        upgrade.on_upgrade(move |socket| hub.run(socket, reservation))
     }
 
-    async fn run(self, socket: WebSocket, reservation: Reservation, peer_ip: IpAddr) {
+    async fn run(self, socket: WebSocket, reservation: Reservation) {
         let connection_id = reservation.connection_id.clone();
         let name = self.inner.name;
         let (mut sink, mut stream) = socket.split();
@@ -484,22 +409,10 @@ impl Hub {
 
         let (tx, mut rx) = mpsc::channel::<Utf8Bytes>(CONNECTION_BUFFER);
         lock(&self.inner.connections).insert(connection_id.clone(), tx);
-        let registration = Registration {
-            reservation,
-            on_disconnection: read(&self.inner.on_disconnection),
-        };
+        let registration = Registration { reservation };
         debug!(hub = name, connection = %connection_id, "SignalR client connected");
 
         let close = async {
-            if let Some(on_connection) = read(&self.inner.on_connection) {
-                let messages = match on_connection(&connection_id, peer_ip) {
-                    Ok(messages) => messages,
-                    Err(error) => return Close::Error(error),
-                };
-                if send_initial(&mut sink, messages).await.is_err() {
-                    return Close::Silent;
-                }
-            }
             if let Some(on_connected) = read(&self.inner.on_connected) {
                 if send_initial(&mut sink, on_connected()).await.is_err() {
                     return Close::Silent;
@@ -509,7 +422,7 @@ impl Hub {
             // The invocation futures belong to this socket. Dropping them before the
             // registration prevents callbacks from continuing after disconnection cleanup.
             let mut in_flight = FuturesUnordered::new();
-            let mut invoke = |id, target, args| self.invoke(&connection_id, id, target, args);
+            let mut invoke = |id, target, args| self.invoke(id, target, args);
             if let Err(close) = self.handle_records(&mut sink, records, &mut in_flight, &mut invoke).await {
                 return close;
             }
@@ -634,26 +547,18 @@ impl Hub {
 
     fn invoke(
         &self,
-        connection_id: &str,
         invocation_id: Option<String>,
         target: String,
         arguments: Vec<Value>,
     ) -> impl Future<Output = Option<String>> + Send + use<> {
-        let scoped = read(&self.inner.on_connection_invoke)
-            .map(|handler| (handler, connection_id.to_owned()));
-        let generic = if scoped.is_none() {
-            read(&self.inner.on_invoke)
-        } else {
-            None
-        };
+        let handler = read(&self.inner.on_invoke);
         let name = self.inner.name;
 
         async move {
             let log_target = invocation_id.is_none().then(|| target.clone());
-            let result = match (scoped, generic) {
-                (Some((handler, id)), _) => handler(id, target, arguments).await,
-                (None, Some(handler)) => handler(target, arguments).await,
-                (None, None) => Err(format!(
+            let result = match handler {
+                Some(handler) => handler(target, arguments).await,
+                None => Err(format!(
                     "Failed to invoke '{target}' due to an error on the server. HubException: Method does not exist."
                 )),
             };
@@ -914,21 +819,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_hooks_isolate_messages_and_use_the_socket_identity() {
-        let hub = Hub::new("scoped");
+    async fn negotiated_token_is_single_use_and_invocations_complete_in_order() {
+        let hub = Hub::new("invocations");
         hub.on_connected(|| vec![("Welcome".into(), vec![])]);
-        hub.on_invoke(|_, _| panic!("scoped handler must take precedence"));
-        hub.on_connection(|id, ip| Ok(vec![("Challenge".into(), vec![json!(id), json!(ip)])]));
-        hub.on_connection_invoke(|id, target, args| {
-            Box::pin(async move { Ok(json!([id, target, args])) })
-        });
+        hub.on_invoke(|target, args| Box::pin(async move { Ok(json!([target, args])) }));
         let server = Server::start(&hub).await;
 
         let mut other = server.connect(None).await.unwrap();
         client_send(&mut other, HANDSHAKE).await;
         assert_eq!(client_recv(&mut other).await, json!({}));
-        let other_challenge = client_recv(&mut other).await;
-        let other_id = other_challenge["arguments"][0].as_str().unwrap();
         assert_eq!(client_recv(&mut other).await["target"], "Welcome");
 
         let (_, body) = call(
@@ -937,9 +836,7 @@ mod tests {
         )
         .await;
         let negotiated: Value = serde_json::from_slice(&body).unwrap();
-        let id = negotiated["connectionId"].as_str().unwrap();
         let token = negotiated["connectionToken"].as_str().unwrap();
-        assert_ne!(other_id, id);
         let mut socket = server.connect(Some(token)).await.unwrap();
         match server.connect(Some(token)).await {
             Err(ClientError::Http(response)) => {
@@ -948,76 +845,31 @@ mod tests {
             _ => panic!("a negotiated token must be single-use, even before its socket handshakes"),
         }
 
-        // A pipelined invocation cannot overtake the challenge or borrow an ID from its arguments.
+        // A pipelined invocation cannot overtake the initial messages.
         client_send(
             &mut socket,
             format!(
                 "{HANDSHAKE}{}\u{1e}",
-                json!({"type": 1, "target": "Login", "invocationId": "1", "arguments": [other_id]}),
+                json!({"type": 1, "target": "Echo", "invocationId": "1", "arguments": [1]}),
             ),
         )
         .await;
         assert_eq!(client_recv(&mut socket).await, json!({}));
-        assert_eq!(
-            client_recv(&mut socket).await,
-            json!({
-                "type": 1, "target": "Challenge", "arguments": [id, "127.0.0.1"],
-            })
-        );
         assert_eq!(client_recv(&mut socket).await["target"], "Welcome");
         assert_eq!(
             client_recv(&mut socket).await,
             json!({
-                "type": 3, "invocationId": "1", "result": [id, "Login", [other_id]],
+                "type": 3, "invocationId": "1", "result": ["Echo", [1]],
             })
         );
 
-        assert!(!hub.send_to(token, "WrongRecipient", vec![]));
-        assert!(hub.send_to(id, "Private", vec![json!(42)]));
         hub.broadcast("Public", vec![]);
-        assert_eq!(
-            client_recv(&mut socket).await,
-            json!({
-                "type": 1, "target": "Private", "arguments": [42],
-            })
-        );
-        // The broadcast is queued after the private message; the other socket must not see it.
+        assert_eq!(client_recv(&mut socket).await["target"], "Public");
         assert_eq!(client_recv(&mut other).await["target"], "Public");
     }
 
     #[tokio::test]
-    async fn rejecting_hook_cleans_up_and_prevents_invocations() {
-        let hub = Hub::new("rejecting");
-        let (events, mut observed) = mpsc::unbounded_channel();
-        let opened = events.clone();
-        hub.on_connection(move |id, _| {
-            opened.send(("open", id.to_owned())).unwrap();
-            Err("relay disabled".into())
-        });
-        hub.on_connection_invoke(|_, _, _| panic!("a rejected connection must not invoke methods"));
-        hub.on_disconnection(move |id| events.send(("close", id.to_owned())).unwrap());
-        let server = Server::start(&hub).await;
-        let mut socket = server.connect(None).await.unwrap();
-
-        client_send(
-            &mut socket,
-            format!("{HANDSHAKE}{{\"type\":1,\"target\":\"Login\"}}\u{1e}"),
-        )
-        .await;
-        assert_eq!(client_recv(&mut socket).await, json!({}));
-        assert_eq!(
-            client_recv(&mut socket).await,
-            json!({"type": 7, "error": "relay disabled"})
-        );
-        let (event, id) = observed.try_recv().unwrap();
-        assert_eq!(event, "open");
-        assert_eq!(observed.try_recv().unwrap(), ("close", id));
-        assert!(observed.try_recv().is_err());
-        assert_eq!(hub.connection_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn pending_invocation_is_dropped_before_disconnection_callback() {
+    async fn pending_invocation_is_dropped_on_disconnection() {
         struct MarkDropped(Arc<AtomicBool>);
         impl Drop for MarkDropped {
             fn drop(&mut self) {
@@ -1029,27 +881,14 @@ mod tests {
         let (started, mut running) = mpsc::unbounded_channel();
         let dropped = Arc::new(AtomicBool::new(false));
         let mark = dropped.clone();
-        hub.on_connection_invoke(move |id, _, _| {
+        hub.on_invoke(move |_, _| {
             let started = started.clone();
             let guard = MarkDropped(mark.clone());
             Box::pin(async move {
                 let _guard = guard;
-                started.send(id).unwrap();
+                started.send(()).unwrap();
                 pending().await
             })
-        });
-        let weak = Arc::downgrade(&hub.inner);
-        let (stopped, mut disconnected) = mpsc::unbounded_channel();
-        hub.on_disconnection(move |id| {
-            let inner = weak.upgrade().unwrap();
-            let count = inner
-                .connections
-                .try_lock()
-                .ok()
-                .map(|connections| connections.len());
-            stopped
-                .send((id.to_owned(), dropped.load(Ordering::Relaxed), count))
-                .unwrap();
         });
         let server = Server::start(&hub).await;
         let mut socket = server.connect(None).await.unwrap();
@@ -1060,22 +899,26 @@ mod tests {
         )
         .await;
         assert_eq!(client_recv(&mut socket).await, json!({}));
-        let id = within(running.recv()).await.unwrap();
+        within(running.recv()).await.unwrap();
         within(socket.send(ClientMessage::Close(None)))
             .await
             .unwrap();
-        assert_eq!(
-            within(disconnected.recv()).await.unwrap(),
-            (id, true, Some(0))
-        );
+        // The invocation is dropped before the connection is unregistered.
+        within(async {
+            while hub.connection_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(dropped.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
-    async fn generic_invocation_remains_available_without_scoped_handler() {
+    async fn generic_invocation_returns_a_completion() {
         let hub = Hub::new("generic");
         hub.on_invoke(|target, args| Box::pin(async move { Ok(json!([target, args])) }));
         let completion = hub
-            .invoke("id", Some("1".into()), "Echo".into(), vec![json!(true)])
+            .invoke(Some("1".into()), "Echo".into(), vec![json!(true)])
             .await;
         assert_eq!(
             completion,

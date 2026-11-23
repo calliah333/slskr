@@ -13,10 +13,8 @@ pub const MAX_PROTOCOL_VERSION: u32 = 2;
 
 /// Upper bound for a single record, whether complete or still buffered, and for one
 /// WebSocket message/frame. Upstream slskd keeps ASP.NET Core SignalR's default
-/// `MaximumReceiveMessageSize` of 32 KiB; the largest legitimate client-to-server
-/// messages are relay agent invocations (login, file info, failure notices), which are a
-/// few hundred bytes, and our relay agent caps its own frames at 128 KiB. Share indexes and
-/// files travel over HTTP, not the hub. 1 MiB leaves ample headroom.
+/// `MaximumReceiveMessageSize` of 32 KiB; legitimate client-to-server messages are far
+/// smaller. 1 MiB leaves ample headroom.
 pub const MAX_BUFFERED: usize = 1024 * 1024;
 
 /// Message type discriminators.

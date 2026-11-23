@@ -62,14 +62,6 @@ struct Remove {
     remove: bool,
 }
 
-fn require_non_agent(app: &AppState) -> ApiResult<()> {
-    let relay = &app.options.startup().relay;
-    if relay.enabled && relay.mode.eq_ignore_ascii_case("agent") {
-        return Err(ApiError::Forbidden(String::new()));
-    }
-    Ok(())
-}
-
 fn bad_request(message: &str) -> ApiError {
     ApiError::BadRequest(message.into())
 }
@@ -144,7 +136,6 @@ async fn list_all(
     Extension(direction): Extension<TransferDirection>,
     Query(query): Query<IncludeRemoved>,
 ) -> ApiResult<Json<Vec<UserResponse>>> {
-    require_non_agent(&app)?;
     Ok(Json(grouped(
         app.services
             .transfers
@@ -175,7 +166,6 @@ async fn user_response(
     direction: TransferDirection,
     username: String,
 ) -> ApiResult<Json<UserResponse>> {
-    require_non_agent(&app)?;
     grouped(
         app.services
             .transfers
@@ -193,7 +183,6 @@ async fn get_one(
     Extension(direction): Extension<TransferDirection>,
     Path((_username, id)): Path<(String, String)>,
 ) -> ApiResult<Json<Transfer>> {
-    require_non_agent(&app)?;
     app.services
         .transfers
         .find(direction, canonical_id(&id)?)
@@ -207,7 +196,6 @@ async fn get_batch(
     State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Batch>> {
-    require_non_agent(&app)?;
     let id = canonical_id(&id)
         .map_err(|_| bad_request(&format!("The specified id {id} is not a valid GUID/UUID")))?;
     app.services
@@ -225,7 +213,6 @@ async fn cancel(
     Path((_username, id)): Path<(String, String)>,
     Query(query): Query<Remove>,
 ) -> ApiResult<StatusCode> {
-    require_non_agent(&app)?;
     app.services
         .transfers
         .cancel(direction, canonical_id(&id)?, query.remove)
@@ -238,7 +225,6 @@ async fn clear_completed(
     State(app): State<AppState>,
     Extension(direction): Extension<TransferDirection>,
 ) -> ApiResult<StatusCode> {
-    require_non_agent(&app)?;
     let transfers = &app.services.transfers;
     transfers.ready().await?;
     transfers.flush().await;
@@ -251,7 +237,6 @@ async fn download_position(
     State(app): State<AppState>,
     Path((username, id)): Path<(String, String)>,
 ) -> ApiResult<Json<u32>> {
-    require_non_agent(&app)?;
     if app.services.users.is_blacklisted(&username, None) {
         return Err(not_found());
     }
@@ -352,7 +337,6 @@ async fn enqueue_downloads(
     Path(username): Path<String>,
     request: Result<Json<Option<Vec<Option<PlainDownloadRequest>>>>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<EnqueueDownloadsResponse>)> {
-    require_non_agent(&app)?;
     let files = body(request)?
         .unwrap_or_default()
         .into_iter()
@@ -396,7 +380,6 @@ async fn enqueue_batch(
     State(app): State<AppState>,
     request: Result<Json<EnqueueDownloadBatchRequest>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<EnqueueDownloadBatchResponse>)> {
-    require_non_agent(&app)?;
     let request = body(request)?;
     if request.username.trim().is_empty() || request.username.encode_utf16().count() > 500 {
         return Err(bad_request("A valid username is required"));

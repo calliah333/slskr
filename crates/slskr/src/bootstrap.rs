@@ -1,10 +1,8 @@
 //! Command line, application construction and HTTP server lifetime.
 
-mod tls;
-
 use std::{
     ffi::OsString,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -28,7 +26,7 @@ use crate::{
     app::{AppInner, AppState, Core, Hubs, Paths, Services},
     auth::{Auth, Role},
     config::{self, OptionsStore, SOURCES},
-    core_api, events, files, http, integrations, logging, messaging, relay,
+    core_api, events, files, http, logging, messaging,
     resolvers::AppResolvers,
     search, shares,
     signalr::Hub,
@@ -42,7 +40,6 @@ pub struct Cli {
     overrides: Mapping,
     envars: bool,
     generate_secret: Option<usize>,
-    generate_cert: bool,
 }
 
 impl Parser for Cli {}
@@ -74,12 +71,6 @@ impl CommandFactory for Cli {
                 Arg::new("envars")
                     .long("envars")
                     .short('e')
-                    .action(ArgAction::SetTrue),
-            )
-            .arg(
-                Arg::new("generate-cert")
-                    .long("generate-cert")
-                    .short('g')
                     .action(ArgAction::SetTrue),
             )
             .arg(
@@ -145,7 +136,6 @@ impl FromArgMatches for Cli {
             overrides,
             envars: matches.get_flag("envars"),
             generate_secret: matches.get_one::<usize>("generate-secret").copied(),
-            generate_cert: matches.get_flag("generate-cert"),
         })
     }
 
@@ -174,14 +164,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         println!("{}", Alphanumeric.sample_string(&mut rand::rng(), len));
         return Ok(());
     }
-    if cli.generate_cert {
-        use rand::distr::{Alphanumeric, SampleString};
-        let password = Alphanumeric.sample_string(&mut rand::rng(), 32);
-        let filename = Path::new("slskd.pfx");
-        tls::generate_pfx(filename, &password)?;
-        println!("Certificate: {}\nPassword: {password}", filename.display());
-        return Ok(());
-    }
 
     let app_dir = cli
         .app_dir
@@ -199,38 +181,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
     let web = &options.startup().web;
     let tcp = bind_tcp(web.ip_address.as_deref(), web.port).await?;
-    let (https, acceptor) = if web.https.disabled {
-        (Vec::new(), None)
-    } else {
-        (
-            bind_tcp(web.https.ip_address.as_deref(), web.https.port).await?,
-            Some(tls::acceptor(&web.https.certificate)?),
-        )
-    };
-    let redirect = if web.https.force {
-        let port = https
-            .first()
-            .context("forced HTTPS requires an HTTPS listener")?
-            .local_addr()?
-            .port();
-        Some(tls::redirect(port))
-    } else {
-        None
-    };
-    let socket = web.socket.as_deref().filter(|path| !path.is_empty());
-    #[cfg(unix)]
-    let unix = socket.map(UnixListener::bind).transpose()?;
-    #[cfg(not(unix))]
-    ensure!(
-        socket.is_none(),
-        "Unix sockets are not supported on this platform"
-    );
 
     let startup_key: [u8; 32] = rand::random();
     let app = build(app_dir, config_file, options, &startup_key).await?;
     let _cancel_on_drop = app.shutdown.clone().drop_guard();
     let router = router(&app);
-    let plain_router = redirect.unwrap_or_else(|| router.clone());
     let client_events_done = CancellationToken::new();
     let _cancel_events_on_drop = client_events_done.clone().drop_guard();
     let client_events = app.start(startup_key, client_events_done.clone());
@@ -238,28 +193,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut servers = JoinSet::new();
     for listener in tcp {
         tracing::info!(address = %listener.local_addr()?, "HTTP listener started");
-        serve(
-            &mut servers,
-            listener,
-            plain_router.clone(),
-            app.shutdown.clone(),
-        );
-    }
-    if let Some(acceptor) = acceptor {
-        for listener in https {
-            tracing::info!(address = %listener.local_addr()?, "HTTPS listener started");
-            serve(
-                &mut servers,
-                tls::TlsListener::new(listener, acceptor.clone()),
-                router.clone(),
-                app.shutdown.clone(),
-            );
-        }
-    }
-    #[cfg(unix)]
-    if let Some(listener) = unix {
-        tracing::info!(path = %listener.path.display(), "HTTP Unix listener started");
-        serve(&mut servers, listener, plain_router, app.shutdown.clone());
+        serve(&mut servers, listener, router.clone(), app.shutdown.clone());
     }
 
     let exit: Result<()> = tokio::select! {
@@ -335,7 +269,6 @@ async fn build(
         logs: Hub::new("logs"),
         search: Hub::new("search"),
         metrics: Hub::new("metrics"),
-        relay: Hub::new("relay"),
     };
     let auth =
         Auth::new(config::auth_config(startup, startup_key)?).with_url_base(&startup.web.url_base);
@@ -368,8 +301,6 @@ async fn build(
     let telemetry = telemetry::TelemetryService::new(&core, &transfers)?;
     let search = search::SearchService::new(&core).await?;
     let messaging = messaging::MessagingService::new(&core, &events)?;
-    let relay = relay::RelayService::new(&core, &shares, &transfers)?;
-    let integrations = integrations::IntegrationService::new(&core, &events)?;
     let services = Services {
         events,
         users,
@@ -379,8 +310,6 @@ async fn build(
         telemetry,
         search,
         messaging,
-        relay,
-        integrations,
     };
     let app = AppState(Arc::new(AppInner::new(core, services)));
     resolvers.bind(&app);
@@ -398,8 +327,7 @@ fn router(app: &AppState) -> Router {
         .merge(transfers::routes())
         .merge(telemetry::routes())
         .merge(search::routes())
-        .merge(messaging::routes())
-        .merge(relay::routes());
+        .merge(messaging::routes());
     let missing = || async { StatusCode::NOT_FOUND };
     let mut endpoints = Router::new()
         .nest("/api/v0", api)
@@ -410,7 +338,6 @@ fn router(app: &AppState) -> Router {
         .nest("/hub/logs", app.hubs.logs.router())
         .nest("/hub/search", app.hubs.search.router())
         .nest("/hub/metrics", app.hubs.metrics.router())
-        .nest("/hub/relay", app.hubs.relay.router())
         .route("/hub", any(missing))
         .route("/hub/{*unknown}", any(missing));
     let startup = app.options.startup();
@@ -536,74 +463,6 @@ fn serve<L: Listener<Addr = SocketAddr>>(
     });
 }
 
-#[cfg(unix)]
-struct UnixListener {
-    socket: tokio::net::UnixListener,
-    path: PathBuf,
-}
-
-#[cfg(unix)]
-impl UnixListener {
-    fn bind(path: &str) -> Result<Self> {
-        let path = std::path::absolute(path)?;
-        remove_stale_socket(&path);
-        let socket = tokio::net::UnixListener::bind(&path)
-            .with_context(|| format!("binding {}", path.display()))?;
-        Ok(Self { socket, path })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for UnixListener {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[cfg(unix)]
-impl Listener for UnixListener {
-    type Io = tokio::net::UnixStream;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.socket.accept().await {
-                Ok((stream, _)) => return (stream, unix_peer_addr()),
-                Err(error) => {
-                    tracing::warn!(%error, "Unix socket accept failed");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        Ok(unix_peer_addr())
-    }
-}
-
-/// Removes a socket file left behind by a crashed daemon (nothing accepts on it). Other
-/// file types and live sockets are left alone so binding reports the conflict.
-#[cfg(unix)]
-fn remove_stale_socket(path: &Path) {
-    use std::os::unix::fs::FileTypeExt;
-    let is_socket = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket());
-    if is_socket
-        && std::os::unix::net::UnixStream::connect(path)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
-    {
-        tracing::info!(path = %path.display(), "removing stale Unix socket");
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Unix socket peers have no IP address; the unspecified address tells auth the caller is
-/// unknown, so CIDR-restricted API keys are refused (slskd sees a null RemoteIpAddress).
-#[cfg(unix)]
-fn unix_peer_addr() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,24 +495,6 @@ mod tests {
             2
         );
         assert!(Cli::try_parse_from(["slskr", "--set", "missing-value"]).is_err());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unix_bind_replaces_only_stale_sockets() {
-        let dir = tempfile::tempdir().unwrap();
-        let stale = dir.path().join("stale.sock");
-        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
-        assert!(stale.exists());
-        let listener = UnixListener::bind(stale.to_str().unwrap()).unwrap();
-        // A live socket is not removed.
-        assert!(UnixListener::bind(stale.to_str().unwrap()).is_err());
-        drop(listener);
-        let regular = dir.path().join("regular");
-        std::fs::write(&regular, "keep").unwrap();
-        assert!(UnixListener::bind(regular.to_str().unwrap()).is_err());
-        assert_eq!(std::fs::read_to_string(&regular).unwrap(), "keep");
-        assert!(unix_peer_addr().ip().is_unspecified());
     }
 
     #[test]
