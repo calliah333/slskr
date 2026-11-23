@@ -4,6 +4,7 @@ description = "Soulseek client daemon with a web UI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 soulseek.workspace = true
@@ -17,7 +18,7 @@ tokio.workspace = true
 bytes.workspace = true
 anyhow = "1"
 axum = { version = "0.8", features = ["ws", "macros"] }
-tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 toml = "1"
@@ -42,3 +43,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 tokio-tungstenite = "0.29"
+
+[build-dependencies]
+brotli = "8"
+flate2 = "1"
+sha2 = "0.10"

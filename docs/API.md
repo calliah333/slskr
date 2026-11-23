@@ -11,7 +11,8 @@ keeps it in step with the router.
 
 - **JSON**: requests and responses are JSON (`Content-Type: application/json`). Field
   names and enum values are `snake_case`. Responses include every field, with `null` for
-  absent values; request fields marked optional may be left out.
+  absent values; request fields marked optional may be left out. Responses are compressed
+  with brotli or gzip when the request's `Accept-Encoding` allows it.
 - **Timestamps** are RFC 3339 UTC strings (`"2026-01-01T12:00:00.123Z"`). **Sizes** are
   bytes, **speeds** bytes per second, **durations** integer milliseconds in fields named
   `*_ms`.

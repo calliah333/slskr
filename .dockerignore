@@ -1,0 +1,11 @@
+# Only sources go into the build context.
+.git
+.direnv
+target
+dist
+ref
+result*
+data
+Dockerfile
+docker-compose.yml
+.dockerignore

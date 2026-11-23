@@ -5,8 +5,12 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>slskr</title>
     <base href="/" />
-    <link data-trunk rel="copy-dir" href="assets/static" />
-    <link rel="stylesheet" href="./static/css/slskd.css" />
+    <link data-trunk rel="icon" href="assets/favicon.svg" />
+    <link data-trunk rel="copy-dir" href="assets/static/media" data-target-path="static/media" />
+    <link data-trunk rel="css" href="assets/static/css/slskd.css" data-target-path="static/css" data-no-minify />
+    <link data-trunk rel="copy-file" href="../../LICENSE" />
+    <link data-trunk rel="copy-file" href="../../NOTICE" />
+    <link data-trunk rel="copy-dir" href="../../licenses" />
     <link data-trunk rel="rust" data-wasm-opt="z" />
   </head>
   <body>

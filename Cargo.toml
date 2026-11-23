@@ -32,3 +32,16 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# build.rs compresses the embedded web UI; build scripts are otherwise unoptimized.
+[profile.dev.package.brotli]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.release.package.brotli]
+opt-level = 3
+
+[profile.release.package.miniz_oxide]
+opt-level = 3

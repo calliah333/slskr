@@ -50,7 +50,8 @@ async fn daemon_http_smoke() {
     let child = Command::new(env!("CARGO_BIN_EXE_slskr"))
         .arg("--data-dir")
         .arg(data_dir.path())
-        .env("SLSKR_CONTENT_PATH", &content_dir)
+        .arg("--web-dir")
+        .arg(&content_dir)
         .env_remove("SLSKR_DATA_DIR")
         .env_remove("SLSKR_CONFIG")
         .kill_on_drop(true)
@@ -118,6 +119,23 @@ async fn daemon_http_smoke() {
         assert!(cookie.split("; ").any(|a| a == attribute), "{cookie}");
     }
     assert!(!cookie.contains("Secure"), "{cookie}");
+
+    // JSON responses are compressed when the client asks for it.
+    for (accept, expected) in [
+        ("br", Some("br")),
+        ("gzip", Some("gzip")),
+        ("identity", None),
+    ] {
+        let response = client
+            .get(format!("{api}/application"))
+            .header("accept-encoding", accept)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let encoding = response.headers().get("content-encoding");
+        assert_eq!(encoding.map(|v| v.to_str().unwrap()), expected, "{accept}");
+    }
     let login: Value = login.json().await.unwrap();
     assert_eq!(
         login,

@@ -1,0 +1,24 @@
+# docker compose up -d, then open http://localhost:5030
+services:
+  slskr:
+    build: .
+    image: slskr
+    container_name: slskr
+    restart: unless-stopped
+    ports:
+      - "5030:5030" # web UI
+      - "50300:50300" # incoming Soulseek connections; forward this port on your router
+    environment:
+      # Web sign-in. Set SLSKR_WEB_PASSWORD in a .env file next to this one.
+      SLSKR_WEB_USERNAME: admin
+      SLSKR_WEB_PASSWORD: ${SLSKR_WEB_PASSWORD:?set SLSKR_WEB_PASSWORD in .env}
+      # Everything else, including the Soulseek account, can be set in the UI.
+      # SLSKR_SOULSEEK_USERNAME: your-soulseek-account
+      # SLSKR_SOULSEEK_PASSWORD: ${SLSKR_SOULSEEK_PASSWORD}
+    volumes:
+      - slskr-data:/data
+      # Files to share; add /music under System -> Options -> Shares.
+      # - /path/to/music:/music:ro
+
+volumes:
+  slskr-data:

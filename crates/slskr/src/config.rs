@@ -41,7 +41,7 @@ pub const FILE_NAME: &str = "slskr.toml";
 /// Prefix of configuration environment variables.
 pub const ENV_PREFIX: &str = "SLSKR_";
 /// `SLSKR_*` process variables that are not configuration keys.
-pub const RESERVED_ENV: [&str; 3] = ["SLSKR_DATA_DIR", "SLSKR_CONFIG", "SLSKR_CONTENT_PATH"];
+pub const RESERVED_ENV: [&str; 3] = ["SLSKR_DATA_DIR", "SLSKR_CONFIG", "SLSKR_WEB_DIR"];
 /// Longest name of an API key created from the settings API.
 const API_KEY_NAME_LIMIT: usize = 64;
 
@@ -1299,7 +1299,7 @@ mod tests {
             ("SLSKR_SHARES_DIRECTORIES", "/a, [B]/b ,"),
             ("SLSKR_GROUPS_LEECHERS_MIN_SHARED_FILES", "3"),
             ("SLSKR_RETENTION_SEARCHES", ""),
-            ("SLSKR_CONTENT_PATH", "/ignored"),
+            ("SLSKR_WEB_DIR", "/ignored"),
             ("SLSKR_DATA_DIR", "/ignored"),
             ("SLSKR_UNRELATED", "x"),
         ])

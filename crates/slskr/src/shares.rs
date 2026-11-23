@@ -791,7 +791,7 @@ mod tests {
                 db_dir: temp.path().join("db"),
                 config_file,
                 logs_dir: temp.path().join("logs"),
-                content_path: None,
+                web_dir: None,
             },
             options,
             state: StateStore::new(),

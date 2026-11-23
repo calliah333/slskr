@@ -4,6 +4,7 @@ description = "slskr web UI (Leptos, client-side rendered)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 slskr-types.workspace = true

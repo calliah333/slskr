@@ -21,5 +21,6 @@ pub mod state;
 pub mod telemetry;
 pub mod transfers;
 pub mod users;
+pub mod web;
 
 pub use bootstrap::{Cli, run};

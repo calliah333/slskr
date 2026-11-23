@@ -5,3 +5,4 @@ result-*
 dist/
 /data/
 .direnv/
+.env

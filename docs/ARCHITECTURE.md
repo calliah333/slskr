@@ -8,7 +8,8 @@ with real Soulseek clients and servers, not file-by-file). Reference sources are
 (read-only, git-ignored) under `ref/Soulseek.NET` and `ref/slskd`.
 
 Toolchain: `nix develop` (flake.nix) provides stable Rust (edition 2024) with the
-`wasm32-unknown-unknown` target, `trunk`, `wasm-bindgen-cli` 0.2.130.
+`wasm32-unknown-unknown` target, `trunk` and `wasm-bindgen-cli` 0.2.130 (pinned in
+`crates/slskr-web`; the Dockerfile downloads the same versions).
 
 ## Crates
 
@@ -16,7 +17,7 @@ Toolchain: `nix develop` (flake.nix) provides stable Rust (edition 2024) with th
 |---|---|---|
 | `crates/soulseek` | lib | async (tokio) Soulseek network client |
 | `crates/slskr-types` | lib | serde types of the HTTP API and live events; shared by daemon and UI |
-| `crates/slskr` | bin `slskr` (+ lib) | the daemon: axum HTTP API, live events WebSocket, services, sqlite |
+| `crates/slskr` | bin `slskr` (+ lib) | the daemon: axum HTTP API, live events WebSocket, services, sqlite, the embedded UI |
 | `crates/slskr-web` | bin (wasm) | Leptos 0.8 CSR port of the slskd React UI, built with trunk |
 
 ## soulseek crate layout
@@ -164,3 +165,14 @@ in `assets/static/media`), so UI components must emit the same DOM/class names a
 semantic-ui-react.
 `src/ui/` holds semantic-ui-react equivalents; `src/services/` ports `src/lib/*.js`;
 `src/components/` ports `src/components/**`.
+
+## Build and packaging
+
+`trunk build --release` in `crates/slskr-web` writes the UI to the workspace `dist/`:
+`index.html`, the hashed wasm/JS, the hashed stylesheet under `static/css/`, fonts and
+flags under `static/media/`, a favicon, and `LICENSE`/`NOTICE`/`licenses/`. Building the
+daemon with `SLSKR_EMBED_UI=<dist>` compiles those files into the binary (see
+[daemon internals](DAEMON.md#web-ui-webrs-buildrs)), so a release is one executable.
+`nix build .#slskr` builds the UI as its own derivation (`.#slskr-web`) and passes it in;
+the Dockerfile does the same in two stages and copies the binary onto distroless. During
+UI work, `slskr --web-dir dist` serves the trunk output from disk instead.

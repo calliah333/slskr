@@ -207,10 +207,15 @@ Prometheus exposition.
 
 ## Process settings
 
-Not configuration keys, so never pinned: `--data-dir` / `SLSKR_DATA_DIR` (data directory,
-default `$XDG_DATA_HOME/slskr` or `~/.local/share/slskr`), `--config` / `SLSKR_CONFIG`
-(configuration file, default `<data_dir>/slskr.toml`), `SLSKR_CONTENT_PATH` (web UI files)
-and `RUST_LOG`.
+Not configuration keys, so never pinned (`slskr --help` lists them):
+
+| Flag | Environment | Description |
+| --- | --- | --- |
+| `--data-dir DIR` | `SLSKR_DATA_DIR` | Data directory; default `$XDG_DATA_HOME/slskr` or `~/.local/share/slskr`. |
+| `--config FILE` | `SLSKR_CONFIG` | Configuration file; default `<data_dir>/slskr.toml`. |
+| `--no-connect` | | Start without connecting to Soulseek (`soulseek.connect = false`). |
+| `--web-dir DIR` | `SLSKR_WEB_DIR` | Serve the web UI from a trunk build instead of the copy in the binary (UI development). |
+| | `RUST_LOG` | Log filter; overrides `logging.level`. |
 
 ## Settings API
 

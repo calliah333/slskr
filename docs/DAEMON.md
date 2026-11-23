@@ -7,12 +7,14 @@ in [API.md](API.md).
 src/main.rs           CLI entry (clap), calls slskr::run()
 src/lib.rs            module declarations, pub async fn run(cli) (bootstrap)
 src/app.rs            AppState / Core / Services / Paths (contract), Snapshots for the events socket
-src/bootstrap.rs      CLI (--data-dir, --config, --no-connect), App::build + run(): load config, build core + services, api_routes() (every route), bind HTTP
+src/bootstrap.rs      CLI (--data-dir, --config, --no-connect, --web-dir), build + run(): load config, build core + services, api_routes() (every route), router, bind HTTP
 src/config.rs         ConfigStore: layers (settings.json, slskr.toml, SLSKR_*, CLI) -> slskr_types::config::Config, pinned keys, settings API, validation, file watch
 src/config/store.rs   settings.json: sparse settings tree, web password hash, API key digests (lenient load)
 src/state.rs          StateStore: application State, coalesced "state" events
 src/db.rs             Database: sqlite wrapper with migrations
-src/http.rs           ApiError, Json/Path/Query extractors, json_errors middleware, Routes builder, static files + SPA fallback, urlBase
+src/http.rs           ApiError, Json/Path/Query extractors, json_errors middleware, Routes builder
+src/web.rs            web UI: embedded files (build.rs) or --web-dir, caching, SPA fallback, urlBase
+build.rs              embeds the trunk output named by SLSKR_EMBED_UI (or a placeholder page)
 src/core_api.rs       /application, /auth, /session, /server, /config, /settings, /api-keys routes
 src/auth/             Auth (sessions, API keys, Origin checks, extractors); session.rs: SessionStore, sessions.db
 src/resolvers.rs      impl soulseek::Resolvers by delegating to services
@@ -51,7 +53,7 @@ are matched against the serialized defaults, so keys containing `_` and nested t
 (`SLSKR_UPLOADS_LIMITS_QUEUED_FILES`) need no extra separator; values are typed like the
 default (booleans, integers, comma-separated lists, strings). `[[web.api_keys]]` and
 user-defined `[groups.<name>]` cannot come from the environment. `SLSKR_DATA_DIR`,
-`SLSKR_CONFIG` and `SLSKR_CONTENT_PATH` are process settings, not keys; other `SLSKR_*`
+`SLSKR_CONFIG` and `SLSKR_WEB_DIR` are process settings, not keys; other `SLSKR_*`
 names outside the configuration sections are ignored, while an unknown key inside a section
 is an error. [CONFIGURATION.md](CONFIGURATION.md) lists every key; a test keeps it complete.
 
@@ -167,10 +169,24 @@ Each service module exposes `pub fn routes() -> http::Routes`, built with
 `Routes` records every `(method, path)` it registers; `bootstrap::api_routes()` merges the
 modules and adds the events socket (`GET /api/events`), and a test compares that table
 with [API.md](API.md), so a route can not be added without documenting it. `bootstrap`
-adds catch-all JSON 404s for `/api` and `/api/{*rest}`, layers `json_errors` over them,
-merges `/health` and the Prometheus path, and nests the whole set under `web.url_base`
-(keeping the root reachable for proxies that strip the prefix). The static router never
-answers `{url_base}/api/...` with `index.html`.
+adds catch-all JSON 404s for `/api` and `/api/{*rest}`, layers `json_errors` and response
+compression (brotli/gzip, fastest level) over them, merges the events socket without
+compression, adds `/health` and the Prometheus path, and nests the whole set under
+`web.url_base` (keeping the root reachable for proxies that strip the prefix). The web UI
+router (`web.rs`) is merged beside it and never answers `{url_base}/api/...` with
+`index.html`.
+
+### Web UI (`web.rs`, `build.rs`)
+`build.rs` embeds the trunk output named by `SLSKR_EMBED_UI` at compile time: every file
+with its content type, a SHA-256 ETag and brotli/gzip variants when they save at least 10%.
+Without the variable the binary embeds a placeholder page explaining how to build the UI,
+so `cargo build` and `cargo test` need no wasm toolchain. `--web-dir DIR` serves a
+directory instead (UI development; paths are confined to the directory, symlinks
+included). Names with a content hash (`slskr-web-<hash>_bg.wasm`, `static/css/slskd-<hash>.css`)
+are sent with `Cache-Control: public, max-age=31536000, immutable`, everything else with
+`no-cache`; `If-None-Match` answers 304. `index.html` gets `<base href="{url_base}/">` and
+`window.urlBase` once at startup. Paths without an extension fall back to `index.html` so
+client-side routes deep-link.
 
 ### Service construction (in `bootstrap.rs`, this order)
 ```rust

@@ -46,8 +46,8 @@ pub struct Paths {
     pub db_dir: PathBuf,
     /// Log files (`{data_dir}/logs`).
     pub logs_dir: PathBuf,
-    /// Static web UI root (`SLSKR_CONTENT_PATH` or the packaged/sibling `wwwroot`), if any.
-    pub content_path: Option<PathBuf>,
+    /// Web UI directory from `--web-dir`; `None` serves the UI embedded in the binary.
+    pub web_dir: Option<PathBuf>,
 }
 
 /// Core handles every service may use. Cheap to clone.

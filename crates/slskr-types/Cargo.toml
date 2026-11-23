@@ -4,6 +4,7 @@ description = "Types of the slskr HTTP API and live events, shared by the daemon
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true

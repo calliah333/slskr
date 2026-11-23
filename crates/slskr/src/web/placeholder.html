@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>slskr</title>
+    <base href="/" />
+    <style>
+      body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; }
+      code, pre { background: #8882; border-radius: 4px; padding: 0 0.25em; }
+      pre { padding: 0.75em; overflow-x: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>slskr is running</h1>
+    <p>This build of the daemon does not include the web UI. The API is available under <code>api/</code>.</p>
+    <p>Build the UI, then either point the daemon at it or embed it in a release build:</p>
+    <pre>(cd crates/slskr-web &amp;&amp; trunk build --release)
+slskr --web-dir dist
+SLSKR_EMBED_UI="$PWD/dist" cargo build --release -p slskr</pre>
+  </body>
+</html>

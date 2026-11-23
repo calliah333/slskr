@@ -1,5 +1,5 @@
 {
-  description = "slskr - a Soulseek server daemon and web UI written in Rust";
+  description = "slskr: a Soulseek client daemon with a web UI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -57,11 +57,19 @@
               let
                 rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
               in
-              !(pkgs.lib.hasPrefix "ref" rel || pkgs.lib.hasPrefix "target" rel || rel == "result");
+              !(builtins.any (prefix: pkgs.lib.hasPrefix prefix rel) [
+                "ref"
+                "target"
+                "dist"
+                "result"
+                "data"
+                ".direnv"
+              ]);
           };
           cargoLock.lockFile = ./Cargo.lock;
-          version = "0.1.0";
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
+          # The web UI (trunk output). The daemon embeds it at build time.
           slskr-web = rustPlatform.buildRustPackage {
             pname = "slskr-web";
             inherit version src cargoLock;
@@ -72,22 +80,19 @@
             ];
             buildPhase = ''
               runHook preBuild
-              cd crates/slskr-web
-              HOME=$TMPDIR NO_COLOR=true trunk build --release --frozen --dist "$TMPDIR/dist"
-              cd ../..
+              (cd crates/slskr-web && HOME=$TMPDIR NO_COLOR=true trunk build --release --frozen --dist "$TMPDIR/dist")
               runHook postBuild
             '';
             installPhase = ''
               runHook preInstall
-              mkdir -p $out/share/slskr
-              cp -r $TMPDIR/dist $out/share/slskr/wwwroot
-              cp LICENSE NOTICE $out/share/slskr/wwwroot/
-              cp -r licenses $out/share/slskr/wwwroot/
+              mkdir -p $out
+              cp -r $TMPDIR/dist/. $out/
               runHook postInstall
             '';
             doCheck = false;
           };
 
+          # A single binary with the web UI built in.
           slskr = rustPlatform.buildRustPackage {
             pname = "slskr";
             inherit version src cargoLock;
@@ -101,19 +106,20 @@
               "-p"
               "soulseek"
             ];
-            nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
+            env.SLSKR_EMBED_UI = "${slskr-web}";
+            nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [
               pkgs.sqlite
             ];
             postInstall = ''
-              mkdir -p $out/share/slskr
-              cp -r ${slskr-web}/share/slskr/wwwroot $out/share/slskr/wwwroot
-              cp LICENSE NOTICE $out/
-              cp LICENSE $out/bin/
-              cp -r licenses $out/
-              wrapProgram $out/bin/slskr --set-default SLSKR_CONTENT_PATH $out/share/slskr/wwwroot
+              install -Dm644 -t $out/share/doc/slskr LICENSE NOTICE README.md
+              cp -r licenses $out/share/doc/slskr/
             '';
-            meta.mainProgram = "slskr";
+            meta = {
+              description = "Soulseek client daemon with a web UI";
+              license = pkgs.lib.licenses.agpl3Plus;
+              mainProgram = "slskr";
+            };
           };
         in
         {

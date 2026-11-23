@@ -1,62 +1,81 @@
 # slskr
 
-A Rust Soulseek client daemon with a browser UI. `soulseek` is a standalone Tokio
-library, `slskr` serves the daemon and its [HTTP API](docs/API.md) under `/api`, and
-`slskr-web` builds the Leptos UI to WebAssembly. It connects to an existing Soulseek server; it does not
-replace the central Soulseek server.
+slskr is a self-hosted [Soulseek](https://www.slsknet.org) client: a daemon that stays
+connected to the Soulseek network, shares your files, and lets you search, download and
+chat from a web UI. It is a single binary with the UI built in, written in Rust, and
+started as a port of [slskd](https://github.com/slskd/slskd).
 
-## Run on NixOS
+## Quick start
 
-slskr keeps its settings, databases, logs and default download directories in a data
-directory: `$XDG_DATA_HOME/slskr` (usually `~/.local/share/slskr`), or the one given with
-`--data-dir`. Most settings are changed in the web UI (System → Options) and saved to
-`settings.json` there. Infrastructure you want in a file, or credentials you provision
-before the first start, go in an optional `slskr.toml` (or the file given with
-`--config`); start from the short [`slskr.example.toml`](slskr.example.toml):
-
-```toml
-[soulseek]
-username = "your-soulseek-account"
-password = "..."
-
-[web]
-username = "admin"
-password = "a separate password for the browser"
-```
-
-Then start it:
+### Docker Compose
 
 ```sh
-nix run . -- --data-dir "$HOME/.local/share/slskr"
+echo 'SLSKR_WEB_PASSWORD=choose-a-password' > .env
+docker compose up -d
 ```
 
-Open `http://127.0.0.1:5030` (`web.listen`). The flake packages the daemon and UI
-together. Configure `shares.directories` to share files and `soulseek.listen_port` for
-incoming peers. Use only directories you intend to share. To inspect the UI without
-connecting to Soulseek, pass `--no-connect` (or set `soulseek.connect = false`).
+Open <http://localhost:5030>, sign in as `admin`, and enter your Soulseek account under
+System → Options. Settings, databases and downloads live in the `slskr-data` volume
+(`/data`). To share music, uncomment the bind mount in
+[`docker-compose.yml`](docker-compose.yml) and add `/music` to the shares. Forward port
+50300 on your router so other users can connect to you.
 
-Settings are layered, lowest precedence first: defaults, the UI's `settings.json`,
-`slskr.toml`, `SLSKR_<SECTION>_<KEY>` environment variables (for example
-`SLSKR_SOULSEEK_PASSWORD` or `SLSKR_WEB_LISTEN`; lists are comma-separated), then
-command-line flags. A key set in the file, the environment or on the command line is
-locked in the UI. Changes apply without a restart except for the web listener, URL base,
-authentication switch, logging, metrics, slot counts and incoming search concurrency; the
-UI shows when a restart is pending. [docs/CONFIGURATION.md](docs/CONFIGURATION.md) lists
-every key. Keep credentials out of Git.
+### Nix
 
-## Develop
+```sh
+nix run . -- --data-dir ~/.local/share/slskr
+```
+
+`nix build .#slskr` puts the same single binary in `result/bin/slskr`. Before the first
+start, put web credentials in `~/.local/share/slskr/slskr.toml` (see below).
+
+### From source
+
+Needs Rust, the `wasm32-unknown-unknown` target, [trunk](https://trunkrs.dev) and
+`wasm-bindgen-cli` 0.2.130 (`nix develop` provides all of them).
+
+```sh
+(cd crates/slskr-web && trunk build --release)
+SLSKR_EMBED_UI="$PWD/dist" cargo build --release -p slskr
+./target/release/slskr --help
+```
+
+## Configuration
+
+Most settings are changed in the web UI (System → Options). Things you want to keep in a
+file or set before the first start (web credentials, the listen address, the URL base
+behind a reverse proxy) go in `slskr.toml` in the data directory or in
+`SLSKR_<SECTION>_<KEY>` environment variables; anything set there is locked in the UI.
+Start from [`slskr.example.toml`](slskr.example.toml); [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
+lists every key.
+
+```toml
+[web]
+username = "admin"
+password = "a password for the web UI"
+```
+
+## Development
 
 ```sh
 nix develop
 cargo test --locked --workspace
-(cd crates/slskr-web && NO_COLOR=true trunk build --frozen)
-SLSKR_CONTENT_PATH="$PWD/dist" cargo run --locked -p slskr -- --data-dir ./data
+
+# UI work: rebuild on change in one terminal, serve the result in another
+(cd crates/slskr-web && trunk watch)
+cargo run -p slskr -- --data-dir ./data --web-dir dist --no-connect
 ```
 
-Protocol and transfer tests use loopback fixtures and do not require a public
-Soulseek account. See [architecture](docs/ARCHITECTURE.md) for the crate layout.
-For repository conventions, upstream references, and targeted checks, see
-[AGENTS.md](AGENTS.md).
+A plain `cargo build` embeds a placeholder page instead of the UI; `--web-dir`
+(`SLSKR_WEB_DIR`) serves a trunk build from disk, so UI changes need only a
+rebuild and a browser reload. See [architecture](docs/ARCHITECTURE.md) for the crate
+layout and [AGENTS.md](AGENTS.md) for conventions and checks.
+
+## API
+
+Everything the UI does goes through a JSON API under `/api`, with live updates on one
+WebSocket. Create an API key in the UI to script it; [docs/API.md](docs/API.md) lists
+every route.
 
 ## Attribution
 
@@ -69,4 +88,5 @@ or affiliated with the Soulseek.NET project or its author(s).
 The gitignored reference checkouts are [`ref/slskd`](https://github.com/slskd/slskd)
 and [`ref/Soulseek.NET`](https://github.com/jpdillingham/Soulseek.NET). See
 [NOTICE](NOTICE), [LICENSE](LICENSE), and the [upstream notices](licenses/) for
-source revisions, attribution, and license terms.
+source revisions, attribution, and license terms. slskr is licensed under the
+AGPL-3.0-or-later.

@@ -33,20 +33,23 @@ use crate::{
     resolvers::AppResolvers,
     search, shares,
     state::StateStore,
-    telemetry, transfers, users,
+    telemetry, transfers, users, web,
 };
 
-/// Command line. Everything else is configured in the web UI, `slskr.toml` or `SLSKR_*`
-/// variables.
+/// Command line. Everything else is configured in the web UI, `slskr.toml` or
+/// `SLSKR_<SECTION>_<KEY>` variables.
 #[derive(Debug, Parser)]
 #[command(
     name = "slskr",
     version,
-    about = "Soulseek client daemon with a web UI"
+    about = "Soulseek client daemon with a web UI",
+    after_help = "Most settings are changed in the web UI. Keys set in <DATA_DIR>/slskr.toml or as \
+                  SLSKR_<SECTION>_<KEY> environment variables (e.g. SLSKR_WEB_LISTEN=0.0.0.0:5030) \
+                  override it; see docs/CONFIGURATION.md."
 )]
 pub struct Cli {
-    /// Data directory holding the configuration, databases, logs and default download
-    /// directories [default: $XDG_DATA_HOME/slskr or ~/.local/share/slskr]
+    /// Data directory: configuration, databases, logs and downloads
+    /// [default: $XDG_DATA_HOME/slskr or ~/.local/share/slskr]
     #[arg(long, value_name = "DIR", env = "SLSKR_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     /// Configuration file [default: <DATA_DIR>/slskr.toml]
@@ -55,6 +58,9 @@ pub struct Cli {
     /// Do not connect to the Soulseek server (overrides soulseek.connect)
     #[arg(long)]
     pub no_connect: bool,
+    /// Serve the web UI from DIR (e.g. the trunk output dist/) instead of the built-in copy
+    #[arg(long, value_name = "DIR", env = "SLSKR_WEB_DIR")]
+    pub web_dir: Option<PathBuf>,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -63,6 +69,18 @@ pub async fn run(cli: Cli) -> Result<()> {
         cli.config
             .unwrap_or_else(|| data_dir.join(config::FILE_NAME)),
     )?;
+    let web_dir = cli
+        .web_dir
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(std::path::absolute)
+        .transpose()?;
+    if let Some(dir) = &web_dir {
+        anyhow::ensure!(
+            dir.join("index.html").is_file(),
+            "--web-dir {}: index.html not found (build the UI with trunk first)",
+            dir.display()
+        );
+    }
     let sources = Sources::from_env(
         data_dir.clone(),
         Overrides {
@@ -75,7 +93,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         .await
         .with_context(|| format!("binding web.listen {listen}"))?;
 
-    let app = build(data_dir, config_file, options).await?;
+    let app = build(data_dir, config_file, web_dir, options).await?;
 
     let _cancel_on_drop = app.shutdown.clone().drop_guard();
     let router = router(&app);
@@ -120,14 +138,18 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) -> Result<AppState> {
+async fn build(
+    data_dir: PathBuf,
+    config_file: PathBuf,
+    web_dir: Option<PathBuf>,
+    options: ConfigStore,
+) -> Result<AppState> {
     let startup = options.startup();
-    let exe = std::env::current_exe()?;
     let paths = Paths {
         config_file,
         db_dir: data_dir.join("db"),
         logs_dir: data_dir.join("logs"),
-        content_path: discover_content(&exe, std::env::var_os("SLSKR_CONTENT_PATH")),
+        web_dir,
         data_dir,
     };
     tokio::fs::create_dir_all(&paths.db_dir).await?;
@@ -136,10 +158,12 @@ async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) ->
     let bus = EventBus::new();
     let logs = logging::init(startup, &paths, bus.clone())?;
     warn_about_web_access(startup, &paths.config_file);
-    if paths.content_path.is_none() {
-        tracing::warn!(
-            "web UI files not found (set SLSKR_CONTENT_PATH to a directory containing index.html)"
-        );
+    match &paths.web_dir {
+        Some(dir) => tracing::info!(dir = %dir.display(), "serving the web UI from a directory"),
+        None if !web::EMBEDDED => tracing::warn!(
+            "this build does not include the web UI; build it with trunk and pass --web-dir, or rebuild with SLSKR_EMBED_UI"
+        ),
+        None => {}
     }
     let current = options.get();
     let sessions = SessionStore::open(
@@ -193,6 +217,11 @@ async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) ->
 /// Every API route, with paths starting at `/api` (below `web.url_base`). `docs/API.md`
 /// documents each of them; a test keeps the two in step.
 pub fn api_routes() -> Routes {
+    rest_routes().merge(socket_routes())
+}
+
+/// The JSON API, everything but the events WebSocket.
+fn rest_routes() -> Routes {
     Routes::new()
         .merge(core_api::routes())
         .merge(logging::routes())
@@ -204,7 +233,10 @@ pub fn api_routes() -> Routes {
         .merge(telemetry::routes())
         .merge(search::routes())
         .merge(messaging::routes())
-        .get(slskr_types::realtime::PATH, events_socket)
+}
+
+fn socket_routes() -> Routes {
+    Routes::new().get(slskr_types::realtime::PATH, events_socket)
 }
 
 /// `GET /api/events`: the live events WebSocket.
@@ -221,12 +253,26 @@ async fn events_socket(State(app): State<AppState>, request: Request) -> Respons
 }
 
 fn router(app: &AppState) -> Router {
+    use tower_http::compression::{CompressionLayer, CompressionLevel};
     let not_found = || async { http::error_response(StatusCode::NOT_FOUND, "") };
-    let api = api_routes()
+    // Compress JSON responses cheaply; the WebSocket is merged in after the layer.
+    let compression = CompressionLayer::new()
+        .br(true)
+        .gzip(true)
+        .no_deflate()
+        .no_zstd()
+        .quality(CompressionLevel::Fastest);
+    let api = rest_routes()
         .into_router()
         .route("/api", any(not_found))
         .route("/api/{*unknown}", any(not_found))
-        .layer(axum::middleware::from_fn(http::json_errors));
+        .layer(axum::middleware::from_fn(http::json_errors))
+        .layer(compression)
+        .merge(
+            socket_routes()
+                .into_router()
+                .layer(axum::middleware::from_fn(http::json_errors)),
+        );
     let mut endpoints = Router::new()
         .merge(api)
         .route("/health", get(|| async { StatusCode::OK }));
@@ -243,9 +289,7 @@ fn router(app: &AppState) -> Router {
     } else {
         endpoints.clone().nest(base, endpoints)
     };
-    if let Some(path) = &app.paths.content_path {
-        router = router.merge(http::static_router(path.clone(), base));
-    }
+    router = router.merge(web::router(app.paths.web_dir.clone(), base));
     router = router.layer(axum::middleware::from_fn_with_state(
         app.auth.clone(),
         auth::refresh_session_cookie,
@@ -317,35 +361,6 @@ fn warn_about_web_access(config: &Config, file: &Path) {
     }
 }
 
-/// `SLSKR_CONTENT_PATH`, else `wwwroot` next to the executable, else the packaged
-/// `../share/slskr/wwwroot` (and `dist/` in debug builds).
-fn discover_content(exe: &Path, configured: Option<OsString>) -> Option<PathBuf> {
-    if let Some(path) = configured.filter(|path| !path.is_empty()) {
-        let path = PathBuf::from(path);
-        return path.join("index.html").is_file().then_some(path);
-    }
-    let bin = exe.parent()?;
-    let installed = [
-        bin.join("wwwroot"),
-        bin.parent()?.join("share/slskr/wwwroot"),
-    ];
-    if let Some(found) = installed
-        .into_iter()
-        .find(|path| path.join("index.html").is_file())
-    {
-        return Some(found);
-    }
-    // Development convenience for `cargo run` after `trunk build`.
-    #[cfg(debug_assertions)]
-    {
-        let dist = Path::new("dist");
-        if dist.join("index.html").is_file() {
-            return Some(dist.to_owned());
-        }
-    }
-    None
-}
-
 async fn termination_signal() -> Result<()> {
     #[cfg(unix)]
     {
@@ -401,11 +416,14 @@ mod tests {
             "--config",
             "/etc/slskr.toml",
             "--no-connect",
+            "--web-dir",
+            "dist",
         ])
         .unwrap();
         assert_eq!(cli.data_dir.as_deref(), Some(Path::new("/tmp/slskr")));
         assert_eq!(cli.config.as_deref(), Some(Path::new("/etc/slskr.toml")));
         assert!(cli.no_connect);
+        assert_eq!(cli.web_dir.as_deref(), Some(Path::new("dist")));
         for removed in [
             &["slskr", "--app-dir", "/x"][..],
             &["slskr", "--set", "a=b"],
@@ -448,24 +466,6 @@ mod tests {
         assert!(
             undocumented.is_empty() && unrouted.is_empty(),
             "missing from docs/API.md: {undocumented:?}; documented but not routed: {unrouted:?}"
-        );
-    }
-
-    #[test]
-    fn discover_configured_and_packaged_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let executable = dir.path().join("bin/slskr");
-        let root = dir.path().join("share/slskr/wwwroot");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("index.html"), "shell").unwrap();
-        assert_eq!(discover_content(&executable, None), Some(root.clone()));
-        assert_eq!(
-            discover_content(&executable, Some(root.clone().into())),
-            Some(root)
-        );
-        assert_eq!(
-            discover_content(&executable, Some(dir.path().join("nonexistent").into())),
-            None
         );
     }
 }
