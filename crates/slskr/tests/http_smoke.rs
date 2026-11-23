@@ -55,9 +55,11 @@ async fn daemon_http_smoke() {
         .unwrap();
     let mut daemon = Daemon(child);
     let base = format!("http://127.0.0.1:{port}");
-    let api = format!("{base}/api/v0");
+    // The session cookie's path is the url_base, so use the prefixed API.
+    let api = format!("{base}/client/api/v0");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
+        .cookie_store(true)
         .build()
         .unwrap();
 
@@ -80,6 +82,9 @@ async fn daemon_http_smoke() {
     .await
     .expect("slskr HTTP listener did not become ready");
 
+    let anonymous = client.get(format!("{api}/session")).send().await.unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
     let denied = client
         .post(format!("{api}/session"))
         .json(&serde_json::json!({"username": "smoke", "password": "wrong"}))
@@ -88,9 +93,32 @@ async fn daemon_http_smoke() {
         .unwrap();
     assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let login: Value = client
+    let login = client
         .post(format!("{api}/session"))
         .json(&serde_json::json!({"username": "smoke", "password": "secret"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let cookie = login.headers()["set-cookie"].to_str().unwrap().to_owned();
+    assert!(cookie.starts_with("slskr_session="), "{cookie}");
+    for attribute in [
+        "HttpOnly",
+        "SameSite=Strict",
+        "Path=/client",
+        "Max-Age=2592000",
+    ] {
+        assert!(cookie.split("; ").any(|a| a == attribute), "{cookie}");
+    }
+    assert!(!cookie.contains("Secure"), "{cookie}");
+    let login: Value = login.json().await.unwrap();
+    assert_eq!(
+        login,
+        serde_json::json!({"username": "smoke", "role": "Administrator"})
+    );
+    let session: Value = client
+        .get(format!("{api}/session"))
         .send()
         .await
         .unwrap()
@@ -99,11 +127,10 @@ async fn daemon_http_smoke() {
         .json()
         .await
         .unwrap();
-    assert_eq!(login["tokenType"], "Bearer");
-    let token = login["token"].as_str().expect("login response token");
+    assert_eq!(session, login);
+
     let authorized = client
         .get(format!("{api}/application"))
-        .bearer_auth(token)
         .send()
         .await
         .unwrap()
@@ -115,7 +142,6 @@ async fn daemon_http_smoke() {
 
     let options: Value = client
         .get(format!("{api}/options"))
-        .bearer_auth(token)
         .send()
         .await
         .unwrap()
@@ -131,7 +157,6 @@ async fn daemon_http_smoke() {
 
     let file = client
         .get(format!("{api}/options/toml"))
-        .bearer_auth(token)
         .send()
         .await
         .unwrap()
@@ -146,7 +171,6 @@ async fn daemon_http_smoke() {
     assert_eq!(file.text().await.unwrap(), config);
     let invalid = client
         .put(format!("{api}/options/toml"))
-        .bearer_auth(token)
         .header("content-type", "application/toml")
         .body("[web]\nlisten = \"nowhere\"\n")
         .send()
@@ -157,18 +181,12 @@ async fn daemon_http_smoke() {
     // Deleting a missing download is a 404; deletion is confined to the downloads root.
     let deletion = client
         .delete(format!("{api}/files/downloads/files/c2FtcGxlLnR4dA%3D%3D"))
-        .bearer_auth(token)
         .send()
         .await
         .unwrap();
     assert_eq!(deletion.status(), reqwest::StatusCode::NOT_FOUND);
 
-    let scan = client
-        .put(format!("{api}/shares"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .unwrap();
+    let scan = client.put(format!("{api}/shares")).send().await.unwrap();
     // The startup scan may still be running.
     assert!(
         scan.status().is_success() || scan.status() == reqwest::StatusCode::CONFLICT,
@@ -179,7 +197,6 @@ async fn daemon_http_smoke() {
         loop {
             let response = client
                 .get(format!("{api}/shares/contents"))
-                .bearer_auth(token)
                 .send()
                 .await
                 .unwrap();
@@ -218,11 +235,52 @@ async fn daemon_http_smoke() {
 
     let missing = client
         .get(format!("{api}/not-a-route"))
-        .bearer_auth(token)
         .send()
         .await
         .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // A page on another site cannot use the cookie to change state.
+    let forged = client
+        .put(format!("{api}/shares"))
+        .header("origin", "http://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::FORBIDDEN);
+    let forged = client
+        .post(format!("{api}/session"))
+        .header("origin", "http://evil.example")
+        .json(&serde_json::json!({"username": "smoke", "password": "secret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::FORBIDDEN);
+    let same_origin = client
+        .post(format!("{api}/application/loopback"))
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same_origin.status(), reqwest::StatusCode::OK);
+
+    let logout = client
+        .delete(format!("{api}/session"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+    let cleared = logout.headers()["set-cookie"].to_str().unwrap();
+    assert!(cleared.starts_with("slskr_session=;"), "{cleared}");
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    for path in ["/session", "/application"] {
+        let response = client.get(format!("{api}{path}")).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
 
     daemon.0.start_kill().unwrap();
     daemon.0.wait().await.unwrap();

@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{AppInner, AppState, Core, Hubs, Paths, Services},
-    auth::{Auth, Role},
+    auth::{self, Auth, Role, SessionStore},
     config::{self, ConfigStore, Overrides, Sources},
     core_api, events, files, http, logging, messaging,
     resolvers::AppResolvers,
@@ -70,14 +70,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         .await
         .with_context(|| format!("binding web.listen {listen}"))?;
 
-    let startup_key: [u8; 32] = rand::random();
-    let app = build(data_dir, config_file, options, &startup_key).await?;
+    let app = build(data_dir, config_file, options).await?;
 
     let _cancel_on_drop = app.shutdown.clone().drop_guard();
     let router = router(&app);
     let client_events_done = CancellationToken::new();
     let _cancel_events_on_drop = client_events_done.clone().drop_guard();
-    let client_events = app.start(startup_key, client_events_done.clone());
+    let client_events = app.start(client_events_done.clone());
 
     let mut servers = JoinSet::new();
     tracing::info!(address = %tcp.local_addr()?, "HTTP listener started");
@@ -116,12 +115,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn build(
-    data_dir: PathBuf,
-    config_file: PathBuf,
-    options: ConfigStore,
-    startup_key: &[u8],
-) -> Result<AppState> {
+async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) -> Result<AppState> {
     let startup = options.startup();
     let exe = std::env::current_exe()?;
     let paths = Paths {
@@ -147,8 +141,17 @@ async fn build(
         search: Hub::new("search"),
         metrics: Hub::new("metrics"),
     };
+    let current = options.get();
+    let sessions = SessionStore::open(
+        &paths.db_dir.join("sessions.db"),
+        current.web.session_ttl,
+        &current.web.username,
+        &current.web.password,
+    )
+    .await
+    .context("opening sessions database")?;
     let auth =
-        Auth::new(config::auth_config(startup, startup_key)).with_url_base(&startup.web.url_base);
+        Auth::new(config::auth_config(&current), sessions).with_url_base(&startup.web.url_base);
     for hub in [&hubs.application, &hubs.search, &hubs.metrics] {
         hub.set_authorizer(auth.hub_authorizer(Role::ReadOnly));
     }
@@ -233,10 +236,14 @@ fn router(app: &AppState) -> Router {
     if let Some(path) = &app.paths.content_path {
         router = router.merge(http::static_router(path.clone(), base));
     }
+    router = router.layer(axum::middleware::from_fn_with_state(
+        app.auth.clone(),
+        auth::refresh_session_cookie,
+    ));
     if web.log_requests {
         use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
         // Log at INFO like slskd request logging; the span records the path only so query
-        // strings (SignalR `access_token`) never reach the logs.
+        // strings never reach the logs.
         router = router.layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {

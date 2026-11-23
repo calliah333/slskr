@@ -1,9 +1,9 @@
 //! Minimal SignalR client (JSON hub protocol over WebSockets), port of slskd `lib/hubFactory.js`.
 //!
 //! Behaves like `@microsoft/signalr`'s `HubConnection` as configured by slskd: negotiate
-//! (version 1) with the bearer token, WebSocket transport with `access_token` query
-//! parameter, JSON protocol, keep-alive pings, server timeout, and automatic reconnect
-//! with slskd's retry delays.
+//! (version 1), WebSocket transport, JSON protocol, keep-alive pings, server timeout, and
+//! automatic reconnect with slskd's retry delays. Both the negotiate request and the
+//! WebSocket upgrade are same-origin, so the browser attaches the session cookie.
 
 use std::{
     cell::{Cell, RefCell},
@@ -20,10 +20,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{CloseEvent, MessageEvent, RequestCredentials, WebSocket};
 
-use super::{
-    token::{get_token, is_passthrough_enabled},
-    util::{encode_uri_component, sleep},
-};
+use super::util::sleep;
 use crate::config::hub_base_url;
 
 /// Record separator terminating every JSON hub protocol message.
@@ -136,7 +133,6 @@ struct Negotiated {
     url: String,
     connection_id: Option<String>,
     connection_token: Option<String>,
-    access_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,7 +143,6 @@ struct NegotiateResponse {
     negotiate_version: Option<u32>,
     available_transports: Option<Vec<AvailableTransport>>,
     url: Option<String>,
-    access_token: Option<String>,
     error: Option<String>,
     #[serde(rename = "ProtocolVersion")]
     protocol_version: Option<Value>,
@@ -163,7 +158,6 @@ struct AvailableTransport {
 
 struct Inner {
     url: String,
-    use_access_token: bool,
     state: Cell<HubConnectionState>,
     socket: RefCell<Option<Socket>>,
     /// Incremented per socket; events from stale sockets are ignored.
@@ -484,12 +478,7 @@ impl Inner {
 
     /// Negotiates and opens a socket, resolving once the handshake completed.
     async fn start_internal(self: &Rc<Self>) -> Result<(), HubError> {
-        let token = if self.use_access_token {
-            get_token()
-        } else {
-            None
-        };
-        let negotiated = negotiate(&resolve_url(&self.url)?, token).await?;
+        let negotiated = negotiate(&resolve_url(&self.url)?).await?;
         if !matches!(
             self.state.get(),
             HubConnectionState::Connecting | HubConnectionState::Reconnecting
@@ -504,11 +493,6 @@ impl Inner {
             ws_url.push(if ws_url.contains('?') { '&' } else { '?' });
             ws_url.push_str("id=");
             ws_url.push_str(connection_token);
-        }
-        if let Some(token) = &negotiated.access_token {
-            ws_url.push(if ws_url.contains('?') { '&' } else { '?' });
-            ws_url.push_str("access_token=");
-            ws_url.push_str(&encode_uri_component(token));
         }
         if let Some(rest) = ws_url.strip_prefix("http") {
             ws_url = format!("ws{rest}");
@@ -640,15 +624,12 @@ fn negotiate_url(url: &str) -> String {
     out
 }
 
-async fn negotiate(url: &str, mut access_token: Option<String>) -> Result<Negotiated, HubError> {
+async fn negotiate(url: &str) -> Result<Negotiated, HubError> {
     let mut url = url.to_string();
     for _ in 0..MAX_REDIRECTS {
-        let mut builder = RequestBuilder::new(&negotiate_url(&url))
+        let builder = RequestBuilder::new(&negotiate_url(&url))
             .method(Method::POST)
-            .credentials(RequestCredentials::Include);
-        if let Some(token) = &access_token {
-            builder = builder.header("Authorization", &format!("Bearer {token}"));
-        }
+            .credentials(RequestCredentials::SameOrigin);
         let failed = |detail: String| {
             HubError(format!(
                 "Failed to complete negotiation with the server: {detail}"
@@ -676,9 +657,6 @@ async fn negotiate(url: &str, mut access_token: Option<String>) -> Result<Negoti
         }
         if let Some(redirect) = response.url {
             url = redirect;
-            if response.access_token.is_some() {
-                access_token = response.access_token;
-            }
             continue;
         }
         if let Some(transports) = &response.available_transports
@@ -704,7 +682,6 @@ async fn negotiate(url: &str, mut access_token: Option<String>) -> Result<Negoti
             url,
             connection_id: response.connection_id,
             connection_token,
-            access_token,
         });
     }
     Err(HubError("Negotiate redirection limit exceeded.".into()))
@@ -718,13 +695,9 @@ pub struct HubConnection {
 
 impl HubConnection {
     /// Creates a disconnected connection to the hub at `url` (absolute or relative to the page).
-    ///
-    /// Like slskd's `accessTokenFactory`, the stored token is sent unless passthrough auth is
-    /// active at construction time.
     pub fn new(url: impl Into<String>) -> Self {
         let inner = Rc::new(Inner {
             url: url.into(),
-            use_access_token: !is_passthrough_enabled(),
             state: Cell::new(HubConnectionState::Disconnected),
             socket: RefCell::new(None),
             generation: Cell::new(0),

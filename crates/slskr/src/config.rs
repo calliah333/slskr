@@ -30,8 +30,6 @@ pub const FILE_NAME: &str = "slskr.toml";
 pub const ENV_PREFIX: &str = "SLSKR_";
 /// `SLSKR_*` process variables that are not configuration keys.
 pub const RESERVED_ENV: [&str; 3] = ["SLSKR_DATA_DIR", "SLSKR_CONFIG", "SLSKR_CONTENT_PATH"];
-/// Lifetime of issued web tokens.
-pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(7 * 86_400);
 
 /// Command-line settings that override the file and environment.
 #[derive(Clone, Debug, Default)]
@@ -500,6 +498,10 @@ fn validate(c: &Config) -> Result<()> {
         !web.auth || !web.username.trim().is_empty(),
         "web.username may not be blank while web.auth is enabled"
     );
+    ensure!(
+        (Duration::from_secs(300)..=Duration::from_secs(365 * 86_400)).contains(&web.session_ttl),
+        "web.session_ttl must be between 5m and 365d"
+    );
     let mut names = HashSet::new();
     let mut keys = HashSet::new();
     for (i, key) in web.api_keys.iter().enumerate() {
@@ -633,7 +635,11 @@ fn valid_web_path(path: &str) -> bool {
             .split('/')
             .any(|segment| segment.starts_with(':') || matches!(segment, "." | ".."))
         && !path.chars().any(|c| {
-            c.is_whitespace() || matches!(c, '?' | '#' | '{' | '}' | '*' | '\\' | '"' | '<' | '>')
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '?' | '#' | '{' | '}' | '*' | '\\' | '"' | '<' | '>' | ';'
+                )
         })
         && path.parse::<axum::http::Uri>().is_ok()
 }
@@ -763,14 +769,13 @@ pub(crate) fn client_patch(old: &ClientOptions, c: &Config) -> Result<ClientOpti
     })
 }
 
-pub(crate) fn auth_config(c: &Config, token_key: &[u8]) -> AuthConfig {
+pub(crate) fn auth_config(c: &Config) -> AuthConfig {
     let web = &c.web;
     AuthConfig {
         disabled: !web.auth,
         username: web.username.clone(),
         password: web.password.clone(),
-        jwt_key: token_key.to_vec(),
-        jwt_ttl_ms: TOKEN_TTL.as_millis() as u64,
+        session_ttl: web.session_ttl,
         api_keys: web
             .api_keys
             .iter()
@@ -962,6 +967,8 @@ mod tests {
             ("[web]\nlisten = 5030", "web.listen"),
             ("[web]\nurl_base = \"/api\"", "web.url_base"),
             ("[web]\nusername = \" \"", "web.username"),
+            ("[web]\nsession_ttl = \"1m\"", "web.session_ttl"),
+            ("[web]\nsession_ttl = \"400d\"", "web.session_ttl"),
             (
                 "[[web.api_keys]]\nname = \"a\"\nkey = \"short\"",
                 "web.api_keys[0].key",

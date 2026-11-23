@@ -22,7 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 toml = "1"
 rusqlite = { version = "0.37", features = ["bundled", "limits"] }
-jsonwebtoken = "9"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 walkdir = "2"
@@ -38,6 +37,7 @@ cap-std = "3"
 cap-fs-ext = "3"
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"

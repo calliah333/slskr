@@ -135,8 +135,10 @@ contains a minimal SignalR client over `web_sys::WebSocket`.
 ## HTTP API
 
 `/api/v0/...` exactly as slskd (`ref/slskd/src/slskd/**/API/**Controller.cs`).
-Auth: JWT bearer (`Authorization: Bearer`, or `access_token` query param for hubs),
-API keys (`X-API-Key`), or disabled auth (passthrough, token `n/a`).
+Auth: server-side sessions behind an `HttpOnly`, `SameSite=Strict` cookie (`slskr_session`,
+set by `POST /api/v0/session`, cleared by `DELETE`), API keys (`X-API-Key`), or disabled
+auth (passthrough). Browsers send the cookie on same-origin fetches and hub WebSocket
+upgrades; see [daemon internals](DAEMON.md#authentication).
 
 ## Web UI
 

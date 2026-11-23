@@ -1,4 +1,7 @@
-//! Session (login) DTOs.
+//! Session (sign-in) DTOs.
+//!
+//! `POST /api/v0/session` signs in with [`LoginRequest`] and sets the `slskr_session`
+//! cookie; `GET` returns the caller's [`Session`]; `DELETE` signs out.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,17 +13,14 @@ pub struct LoginRequest {
     pub password: Option<String>,
 }
 
-/// JWT issued on login. Times are unix seconds.
+/// The authenticated caller (`GET /api/v0/session`, and the `POST` response).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct TokenResponse {
-    pub expires: i64,
-    pub issued: i64,
-    pub name: Option<String>,
-    pub not_before: i64,
-    pub token: String,
-    /// Always `"Bearer"`.
-    pub token_type: String,
+pub struct Session {
+    /// Web username, API key name, or `Anonymous` when authentication is disabled.
+    pub username: String,
+    /// `ReadOnly`, `ReadWrite` or `Administrator`.
+    pub role: String,
 }
 
 #[cfg(test)]
@@ -28,13 +28,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_fields() {
-        let v = serde_json::to_value(TokenResponse {
-            token_type: "Bearer".into(),
-            ..Default::default()
+    fn session_fields() {
+        let v = serde_json::to_value(Session {
+            username: "admin".into(),
+            role: "Administrator".into(),
         })
         .unwrap();
-        assert!(v.get("notBefore").is_some());
-        assert_eq!(v["tokenType"], "Bearer");
+        assert_eq!(
+            v,
+            serde_json::json!({"username": "admin", "role": "Administrator"})
+        );
     }
 }

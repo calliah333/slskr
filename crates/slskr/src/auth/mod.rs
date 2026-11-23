@@ -1,38 +1,39 @@
-//! Authentication and authorization with slskd semantics: JWT bearer tokens, API keys
-//! (`X-API-Key`, CIDR restricted) and passthrough when authentication is disabled.
+//! Authentication and authorization: server-side sign-in sessions (the `slskr_session`
+//! cookie, see [`session`]), API keys (`X-API-Key`, CIDR restricted) and passthrough when
+//! authentication is disabled.
+//!
+//! Cookie-authenticated requests that change state, and every WebSocket upgrade, must not
+//! carry a foreign `Origin` (cross-site request forgery and WebSocket hijacking). API keys
+//! are not ambient credentials and skip that check.
 
 pub mod ip;
+pub mod session;
 
-use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use axum::extract::{ConnectInfo, FromRef, FromRequestParts, OriginalUri, Query};
+use axum::extract::{ConnectInfo, FromRef, FromRequestParts, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
 use tracing::warn;
 
 pub use ip::{IpRange, parse_ranges};
+pub use session::{COOKIE_NAME, SessionStore};
 
-/// JWT issuer, as slskd sets it (`Program.AppName`).
-pub const ISSUER: &str = "slskd";
-/// Clock skew tolerated when validating token lifetimes (ASP.NET `ClockSkew`).
-pub const CLOCK_SKEW_SECS: u64 = 300;
-/// Default JWT lifetime in milliseconds (7 days).
-pub const DEFAULT_JWT_TTL_MS: u64 = 604_800_000;
 /// Name of the principal created by passthrough authentication.
 pub const PASSTHROUGH_USERNAME: &str = "Anonymous";
 /// Header carrying API keys.
 pub const API_KEY_HEADER: &str = "X-API-Key";
 /// CIDR list allowing every address.
 pub const ALLOW_ALL_CIDR: &str = "0.0.0.0/0,::/0";
+/// Delay before answering a failed sign-in.
+pub const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(500);
 
 /// User roles; numeric values match slskd's `Role` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -93,28 +94,29 @@ impl<'de> Deserialize<'de> for Role {
     }
 }
 
-/// Which authentication schemes an endpoint accepts (slskd `AuthPolicy`).
+/// Which authentication schemes an endpoint accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum Policy {
-    /// JWT or API key.
+    /// Session cookie or API key.
     #[default]
     Any = 0,
-    JwtOnly = 1,
+    /// Interactive sign-in only: API keys are refused.
+    SessionOnly = 1,
     ApiKeyOnly = 2,
 }
 
 impl Policy {
     const fn from_u8(v: u8) -> Self {
         match v {
-            1 => Self::JwtOnly,
+            1 => Self::SessionOnly,
             2 => Self::ApiKeyOnly,
             _ => Self::Any,
         }
     }
 
-    fn allows_jwt(self) -> bool {
-        matches!(self, Self::Any | Self::JwtOnly)
+    fn allows_session(self) -> bool {
+        matches!(self, Self::Any | Self::SessionOnly)
     }
 
     fn allows_api_key(self) -> bool {
@@ -132,15 +134,13 @@ pub struct ApiKey {
     pub cidr: String,
 }
 
-/// Authentication settings (slskd `web.authentication`).
+/// Authentication settings (`[web]`).
 #[derive(Clone)]
 pub struct AuthConfig {
     pub disabled: bool,
     pub username: String,
     pub password: String,
-    /// HMAC-SHA256 signing key (slskd uses the UTF-8 bytes of `jwt.key`).
-    pub jwt_key: Vec<u8>,
-    pub jwt_ttl_ms: u64,
+    pub session_ttl: Duration,
     pub api_keys: Vec<ApiKey>,
 }
 
@@ -148,10 +148,9 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             disabled: false,
-            username: "slskd".into(),
-            password: "slskd".into(),
-            jwt_key: rand::random::<[u8; 32]>().to_vec(),
-            jwt_ttl_ms: DEFAULT_JWT_TTL_MS,
+            username: "admin".into(),
+            password: String::new(),
+            session_ttl: session::DEFAULT_TTL,
             api_keys: Vec::new(),
         }
     }
@@ -163,8 +162,7 @@ impl fmt::Debug for AuthConfig {
             .field("disabled", &self.disabled)
             .field("username", &self.username)
             .field("password", &"<redacted>")
-            .field("jwt_key", &"<redacted>")
-            .field("jwt_ttl_ms", &self.jwt_ttl_ms)
+            .field("session_ttl", &self.session_ttl)
             .field(
                 "api_keys",
                 &self.api_keys.iter().map(|k| &k.name).collect::<Vec<_>>(),
@@ -176,7 +174,7 @@ impl fmt::Debug for AuthConfig {
 /// How a principal was authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthMethod {
-    Jwt,
+    Session,
     ApiKey,
     Passthrough,
 }
@@ -190,53 +188,25 @@ pub struct Principal {
 }
 
 impl Principal {
-    fn passthrough() -> Self {
+    pub fn passthrough() -> Self {
         Self {
             name: PASSTHROUGH_USERNAME.into(),
             role: Role::Administrator,
             method: AuthMethod::Passthrough,
         }
     }
+
+    /// The `GET /session` representation.
+    pub fn session(&self) -> slskr_api::session::Session {
+        slskr_api::session::Session {
+            username: self.name.clone(),
+            role: self.role.as_str().to_owned(),
+        }
+    }
 }
 
-/// Login response, serialised exactly like slskd's `TokenResponse`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TokenResponse {
-    /// Expiry, unix seconds.
-    pub expires: i64,
-    /// Issue time (`ValidFrom`), unix seconds.
-    pub issued: i64,
-    pub name: String,
-    pub not_before: i64,
-    pub token: String,
-    pub token_type: String,
-}
-
-/// Claims emitted with the names .NET's `JwtSecurityTokenHandler` produces for slskd's claims.
-#[derive(Serialize)]
-struct OutgoingClaims<'a> {
-    unique_name: &'a str,
-    nameid: String,
-    role: &'static str,
-    name: &'a str,
-    iat: i64,
-    nbf: i64,
-    exp: i64,
-    iss: &'static str,
-}
-
-#[derive(Deserialize)]
-struct IncomingClaims {
-    #[serde(default)]
-    unique_name: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    role: Option<Value>,
-}
-
-/// Authorization failure, rendered like ASP.NET: 401 (no body) or 403 (no body).
+/// Authorization failure: 401 (not authenticated) or 403 (role too low, or a cross-site
+/// request carrying the session cookie). Both have empty bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     #[error("unauthorized")]
@@ -245,17 +215,18 @@ pub enum AuthError {
     Forbidden,
 }
 
+impl AuthError {
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        match self {
-            Self::Unauthorized => {
-                let mut res = StatusCode::UNAUTHORIZED.into_response();
-                res.headers_mut()
-                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-                res
-            }
-            Self::Forbidden => StatusCode::FORBIDDEN.into_response(),
-        }
+        self.status().into_response()
     }
 }
 
@@ -272,8 +243,8 @@ pub enum ApiKeyError {
     },
 }
 
-/// Login failure, rendered like slskd's `SessionController.Login`.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Sign-in failure.
+#[derive(Debug, thiserror::Error)]
 pub enum LoginError {
     #[error("{0}")]
     BadRequest(&'static str),
@@ -281,6 +252,10 @@ pub enum LoginError {
     Misconfigured,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    CrossSite,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
 }
 
 impl IntoResponse for LoginError {
@@ -291,6 +266,8 @@ impl IntoResponse for LoginError {
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(self.to_string())).into_response()
             }
             Self::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
+            Self::CrossSite => StatusCode::FORBIDDEN.into_response(),
+            Self::Internal(error) => crate::http::ApiError::Internal(error).into_response(),
         }
     }
 }
@@ -343,25 +320,16 @@ impl Credentials {
 
 struct Inner {
     disabled: bool,
-    ttl_ms: u64,
-    encoding: EncodingKey,
-    decoding: DecodingKey,
-    validation: Validation,
     credentials: RwLock<Credentials>,
-    /// `web.url_base` without a trailing slash; empty at the root.
-    url_base: String,
+    sessions: SessionStore,
+    /// Cookie `Path`: `web.url_base`, `/` at the root.
+    cookie_path: String,
 }
 
 /// Authentication service; cheap to clone.
 #[derive(Clone)]
 pub struct Auth {
     inner: Arc<Inner>,
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Compares two byte strings in time independent of their contents (lengths may leak).
@@ -371,33 +339,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     }
     let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
     std::hint::black_box(diff) == 0
-}
-
-/// Value of an `Authorization: Bearer <token>` header (scheme matched case-insensitively).
-fn bearer_token(parts: &Parts) -> Option<&str> {
-    let value = parts.headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    if !value.get(..7)?.eq_ignore_ascii_case("bearer ") {
-        return None;
-    }
-    value
-        .rsplit(' ')
-        .next()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-}
-
-/// slskd only reads `access_token` (and bearer API keys) for SignalR hub paths: after
-/// `UsePathBase` strips `url_base`, the path must start with the `/hub` segment.
-fn is_hub_request(parts: &Parts, url_base: &str) -> bool {
-    let path = parts
-        .extensions
-        .get::<OriginalUri>()
-        .map_or_else(|| parts.uri.path(), |uri| uri.0.path());
-    let path = match path.strip_prefix(url_base) {
-        Some(rest) if !url_base.is_empty() && (rest.is_empty() || rest.starts_with('/')) => rest,
-        _ => path,
-    };
-    path == "/hub" || path.starts_with("/hub/")
 }
 
 /// Caller address from axum's `ConnectInfo`; unspecified when the server was not
@@ -411,124 +352,139 @@ pub fn remote_addr(parts: &Parts) -> SocketAddr {
         .map_or(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), |info| info.0)
 }
 
-impl Auth {
-    pub fn new(config: AuthConfig) -> Self {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.leeway = CLOCK_SKEW_SECS;
-        validation.validate_exp = true;
-        validation.validate_nbf = true;
-        validation.validate_aud = false;
-        validation.set_issuer(&[ISSUER]);
-        validation.set_required_spec_claims(&["exp", "iss"]);
+/// Values of the session cookie in the request's `Cookie` headers.
+pub fn session_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    headers
+        .get_all(header::COOKIE)
+        .into_iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name.trim() == COOKIE_NAME).then(|| value.trim().trim_matches('"'))
+        })
+        .filter(|token| !token.is_empty())
+}
 
+/// True when the request arrived over HTTPS at a reverse proxy (`X-Forwarded-Proto`).
+pub fn forwarded_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
+}
+
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::UPGRADE)
+        .into_iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|protocol| protocol.trim().eq_ignore_ascii_case("websocket"))
+}
+
+/// True for requests an ambient credential must not authorize cross-site: anything but
+/// GET, HEAD and OPTIONS, and every WebSocket upgrade.
+pub fn needs_origin_check(method: &Method, headers: &HeaderMap) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        || is_websocket_upgrade(headers)
+}
+
+/// True when the request has no `Origin` header or its host and port equal the request
+/// `Host` (forwarded host headers are not trusted).
+pub fn same_origin(headers: &HeaderMap, uri: &Uri) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Some((scheme, authority)) = origin.to_str().ok().and_then(|o| o.split_once("://")) else {
+        // Includes the opaque origin "null".
+        return false;
+    };
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        ":80"
+    } else if scheme.eq_ignore_ascii_case("https") {
+        ":443"
+    } else {
+        return false;
+    };
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| uri.authority().map(|authority| authority.as_str()))
+    else {
+        return false;
+    };
+    let normalize = |value: &str| {
+        let value = value.trim().to_ascii_lowercase();
+        match value.strip_suffix(default_port) {
+            Some(stripped) => stripped.to_owned(),
+            None => value,
+        }
+    };
+    !authority.contains(['/', '@']) && normalize(authority) == normalize(host)
+}
+
+fn cross_site(parts: &Parts) -> bool {
+    needs_origin_check(&parts.method, &parts.headers) && !same_origin(&parts.headers, &parts.uri)
+}
+
+impl Auth {
+    pub fn new(config: AuthConfig, sessions: SessionStore) -> Self {
+        sessions.set_ttl(config.session_ttl);
         Self {
             inner: Arc::new(Inner {
                 disabled: config.disabled,
-                ttl_ms: config.jwt_ttl_ms,
-                encoding: EncodingKey::from_secret(&config.jwt_key),
-                decoding: DecodingKey::from_secret(&config.jwt_key),
-                validation,
                 credentials: RwLock::new(Credentials::from_config(&config)),
-                url_base: String::new(),
+                sessions,
+                cookie_path: "/".into(),
             }),
         }
     }
 
-    /// Sets the `web.url_base` stripped before matching hub paths. Call before cloning.
+    /// Sets `web.url_base`, the session cookie's path. Call before cloning.
     pub fn with_url_base(mut self, url_base: &str) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("Auth configured before sharing");
-        inner.url_base = url_base.trim_end_matches('/').to_owned();
+        let base = url_base.trim_end_matches('/');
+        inner.cookie_path = if base.is_empty() {
+            "/".into()
+        } else {
+            base.to_owned()
+        };
         self
     }
 
-    /// Applies hot-reloadable settings (username, password, API keys). JWT key/TTL and
-    /// `disabled` require a restart, as in slskd.
+    /// The session registry.
+    pub fn sessions(&self) -> &SessionStore {
+        &self.inner.sessions
+    }
+
+    /// Applies hot-reloadable settings (username, password, session TTL, API keys).
+    /// Changing the username or password signs out every session. `disabled` requires a
+    /// restart.
     pub fn update(&self, config: &AuthConfig) {
-        *self
-            .inner
-            .credentials
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = Credentials::from_config(config);
+        let changed = {
+            let mut credentials = self
+                .inner
+                .credentials
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let changed =
+                credentials.username != config.username || credentials.password != config.password;
+            *credentials = Credentials::from_config(config);
+            changed
+        };
+        self.inner.sessions.set_ttl(config.session_ttl);
+        if changed {
+            self.inner
+                .sessions
+                .reset(&config.username, &config.password);
+        }
     }
 
     /// True when authentication is enabled (`GET /session/enabled`).
     pub fn enabled(&self) -> bool {
         !self.inner.disabled
-    }
-
-    /// Issues a JWT with the configured TTL.
-    pub fn issue_token(&self, username: &str, role: Role) -> TokenResponse {
-        self.issue_token_with_ttl(username, role, Duration::from_millis(self.inner.ttl_ms))
-    }
-
-    /// Issues a JWT valid for `ttl`.
-    pub fn issue_token_with_ttl(&self, username: &str, role: Role, ttl: Duration) -> TokenResponse {
-        self.issue_at(
-            username,
-            role,
-            now_ms(),
-            i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX),
-        )
-    }
-
-    fn issue_at(&self, username: &str, role: Role, issued_ms: i64, ttl_ms: i64) -> TokenResponse {
-        let issued = issued_ms.div_euclid(1000);
-        let expires = issued_ms.saturating_add(ttl_ms).div_euclid(1000);
-
-        let claims = OutgoingClaims {
-            unique_name: username,
-            nameid: uuid::Uuid::new_v4().to_string(),
-            role: role.as_str(),
-            name: username,
-            iat: issued,
-            nbf: issued,
-            exp: expires,
-            iss: ISSUER,
-        };
-
-        // HMAC signing of a serialisable struct cannot fail
-        let token = jsonwebtoken::encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &self.inner.encoding,
-        )
-        .unwrap_or_default();
-
-        TokenResponse {
-            expires,
-            issued,
-            name: username.to_owned(),
-            not_before: issued,
-            token,
-            token_type: "Bearer".into(),
-        }
-    }
-
-    /// Validates signature, issuer and lifetime (5 minute skew) of a JWT.
-    pub fn validate_token(&self, token: &str) -> Option<Principal> {
-        let data = jsonwebtoken::decode::<IncomingClaims>(
-            token,
-            &self.inner.decoding,
-            &self.inner.validation,
-        )
-        .ok()?;
-
-        let claims = data.claims;
-        let name = claims.unique_name.or(claims.name)?;
-        let role = match claims.role? {
-            Value::String(role) => role.parse().ok()?,
-            Value::Array(roles) => roles
-                .iter()
-                .filter_map(|r| r.as_str().and_then(|r| r.parse::<Role>().ok()))
-                .max()?,
-            _ => return None,
-        };
-
-        Some(Principal {
-            name,
-            role,
-            method: AuthMethod::Jwt,
-        })
     }
 
     /// Checks an API key and the caller's address against its CIDR ranges.
@@ -551,8 +507,8 @@ impl Auth {
             .ok_or(ApiKeyError::Unknown)?;
 
         let remote = remote.to_canonical();
-        // An unspecified address marks an unknown caller. slskd rejects a null
-        // address outright; keys open to a whole address family still accept it here.
+        // An unspecified address marks an unknown caller; keys open to a whole address
+        // family still accept it.
         let allowed = if remote.is_unspecified() {
             record.ranges.iter().any(IpRange::is_full)
         } else {
@@ -582,63 +538,66 @@ impl Auth {
             .ok()
     }
 
-    fn jwt_scheme(&self, parts: &Parts, remote: IpAddr) -> Option<Principal> {
-        if is_hub_request(parts, &self.inner.url_base) {
-            // SignalR: `access_token` query parameter wins; a bearer value may also be an API key
-            let query = Query::<HashMap<String, String>>::try_from_uri(&parts.uri).ok();
-            if let Some(token) = query.as_ref().and_then(|q| q.0.get("access_token")) {
-                return self.validate_token(token);
-            }
-
-            let token = bearer_token(parts)?;
-            if let Ok(principal) = self.authenticate_api_key(token, remote) {
-                return Some(principal);
-            }
-            return self.validate_token(token);
-        }
-
-        self.validate_token(bearer_token(parts)?)
+    /// The principal of the first live session among the request's session cookies.
+    pub fn session_principal(&self, headers: &HeaderMap) -> Option<Principal> {
+        session_tokens(headers).find_map(|token| {
+            self.inner.sessions.lookup(token).map(|record| Principal {
+                name: record.username,
+                role: record.role,
+                method: AuthMethod::Session,
+            })
+        })
     }
 
     /// Authenticates a request with the `Any` policy.
-    pub fn authenticate(&self, parts: &Parts, remote: SocketAddr) -> Option<Principal> {
+    pub fn authenticate(&self, parts: &Parts, remote: SocketAddr) -> Result<Principal, AuthError> {
         self.authenticate_with_policy(parts, remote, Policy::Any)
     }
 
     /// Authenticates using the schemes allowed by `policy`; the strongest role wins when
-    /// several schemes succeed (ASP.NET merges the identities).
+    /// both schemes succeed. A session presented cross-site is refused with 403 unless an
+    /// API key authenticates the request.
     pub fn authenticate_with_policy(
         &self,
         parts: &Parts,
         remote: SocketAddr,
         policy: Policy,
-    ) -> Option<Principal> {
-        if self.inner.disabled {
-            return Some(Principal::passthrough());
-        }
-
-        let remote = remote.ip();
+    ) -> Result<Principal, AuthError> {
+        let cross_site = cross_site(parts);
         let api_key = policy
             .allows_api_key()
-            .then(|| self.api_key_scheme(parts, remote))
-            .flatten();
-        let jwt = policy
-            .allows_jwt()
-            .then(|| self.jwt_scheme(parts, remote))
+            .then(|| self.api_key_scheme(parts, remote.ip()))
             .flatten();
 
-        match (api_key, jwt) {
-            (Some(a), Some(j)) => Some(if j.role > a.role { j } else { a }),
-            (a, j) => a.or(j),
+        if self.inner.disabled {
+            // Nothing to steal, but a page on another site must not drive the daemon.
+            return if cross_site && api_key.is_none() {
+                Err(AuthError::Forbidden)
+            } else {
+                Ok(Principal::passthrough())
+            };
+        }
+
+        let session = policy
+            .allows_session()
+            .then(|| self.session_principal(&parts.headers))
+            .flatten();
+        match (api_key, session) {
+            (Some(key), Some(session)) if !cross_site && session.role > key.role => Ok(session),
+            (Some(key), _) => Ok(key),
+            (None, Some(_)) if cross_site => Err(AuthError::Forbidden),
+            (None, Some(session)) => Ok(session),
+            (None, None) => Err(AuthError::Unauthorized),
         }
     }
 
     /// Authenticates using the caller address from `ConnectInfo` (see [`remote_addr`]).
-    pub fn authenticate_request(&self, parts: &Parts) -> Option<Principal> {
+    pub fn authenticate_request(&self, parts: &Parts) -> Result<Principal, AuthError> {
         self.authenticate(parts, remote_addr(parts))
     }
 
-    /// Authenticates and checks the role: 401 when unauthenticated, 403 when the role is insufficient.
+    /// Authenticates and checks the role: 401 when unauthenticated, 403 when the role is
+    /// insufficient or a session is used cross-site.
     pub fn authorize(
         &self,
         parts: &Parts,
@@ -646,9 +605,7 @@ impl Auth {
         role: Role,
         policy: Policy,
     ) -> Result<Principal, AuthError> {
-        let principal = self
-            .authenticate_with_policy(parts, remote, policy)
-            .ok_or(AuthError::Unauthorized)?;
+        let principal = self.authenticate_with_policy(parts, remote, policy)?;
         if principal.role.satisfies(role) {
             Ok(principal)
         } else {
@@ -657,11 +614,15 @@ impl Auth {
     }
 
     /// Authorizer for [`crate::signalr::Hub::set_authorizer`] requiring `role` (policy `Any`).
-    pub fn hub_authorizer(&self, role: Role) -> impl Fn(&Parts) -> bool + Send + Sync + 'static {
+    pub fn hub_authorizer(
+        &self,
+        role: Role,
+    ) -> impl Fn(&Parts) -> Result<(), StatusCode> + Send + Sync + 'static {
         let auth = self.clone();
         move |parts| {
-            auth.authenticate_request(parts)
-                .is_some_and(|p| p.role.satisfies(role))
+            auth.authorize(parts, remote_addr(parts), role, Policy::Any)
+                .map(drop)
+                .map_err(AuthError::status)
         }
     }
 
@@ -679,9 +640,13 @@ impl Auth {
         username_matches & password_matches
     }
 
-    /// slskd `POST /session` semantics: validates input and issues an Administrator token.
-    /// Headless mode is the caller's concern.
-    pub fn login(&self, username: &str, password: &str) -> Result<TokenResponse, LoginError> {
+    /// Signs in with the web credentials: returns the new session's token and principal.
+    /// Failures are answered after [`LOGIN_FAILURE_DELAY`].
+    pub async fn login(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<(String, Principal), LoginError> {
         if username.trim().is_empty() || password.trim().is_empty() {
             return Err(LoginError::BadRequest(
                 "Username and/or Password missing or invalid",
@@ -702,12 +667,84 @@ impl Auth {
             }
         }
 
-        if self.check_credentials(username, password) {
-            Ok(self.issue_token(username, Role::Administrator))
-        } else {
-            Err(LoginError::Unauthorized)
+        if !self.check_credentials(username, password) {
+            tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+            return Err(LoginError::Unauthorized);
+        }
+        let token = self
+            .inner
+            .sessions
+            .create(username, Role::Administrator)
+            .await?;
+        Ok((
+            token,
+            Principal {
+                name: username.to_owned(),
+                role: Role::Administrator,
+                method: AuthMethod::Session,
+            },
+        ))
+    }
+
+    /// Deletes every session named by the request's cookies.
+    pub async fn logout(&self, headers: &HeaderMap) -> anyhow::Result<()> {
+        for token in session_tokens(headers) {
+            self.inner.sessions.remove(token).await?;
+        }
+        Ok(())
+    }
+
+    fn cookie(&self, value: &str, max_age: u64, secure: bool) -> HeaderValue {
+        let secure = if secure { "; Secure" } else { "" };
+        let cookie = format!(
+            "{COOKIE_NAME}={value}; HttpOnly; SameSite=Strict; Path={}; Max-Age={max_age}{secure}",
+            self.inner.cookie_path
+        );
+        HeaderValue::from_str(&cookie).expect("session cookie is a valid header value")
+    }
+
+    /// `Set-Cookie` value carrying `token` for the session TTL; `Secure` when `secure`.
+    pub fn session_cookie(&self, token: &str, secure: bool) -> HeaderValue {
+        self.cookie(token, self.inner.sessions.ttl().as_secs(), secure)
+    }
+
+    /// `Set-Cookie` value deleting the session cookie.
+    pub fn clear_cookie(&self, secure: bool) -> HeaderValue {
+        self.cookie("", 0, secure)
+    }
+}
+
+/// Middleware re-sending the session cookie when a request extended its session, so the
+/// browser's copy slides along with the server-side expiry.
+pub async fn refresh_session_cookie(
+    State(auth): State<Auth>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let refreshed = if auth.inner.disabled || !same_origin(headers, request.uri()) {
+        None
+    } else {
+        session_tokens(headers)
+            .find(|token| auth.inner.sessions.touch(token))
+            .map(str::to_owned)
+    };
+    let secure = forwarded_https(headers);
+    let mut response = next.run(request).await;
+    if let Some(token) = refreshed {
+        let prefix = format!("{COOKIE_NAME}=");
+        let sets_cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .into_iter()
+            .any(|value| value.as_bytes().starts_with(prefix.as_bytes()));
+        if !sets_cookie {
+            response
+                .headers_mut()
+                .append(header::SET_COOKIE, auth.session_cookie(&token, secure));
         }
     }
+    response
 }
 
 /// Extractor requiring an authenticated caller with at least role `R` (a [`Role`] as `u8`)
@@ -715,14 +752,15 @@ impl Auth {
 #[derive(Debug, Clone)]
 pub struct RequireRole<const R: u8, const P: u8 = { Policy::Any as u8 }>(pub Principal);
 
-/// Any authenticated caller (`AuthPolicy.Any`).
+/// Any authenticated caller.
 pub type Authenticated = RequireRole<{ Role::ReadOnly as u8 }>;
-/// `AuthRole.ReadWriteOrAdministrator`.
+/// Read-write or administrator.
 pub type RequireReadWrite = RequireRole<{ Role::ReadWrite as u8 }>;
-/// `AuthRole.AdministratorOnly`.
+/// Administrator.
 pub type RequireAdmin = RequireRole<{ Role::Administrator as u8 }>;
-/// `AuthPolicy.JwtOnly` + `AuthRole.AdministratorOnly`.
-pub type RequireAdminJwt = RequireRole<{ Role::Administrator as u8 }, { Policy::JwtOnly as u8 }>;
+/// Administrator signed in interactively (API keys refused).
+pub type RequireAdminSession =
+    RequireRole<{ Role::Administrator as u8 }, { Policy::SessionOnly as u8 }>;
 
 const fn role_from_u8(v: u8) -> Role {
     match v {
@@ -748,376 +786,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::Request;
-
-    fn config() -> AuthConfig {
-        AuthConfig {
-            disabled: false,
-            username: "admin".into(),
-            password: "hunter2".into(),
-            jwt_key: b"0123456789abcdef0123456789abcdef".to_vec(),
-            jwt_ttl_ms: DEFAULT_JWT_TTL_MS,
-            api_keys: vec![
-                ApiKey {
-                    name: "local".into(),
-                    key: "local-key-0123456789".into(),
-                    role: Role::ReadWrite,
-                    cidr: "127.0.0.0/8,::1/128".into(),
-                },
-                ApiKey {
-                    name: "anywhere".into(),
-                    key: "anywhere-key-0123456789".into(),
-                    role: Role::ReadOnly,
-                    cidr: ALLOW_ALL_CIDR.into(),
-                },
-            ],
-        }
-    }
-
-    fn parts(uri: &str, headers: &[(&str, &str)]) -> Parts {
-        let mut builder = Request::get(uri);
-        for (name, value) in headers {
-            builder = builder.header(*name, *value);
-        }
-        builder.body(()).unwrap().into_parts().0
-    }
-
-    fn addr(s: &str) -> SocketAddr {
-        SocketAddr::new(s.parse().unwrap(), 1234)
-    }
-
-    fn decode_payload(token: &str) -> Value {
-        use base64::Engine as _;
-        let payload = token.split('.').nth(1).unwrap();
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
-    #[test]
-    fn token_round_trip() {
-        let auth = Auth::new(config());
-        let response = auth.issue_token("admin", Role::Administrator);
-
-        assert_eq!(response.token_type, "Bearer");
-        assert_eq!(response.name, "admin");
-        assert_eq!(response.issued, response.not_before);
-        assert_eq!(response.expires - response.issued, 604_800);
-
-        let principal = auth.validate_token(&response.token).unwrap();
-        assert_eq!(
-            principal,
-            Principal {
-                name: "admin".into(),
-                role: Role::Administrator,
-                method: AuthMethod::Jwt
-            }
-        );
-
-        let payload = decode_payload(&response.token);
-        assert_eq!(payload["iss"], "slskd");
-        assert_eq!(payload["name"], "admin");
-        assert_eq!(payload["unique_name"], "admin");
-        assert_eq!(payload["role"], "Administrator");
-        assert_eq!(payload["exp"], response.expires);
-        assert_eq!(payload["nbf"], response.issued);
-        assert!(payload["nameid"].as_str().is_some_and(|id| id.len() == 36));
-
-        let json = serde_json::to_value(&response).unwrap();
-        for field in [
-            "expires",
-            "issued",
-            "name",
-            "notBefore",
-            "token",
-            "tokenType",
-        ] {
-            assert!(json.get(field).is_some(), "missing {field}");
-        }
-    }
-
-    #[test]
-    fn token_rejected_with_other_key_or_tampering() {
-        let auth = Auth::new(config());
-        let token = auth.issue_token("admin", Role::ReadOnly).token;
-
-        let other = Auth::new(AuthConfig {
-            jwt_key: b"another-key-another-key-another!".to_vec(),
-            ..config()
-        });
-        assert!(other.validate_token(&token).is_none());
-
-        let mut tampered = token.clone();
-        tampered.pop();
-        tampered.push(if token.ends_with('A') { 'B' } else { 'A' });
-        assert!(auth.validate_token(&tampered).is_none());
-        assert!(auth.validate_token("garbage").is_none());
-    }
-
-    #[test]
-    fn token_expiry_and_not_before() {
-        let auth = Auth::new(config());
-        let now = now_ms();
-
-        let expired = auth
-            .issue_at("admin", Role::Administrator, now - 3_600_000, 1_000)
-            .token;
-        assert!(auth.validate_token(&expired).is_none());
-
-        // within the 5 minute clock skew
-        let recently_expired = auth
-            .issue_at("admin", Role::Administrator, now - 61_000, 1_000)
-            .token;
-        assert!(auth.validate_token(&recently_expired).is_some());
-
-        let future = auth
-            .issue_at("admin", Role::Administrator, now + 3_600_000, 3_600_000)
-            .token;
-        assert!(auth.validate_token(&future).is_none());
-
-        let short = auth.issue_token_with_ttl("admin", Role::ReadOnly, Duration::from_secs(1));
-        assert_eq!(short.expires - short.issued, 1);
-    }
-
-    #[test]
-    fn api_key_cidr() {
-        let auth = Auth::new(config());
-
-        let p = auth
-            .authenticate_api_key("local-key-0123456789", "127.0.0.1".parse().unwrap())
-            .unwrap();
-        assert_eq!(
-            p,
-            Principal {
-                name: "local".into(),
-                role: Role::ReadWrite,
-                method: AuthMethod::ApiKey
-            }
-        );
-        assert!(
-            auth.authenticate_api_key("local-key-0123456789", "::ffff:127.0.0.1".parse().unwrap())
-                .is_ok()
-        );
-        assert!(
-            auth.authenticate_api_key("local-key-0123456789", "::1".parse().unwrap())
-                .is_ok()
-        );
-        assert!(matches!(
-            auth.authenticate_api_key("local-key-0123456789", "10.0.0.1".parse().unwrap()),
-            Err(ApiKeyError::OutOfRange { .. })
-        ));
-        assert!(
-            auth.authenticate_api_key("anywhere-key-0123456789", "8.8.8.8".parse().unwrap())
-                .is_ok()
-        );
-        assert!(
-            auth.authenticate_api_key("anywhere-key-0123456789", "2001:db8::1".parse().unwrap())
-                .is_ok()
-        );
-        assert_eq!(
-            auth.authenticate_api_key("nope", "127.0.0.1".parse().unwrap()),
-            Err(ApiKeyError::Unknown)
-        );
-    }
-
-    #[test]
-    fn authenticate_schemes_and_roles() {
-        let auth = Auth::new(config());
-        let token = auth.issue_token("admin", Role::Administrator).token;
-        let local = addr("127.0.0.1");
-
-        let bearer = format!("Bearer {token}");
-        let p = parts("/api/v0/session", &[("authorization", bearer.as_str())]);
-        assert_eq!(
-            auth.authenticate(&p, local).unwrap().method,
-            AuthMethod::Jwt
-        );
-        assert!(
-            auth.authenticate_with_policy(&p, local, Policy::ApiKeyOnly)
-                .is_none()
-        );
-
-        let p = parts("/api/v0/session", &[("x-api-key", "local-key-0123456789")]);
-        let principal = auth.authenticate(&p, local).unwrap();
-        assert_eq!(principal.method, AuthMethod::ApiKey);
-        assert!(
-            auth.authenticate_with_policy(&p, local, Policy::JwtOnly)
-                .is_none()
-        );
-        assert!(auth.authenticate(&p, addr("192.168.1.1")).is_none());
-
-        assert_eq!(
-            auth.authorize(&p, local, Role::ReadWrite, Policy::Any)
-                .unwrap()
-                .role,
-            Role::ReadWrite
-        );
-        assert_eq!(
-            auth.authorize(&p, local, Role::Administrator, Policy::Any),
-            Err(AuthError::Forbidden)
-        );
-
-        let none = parts("/api/v0/session", &[]);
-        assert_eq!(
-            auth.authorize(&none, local, Role::ReadOnly, Policy::Any),
-            Err(AuthError::Unauthorized)
-        );
-
-        // access_token only honoured for hubs
-        let query = format!("/api/v0/session?access_token={token}");
-        assert!(auth.authenticate(&parts(&query, &[]), local).is_none());
-        let query = format!("/hub/application?id=x&access_token={token}");
-        assert_eq!(
-            auth.authenticate(&parts(&query, &[]), local).unwrap().role,
-            Role::Administrator
-        );
-
-        // hubs accept API keys as bearer values
-        let p = parts(
-            "/hub/logs/negotiate",
-            &[("authorization", "Bearer anywhere-key-0123456789")],
-        );
-        assert_eq!(
-            auth.authenticate(&p, local).unwrap().method,
-            AuthMethod::ApiKey
-        );
-        let p = parts(
-            "/api/v0/session",
-            &[("authorization", "Bearer anywhere-key-0123456789")],
-        );
-        assert!(auth.authenticate(&p, local).is_none());
-    }
-
-    #[test]
-    fn hub_paths_are_matched_after_url_base() {
-        let auth = Auth::new(config()).with_url_base("/apps/hub/");
-        let token = auth.issue_token("admin", Role::Administrator).token;
-        let local = addr("127.0.0.1");
-        let bearer_key = [("authorization", "Bearer anywhere-key-0123456789")];
-        for path in [
-            "/apps/hub/api/v0/options",
-            "/api/v0/hubs",
-            "/apps/hubx/logs",
-        ] {
-            assert!(
-                auth.authenticate(&parts(path, &bearer_key), local)
-                    .is_none(),
-                "{path}"
-            );
-            let query = format!("{path}?access_token={token}");
-            assert!(
-                auth.authenticate(&parts(&query, &[]), local).is_none(),
-                "{path}"
-            );
-        }
-        for path in ["/apps/hub/hub/logs", "/apps/hub/hub", "/hub/logs/negotiate"] {
-            assert_eq!(
-                auth.authenticate(&parts(path, &bearer_key), local)
-                    .map(|p| p.method),
-                Some(AuthMethod::ApiKey),
-                "{path}"
-            );
-            let query = format!("{path}?access_token={token}");
-            assert_eq!(
-                auth.authenticate(&parts(&query, &[]), local)
-                    .map(|p| p.method),
-                Some(AuthMethod::Jwt),
-                "{path}"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_caller_only_matches_unrestricted_keys() {
-        let auth = Auth::new(config());
-        let unknown = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-        assert!(matches!(
-            auth.authenticate_api_key("local-key-0123456789", unknown),
-            Err(ApiKeyError::OutOfRange { .. })
-        ));
-        assert!(
-            auth.authenticate_api_key("anywhere-key-0123456789", unknown)
-                .is_ok()
-        );
-        let auth = Auth::new(AuthConfig {
-            api_keys: vec![ApiKey {
-                name: "zero".into(),
-                key: "zero-net-key-0123456789".into(),
-                role: Role::ReadOnly,
-                cidr: "0.0.0.0/8".into(),
-            }],
-            ..config()
-        });
-        assert!(
-            auth.authenticate_api_key("zero-net-key-0123456789", unknown)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn passthrough_when_disabled() {
-        let auth = Auth::new(AuthConfig {
-            disabled: true,
-            ..config()
-        });
-        assert!(!auth.enabled());
-        let p = parts("/api/v0/transfers", &[]);
-        let principal = auth
-            .authorize(&p, addr("10.0.0.1"), Role::Administrator, Policy::JwtOnly)
-            .unwrap();
-        assert_eq!(principal, Principal::passthrough());
-    }
-
-    #[test]
-    fn login_semantics() {
-        let auth = Auth::new(config());
-        assert!(auth.check_credentials("admin", "hunter2"));
-        assert!(!auth.check_credentials("admin", "hunter3"));
-        assert!(!auth.check_credentials("Admin", "hunter2"));
-
-        let token = auth.login("admin", "hunter2").unwrap();
-        assert_eq!(
-            auth.validate_token(&token.token).unwrap().role,
-            Role::Administrator
-        );
-        assert_eq!(auth.login("admin", "wrong"), Err(LoginError::Unauthorized));
-        assert!(matches!(
-            auth.login("", "x"),
-            Err(LoginError::BadRequest(_))
-        ));
-
-        auth.update(&AuthConfig {
-            password: "changed".into(),
-            ..config()
-        });
-        assert!(auth.login("admin", "changed").is_ok());
-    }
-
-    #[test]
-    fn roles() {
-        assert_eq!(
-            "administrator".parse::<Role>().unwrap(),
-            Role::Administrator
-        );
-        assert_eq!("READWRITE".parse::<Role>().unwrap(), Role::ReadWrite);
-        assert!("root".parse::<Role>().is_err());
-        assert!(Role::Administrator.satisfies(Role::ReadWrite));
-        assert!(!Role::ReadOnly.satisfies(Role::ReadWrite));
-        assert_eq!(
-            serde_json::to_string(&Role::ReadWrite).unwrap(),
-            "\"ReadWrite\""
-        );
-        assert_eq!(role_from_u8(Role::Administrator as u8), Role::Administrator);
-    }
-
-    #[test]
-    fn constant_time() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(constant_time_eq(b"", b""));
-    }
-}
+#[path = "tests.rs"]
+mod tests;

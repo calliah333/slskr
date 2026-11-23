@@ -13,6 +13,7 @@ src/state.rs          StateStore: application State, broadcasts "state" on the a
 src/db.rs             Database: sqlite wrapper with migrations
 src/http.rs           ApiError, router assembly helpers, static file serving + SPA fallback, urlBase
 src/core_api.rs       /application, /session, /server, /options, /debug controllers
+src/auth/             Auth (sessions, API keys, Origin checks, extractors); session.rs: SessionStore, sessions.db
 src/resolvers.rs      impl soulseek::Resolvers by delegating to services
 src/logging.rs        tracing setup, LogBuffer (ring buffer), logs hub, /logs controller, file logs
 src/events/           EventService (raise/list/subscribe) + /events controller, events.db
@@ -60,7 +61,8 @@ published to subscribers, an invalid one is logged and ignored.
 `web.url_base`, `web.auth`, `web.log_requests`, `soulseek.connect`, `uploads.slots`,
 `downloads.slots`, `search.incoming_concurrency`, `[logging]` and `[metrics]` apply only on
 restart. Everything else is read live or applied on change: web credentials and API keys
-(`Auth::update`), Soulseek listener, proxy, distributed network and speed limits
+and `web.session_ttl` (`Auth::update`; a username or password change signs out every
+session), Soulseek listener, proxy, distributed network and speed limits
 (`ClientOptionsPatch`, reconnecting when required), Soulseek credentials and server
 (`pending_reconnect`), shares (rescan), groups, blacklist, limits, retry policy, ignored
 searches and retention.
@@ -68,7 +70,7 @@ searches and retention.
 ### Data directory
 ```
 slskr.toml          configuration (optional)
-db/                 events.db, transfers.db, search.db, messaging.db, shares-cache.json
+db/                 events.db, transfers.db, search.db, messaging.db, sessions.db, shares-cache.json
 logs/               slskr-YYYYMMDD.log (pruned by retention.logs)
 downloads/          default downloads.directory
 incomplete/         default downloads.incomplete_directory
@@ -96,10 +98,35 @@ implementing `IntoResponse` like ASP.NET results (`BadRequest("msg")` -> 400 wit
 (UserOffline -> 404, Timeout -> 504? see slskd controllers for each endpoint's mapping).
 `pub type ApiResult<T> = Result<T, ApiError>;`
 
+### Authentication
+`POST /api/v0/session` with `{username, password}` checks the web credentials in constant
+time (a failure answers 401 after a 500 ms async delay) and returns the `Session`
+(`{username, role}`) with `Set-Cookie: slskr_session=<token>; HttpOnly; SameSite=Strict;
+Path=<url_base>; Max-Age=<web.session_ttl>`, plus `Secure` when `X-Forwarded-Proto: https`
+(TLS is a reverse proxy's job). `GET` returns the caller's `Session` (cookie, API key, or the
+`Anonymous` administrator when `web.auth = false`) or 401; `DELETE` deletes the session and
+expires the cookie (204).
+
+The token is 32 random bytes, base64url; `db/sessions.db` stores only its SHA-256 with
+username, role, `created_at`, `expires_at` and `last_seen_at`. `SessionStore` keeps the rows
+in memory for synchronous lookups and writes through one ordered writer task. Expiry slides:
+a request at least an hour after the last refresh extends `expires_at` by the TTL and the
+`refresh_session_cookie` middleware re-sends the cookie. Expired rows are pruned hourly and
+on startup. Sessions survive restarts unless the web username or password changed, also
+while the daemon was stopped (a salted fingerprint of the credentials is kept in the `meta`
+table).
+
+Cross-site protection: a cookie-authenticated request other than GET/HEAD/OPTIONS, and any
+WebSocket upgrade (SignalR hubs included), is refused with 403 when it carries an `Origin`
+whose host and port differ from `Host`. Forwarded host headers are not trusted, so a reverse
+proxy must pass the original `Host`. Sign-in and sign-out apply the same check. API-key
+requests skip it; with `web.auth = false` cross-site requests are refused too.
+
 ### Auth in handlers
-`crate::auth::{Authenticated, RequireReadWrite, RequireAdmin, RequireAdminJwt}` extractors
-(require `Auth: FromRef<AppState>`, implemented in http.rs). Use the role/policy shown in
-slskd's `[Authorize]` attribute for each endpoint.
+`crate::auth::{Authenticated, RequireReadWrite, RequireAdmin, RequireAdminSession}` extractors
+(require `Auth: FromRef<AppState>`, implemented in http.rs) reject with 401 or 403.
+`RequireAdminSession` refuses API keys (shutdown, restart, raw configuration file). Hubs use
+`Auth::hub_authorizer(role)` on negotiate and upgrade.
 
 ### Routes
 Each service module exposes `pub fn routes() -> axum::Router<AppState>` with paths relative to

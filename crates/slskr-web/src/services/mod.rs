@@ -5,5 +5,4 @@
 
 pub mod api;
 pub mod hub;
-pub mod token;
 pub mod util;

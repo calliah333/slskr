@@ -47,7 +47,7 @@ type InitialMessages = Vec<(String, Vec<Value>)>;
 type OnConnected = dyn Fn() -> InitialMessages + Send + Sync;
 type OnInvoke =
     dyn Fn(String, Vec<Value>) -> BoxFuture<'static, Result<Value, String>> + Send + Sync;
-type Authorizer = dyn Fn(&Parts) -> bool + Send + Sync;
+type Authorizer = dyn Fn(&Parts) -> Result<(), StatusCode> + Send + Sync;
 
 /// A SignalR hub: tracks connected clients and broadcasts invocations to them.
 #[derive(Clone)]
@@ -231,8 +231,12 @@ impl Hub {
         write(&self.inner.on_invoke, Arc::new(f) as Arc<OnInvoke>);
     }
 
-    /// Registers the authorizer checked on negotiate and WebSocket upgrade (401 when it returns false).
-    pub fn set_authorizer(&self, f: impl Fn(&Parts) -> bool + Send + Sync + 'static) {
+    /// Registers the authorizer checked on negotiate and WebSocket upgrade; an error status
+    /// (401, 403) is returned to the client.
+    pub fn set_authorizer(
+        &self,
+        f: impl Fn(&Parts) -> Result<(), StatusCode> + Send + Sync + 'static,
+    ) {
         write(&self.inner.authorizer, Arc::new(f) as Arc<Authorizer>);
     }
 
@@ -263,8 +267,8 @@ impl Hub {
             )
     }
 
-    fn authorized(&self, parts: &Parts) -> bool {
-        read(&self.inner.authorizer).is_none_or(|authorize| (*authorize)(parts))
+    fn authorize(&self, parts: &Parts) -> Result<(), StatusCode> {
+        read(&self.inner.authorizer).map_or(Ok(()), |authorize| (*authorize)(parts))
     }
 
     fn query(parts: &Parts) -> HashMap<String, String> {
@@ -276,8 +280,8 @@ impl Hub {
     fn negotiate(&self, req: Request) -> Response {
         let (parts, _) = req.into_parts();
 
-        if !self.authorized(&parts) {
-            return StatusCode::UNAUTHORIZED.into_response();
+        if let Err(status) = self.authorize(&parts) {
+            return status.into_response();
         }
 
         let version = Self::query(&parts)
@@ -330,8 +334,8 @@ impl Hub {
     async fn connect(&self, req: Request) -> Response {
         let (mut parts, _) = req.into_parts();
 
-        if !self.authorized(&parts) {
-            return StatusCode::UNAUTHORIZED.into_response();
+        if let Err(status) = self.authorize(&parts) {
+            return status.into_response();
         }
 
         let reservation = match Self::query(&parts).get("id") {
@@ -755,13 +759,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorizer_rejects_with_401() {
+    async fn authorizer_status_is_returned() {
         let hub = Hub::new("test");
-        hub.set_authorizer(|parts| {
-            parts
-                .uri
-                .query()
-                .is_some_and(|q| q.contains("access_token=ok"))
+        hub.set_authorizer(|parts| match parts.uri.query() {
+            Some(q) if q.contains("auth=ok") => Ok(()),
+            Some(q) if q.contains("auth=forbidden") => Err(StatusCode::FORBIDDEN),
+            _ => Err(StatusCode::UNAUTHORIZED),
         });
 
         let (status, _) = call(
@@ -779,7 +782,14 @@ mod tests {
 
         let (status, _) = call(
             hub.router(),
-            post_negotiate("/negotiate?negotiateVersion=1&access_token=ok"),
+            post_negotiate("/negotiate?negotiateVersion=1&auth=forbidden"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = call(
+            hub.router(),
+            post_negotiate("/negotiate?negotiateVersion=1&auth=ok"),
         )
         .await;
         assert_eq!(status, StatusCode::OK);

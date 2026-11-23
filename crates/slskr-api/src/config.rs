@@ -117,6 +117,9 @@ pub struct WebConfig {
     pub password: String,
     /// `false` disables authentication entirely.
     pub auth: bool,
+    /// Lifetime of a sign-in session; each use extends it (between 5m and 365d).
+    #[serde(with = "duration")]
+    pub session_ttl: Duration,
     pub log_requests: bool,
     pub api_keys: Vec<ApiKeyConfig>,
 }
@@ -129,6 +132,7 @@ impl Default for WebConfig {
             username: "admin".to_owned(),
             password: String::new(),
             auth: true,
+            session_ttl: Duration::from_secs(30 * 86_400),
             log_requests: false,
             api_keys: Vec::new(),
         }

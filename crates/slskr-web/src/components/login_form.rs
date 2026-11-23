@@ -1,16 +1,12 @@
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
-use slskr_api::session::{LoginRequest, TokenResponse};
+use slskr_api::session::{LoginRequest, Session};
 
-use crate::services::{
-    api,
-    token::{self, TokenStorage},
-};
+use crate::services::api;
 
 #[component]
 pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
     let username = RwSignal::new(String::new());
     let password = RwSignal::new(String::new());
-    let remember = RwSignal::new(true);
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let username_input = NodeRef::<leptos::html::Input>::new();
@@ -28,18 +24,10 @@ pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
             username: Some(username.get_untracked()),
             password: Some(password.get_untracked()),
         };
-        let storage = TokenStorage::for_remember_me(remember.get_untracked());
         spawn_local_scoped_with_cancellation(async move {
-            match api::post::<_, TokenResponse>("/session", &request).await {
-                Ok(response) if !response.token.is_empty() => {
-                    token::clear_token();
-                    token::set_token(storage, &response.token);
-                    on_login.run(());
-                }
-                Ok(_) => {
-                    error.set(Some("The server returned an empty session token.".into()));
-                    pending.set(false);
-                }
+            // The daemon sets an HttpOnly session cookie; the app then re-reads the session.
+            match api::post::<_, Session>("/session", &request).await {
+                Ok(_) => on_login.run(()),
                 Err(err) => {
                     let message = if err.status == 401 {
                         "Invalid username or password.".into()
@@ -81,11 +69,6 @@ pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
                                     on:input=move |event| password.set(event_target_value(&event)) />
                                 <i class="lock icon" aria-hidden="true"></i>
                             </div>
-                        </div>
-                        <div class="ui checked checkbox" class:checked=move || remember.get()>
-                            <input id="login-remember" type="checkbox" name="remember" prop:checked=move || remember.get()
-                                disabled=move || pending.get() on:change=move |event| remember.set(event_target_checked(&event)) />
-                            <label for="login-remember">"Remember Me"</label>
                         </div>
                     </div>
                     <button type="submit" class="ui large fluid primary login-button button"

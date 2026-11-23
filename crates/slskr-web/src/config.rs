@@ -2,10 +2,6 @@
 
 use std::cell::OnceCell;
 
-/// Storage key holding the session token.
-pub const TOKEN_KEY: &str = "slskd-token";
-/// Token value stored when authentication is disabled on the server.
-pub const TOKEN_PASSTHROUGH_VALUE: &str = "n/a";
 /// Storage key holding the active chat conversation.
 pub const ACTIVE_CHAT_KEY: &str = "slskd-active-chat";
 /// Storage key holding the active room.

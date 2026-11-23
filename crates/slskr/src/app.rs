@@ -214,7 +214,6 @@ impl AppState {
 
     pub(crate) fn start(
         &self,
-        startup_key: [u8; 32],
         client_events_done: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let weak = Arc::downgrade(&self.0);
@@ -232,6 +231,7 @@ impl AppState {
         });
 
         crate::logging::start_retention(&self.core);
+        self.auth.sessions().spawn_pruner(self.shutdown.clone());
         self.services.users.start(self.clone());
         self.services.shares.start();
         self.services.files.start(self.clone());
@@ -245,7 +245,7 @@ impl AppState {
         let connection = self.connection.subscribe();
         let options = self.options.subscribe();
         self.options.watch_file(self.shutdown.clone());
-        tokio::spawn(self.clone().watch_options(options, startup_key));
+        tokio::spawn(self.clone().watch_options(options));
         tokio::spawn(self.clone().watch_connection(connection, watchdog_events));
         tokio::spawn(self.clone().watch_client(events, client_events_done))
     }
@@ -491,11 +491,7 @@ impl AppState {
         self.state.update(|state| state.user.statistics = stats);
     }
 
-    async fn watch_options(
-        self,
-        mut receiver: watch::Receiver<Arc<Config>>,
-        startup_key: [u8; 32],
-    ) {
+    async fn watch_options(self, mut receiver: watch::Receiver<Arc<Config>>) {
         let mut previous = receiver.borrow().clone();
         loop {
             tokio::select! {
@@ -503,8 +499,7 @@ impl AppState {
                 change = receiver.changed() => if change.is_err() { break },
             }
             let current = receiver.borrow_and_update().clone();
-            self.auth
-                .update(&crate::config::auth_config(&current, &startup_key));
+            self.auth.update(&crate::config::auth_config(&current));
             if previous.search.ignore_queries != current.search.ignore_queries {
                 *self
                     .search_filters

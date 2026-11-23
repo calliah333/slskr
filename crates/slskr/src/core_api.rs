@@ -17,12 +17,14 @@ use slskr_api::{
     application::{State as ApplicationState, VersionState},
     config::Config,
     server::ServerState,
-    session::LoginRequest,
+    session::{LoginRequest, Session},
 };
 
 use crate::{
     app::AppState,
-    auth::{Authenticated, RequireAdmin, RequireAdminJwt, RequireReadWrite, Role},
+    auth::{
+        self, Authenticated, LoginError, RequireAdmin, RequireAdminSession, RequireReadWrite, Role,
+    },
     http::ApiError,
 };
 
@@ -38,7 +40,7 @@ pub fn routes() -> Router<AppState> {
         .route("/application/version/latest", get(latest_version))
         .route("/application/gc", post(collect_garbage))
         .route("/application/loopback", post(loopback))
-        .route("/session", get(check_session).post(login))
+        .route("/session", get(check_session).post(login).delete(logout))
         .route("/session/enabled", get(session_enabled))
         .route("/server", get(server).put(connect).delete(disconnect))
         .route("/options", get(options))
@@ -53,12 +55,12 @@ async fn application(_: Authenticated, State(app): State<AppState>) -> Json<Appl
     Json(app.state.get())
 }
 
-async fn shutdown(_: RequireAdminJwt, State(app): State<AppState>) -> StatusCode {
+async fn shutdown(_: RequireAdminSession, State(app): State<AppState>) -> StatusCode {
     app.request_shutdown();
     StatusCode::NO_CONTENT
 }
 
-async fn restart(_: RequireAdminJwt, State(app): State<AppState>) -> StatusCode {
+async fn restart(_: RequireAdminSession, State(app): State<AppState>) -> StatusCode {
     app.request_restart();
     StatusCode::NO_CONTENT
 }
@@ -168,28 +170,55 @@ async fn loopback(_: RequireReadWrite, headers: HeaderMap, body: Bytes) -> HttpR
     Ok(StatusCode::OK)
 }
 
-async fn check_session(_: Authenticated) -> StatusCode {
-    StatusCode::OK
+async fn check_session(caller: Authenticated) -> Json<Session> {
+    Json(caller.0.session())
 }
 
 async fn session_enabled(State(app): State<AppState>) -> Json<bool> {
     Json(app.options.startup().web.auth)
 }
 
+/// Signs in and sets the session cookie. With authentication disabled there is nothing
+/// to sign in to and the passthrough principal is returned.
 async fn login(
     State(app): State<AppState>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: Bytes,
-) -> HttpResult<Json<crate::auth::TokenResponse>> {
+) -> HttpResult<Response> {
+    // Refuse sign-in forced by another site (login CSRF).
+    if !auth::same_origin(&headers, &uri) {
+        return Err(LoginError::CrossSite.into_response());
+    }
+    if !app.auth.enabled() {
+        return Ok(Json(auth::Principal::passthrough().session()).into_response());
+    }
     let request = optional_json::<LoginRequest>(&headers, &body)?
         .ok_or_else(|| bad_request("No credentials provided"))?;
-    app.auth
+    let (token, principal) = app
+        .auth
         .login(
             request.username.as_deref().unwrap_or_default(),
             request.password.as_deref().unwrap_or_default(),
         )
-        .map(Json)
-        .map_err(IntoResponse::into_response)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let cookie = app
+        .auth
+        .session_cookie(&token, auth::forwarded_https(&headers));
+    Ok(([(header::SET_COOKIE, cookie)], Json(principal.session())).into_response())
+}
+
+/// Signs out: deletes the session and clears the cookie.
+async fn logout(State(app): State<AppState>, uri: axum::http::Uri, headers: HeaderMap) -> Response {
+    if !auth::same_origin(&headers, &uri) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(error) = app.auth.logout(&headers).await {
+        return ApiError::Internal(error).into_response();
+    }
+    let cookie = app.auth.clear_cookie(auth::forwarded_https(&headers));
+    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
 }
 
 async fn server(_: Authenticated, State(app): State<AppState>) -> Json<ServerState> {
@@ -229,14 +258,14 @@ async fn startup_options(_: RequireAdmin, State(app): State<AppState>) -> Json<C
 }
 
 async fn toml_location(
-    _: RequireAdminJwt,
+    _: RequireAdminSession,
     State(app): State<AppState>,
 ) -> HttpResult<Json<String>> {
     Ok(Json(app.paths.config_file.to_string_lossy().into_owned()))
 }
 
 async fn read_toml(
-    _: RequireAdminJwt,
+    _: RequireAdminSession,
     State(app): State<AppState>,
     headers: HeaderMap,
 ) -> HttpResult<Response> {
@@ -267,7 +296,7 @@ async fn read_toml(
 }
 
 async fn write_toml(
-    _: RequireAdminJwt,
+    _: RequireAdminSession,
     State(app): State<AppState>,
     headers: HeaderMap,
     body: Bytes,

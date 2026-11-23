@@ -1,9 +1,9 @@
 //! HTTP API client (port of slskd `lib/api.js`, an axios instance).
 //!
 //! Paths are relative to [`api_base_url`], e.g. `api::get::<State>("/application")`.
-//! Every request carries `Content-Type: application/json`, credentials, and the bearer
-//! token unless passthrough auth is active. A 401 from any route other than
-//! `/session`, `/server` and `/application` logs out (clears the token and reloads).
+//! Every request carries `Content-Type: application/json` and, being same-origin, the
+//! `HttpOnly` session cookie; the UI never sees the token. A 401 from any route other than
+//! `/session`, `/server` and `/application` reloads the page, which shows the sign-in form.
 
 use std::fmt;
 
@@ -11,7 +11,6 @@ use gloo_net::http::{Method, RequestBuilder};
 use serde::{Serialize, de::DeserializeOwned};
 use web_sys::RequestCredentials;
 
-use super::token::{clear_token, get_token, is_passthrough_enabled};
 use crate::config::api_base_url;
 
 /// Routes whose 401 responses do not trigger a logout.
@@ -53,8 +52,7 @@ fn parse<T: DeserializeOwned>(text: &str) -> Result<T, ApiError> {
         .map_err(|error| ApiError::local(format!("Invalid response: {error}")))
 }
 
-fn logout_and_reload() {
-    clear_token();
+fn reload() {
     if let Some(window) = web_sys::window() {
         let _ = window.location().reload();
     }
@@ -67,16 +65,10 @@ pub async fn request_text(
     body: Option<String>,
 ) -> Result<String, ApiError> {
     let url = format!("{}{}", api_base_url(), path);
-    let mut builder = RequestBuilder::new(&url)
+    let builder = RequestBuilder::new(&url)
         .method(method)
-        .credentials(RequestCredentials::Include)
+        .credentials(RequestCredentials::SameOrigin)
         .header("Content-Type", "application/json");
-
-    if !is_passthrough_enabled()
-        && let Some(token) = get_token()
-    {
-        builder = builder.header("Authorization", &format!("Bearer {token}"));
-    }
 
     let response = match body {
         Some(body) => builder.body(body).map_err(ApiError::local)?.send().await,
@@ -92,7 +84,7 @@ pub async fn request_text(
     }
 
     if status == 401 && !UNAUTHORIZED_EXEMPT.contains(&path) {
-        logout_and_reload();
+        reload();
     }
 
     let message = if text.is_empty() {

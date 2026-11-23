@@ -19,11 +19,10 @@ use super::{
     rooms::Rooms, search::Searches, system::System, transfers::Transfers, users::Users,
 };
 use crate::{
-    config::{self, TOKEN_PASSTHROUGH_VALUE},
+    config,
     services::{
         api,
         hub::{self, HubConnection},
-        token::{self, TokenStorage},
     },
     ui::{Modal, ModalAction},
 };
@@ -94,22 +93,17 @@ enum Session {
     Error(String),
 }
 
+/// True while the session cookie (or passthrough) authenticates; false on 401.
 async fn check_token() -> Result<bool, api::ApiError> {
     match api::get_text("/session").await {
         Ok(_) => Ok(true),
-        Err(error) if error.status == 401 => {
-            token::clear_token();
-            Ok(false)
-        }
+        Err(error) if error.status == 401 => Ok(false),
         Err(error) => Err(error),
     }
 }
 
 async fn check_session() -> Result<Session, api::ApiError> {
     let passthrough = !api::get::<bool>("/session/enabled").await?;
-    if passthrough {
-        token::set_token(TokenStorage::Session, TOKEN_PASSTHROUGH_VALUE);
-    }
     Ok(if check_token().await? {
         Session::Authenticated { passthrough }
     } else {
@@ -147,8 +141,13 @@ fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
         }
     });
     let logout = Callback::new(move |()| {
-        token::clear_token();
-        session.set(Session::Login);
+        // Unscoped: the signed-in views are disposed once the session is cleared.
+        leptos::task::spawn_local(async move {
+            if let Err(error) = api::delete::<()>("/session").await {
+                leptos::logging::warn!("Could not sign out: {error}");
+            }
+            session.set(Session::Login);
+        });
     });
     move || match session.get() {
         Session::Checking => loading().into_any(),

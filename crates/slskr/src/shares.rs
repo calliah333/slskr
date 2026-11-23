@@ -788,7 +788,7 @@ mod tests {
     async fn local_shares_browse_and_search_within_limits() {
         use crate::{
             app::{Hubs, Paths},
-            auth::{Auth, AuthConfig},
+            auth::{Auth, AuthConfig, SessionStore},
             config::{ConfigStore, Overrides, Sources},
             signalr::Hub,
             state::StateStore,
@@ -825,14 +825,13 @@ mod tests {
                 Arc::new(soulseek::resolvers::DefaultResolvers),
             ),
             hubs,
-            auth: Auth::new(AuthConfig {
-                disabled: true,
-                username: "test".into(),
-                password: "test".into(),
-                jwt_key: vec![0; 32],
-                jwt_ttl_ms: 1_000,
-                api_keys: Vec::new(),
-            }),
+            auth: Auth::new(
+                AuthConfig {
+                    disabled: true,
+                    ..AuthConfig::default()
+                },
+                SessionStore::memory(std::time::Duration::from_secs(3_600)),
+            ),
             logs: Default::default(),
             shutdown: CancellationToken::new(),
         };

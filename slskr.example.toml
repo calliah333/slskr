@@ -43,10 +43,17 @@ rooms = []
 # Address of the web UI and API. Restart required.
 listen = "127.0.0.1:5030"
 # Path prefix when served behind a reverse proxy, e.g. "/slskr". Restart required.
+# slskr serves plain HTTP: terminate TLS at the proxy, have it send
+# X-Forwarded-Proto: https (the session cookie is then marked Secure) and pass the
+# original Host header (browser requests that change state or open a WebSocket are
+# refused when their Origin differs from Host).
 url_base = "/"
-# Web sign-in. An empty password disables sign-in.
+# Web sign-in. An empty password disables sign-in. Changing the username or password
+# signs out every browser.
 username = "admin"
 password = "change-me"                    # example; default ""
+# How long a browser stays signed in; each use extends it. 5m to 365d.
+session_ttl = "30d"
 # false disables authentication entirely: only for loopback or development use.
 # Restart required.
 auth = true
