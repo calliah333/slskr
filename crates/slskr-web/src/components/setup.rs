@@ -9,9 +9,12 @@ use slskr_types::setup::{
 };
 
 use crate::{
-    components::directory_picker::DirectoryPicker,
+    components::{app::AuthLayout, directory_picker::DirectoryPicker},
     services::{api, forms},
-    ui::form::{Field, FormMessage, ListEditor, PasswordInput, TextInput, focus_first_invalid},
+    ui::{
+        Icon, Loading,
+        form::{Field, FormMessage, ListEditor, PasswordInput, TextInput, focus_first_invalid},
+    },
 };
 
 /// Minimum web password length (`POST /api/setup` refuses shorter ones).
@@ -144,19 +147,22 @@ pub fn SetupWizard(on_done: Callback<()>) -> impl IntoView {
         }
     });
     view! {
-        <main class="setup">
-            <h1 class="ui header setup-title">"slskr setup"</h1>
-            {move || load_error.get().map(|message| view! {
-                <FormMessage kind="negative"><p>{"Could not load the setup status: "}{message}</p></FormMessage>
-            })}
-            {move || match status.get() {
-                Some(status) => view! { <Wizard status on_done/> }.into_any(),
-                None if load_error.with(Option::is_none) => view! {
-                    <div class="ui active centered inline loader" role="status" aria-label="Loading"></div>
-                }.into_any(),
-                None => ().into_any(),
-            }}
-        </main>
+        <AuthLayout wide=true>
+            <div class="setup stack">
+                <div>
+                    <h1 class="page-header__title setup-title">"Set up slskr"</h1>
+                    <p class="page-header__description">"A few steps and slskr is ready to use."</p>
+                </div>
+                {move || load_error.get().map(|message| view! {
+                    <FormMessage kind="danger"><p>{"Could not load the setup status: "}{message}</p></FormMessage>
+                })}
+                {move || match status.get() {
+                    Some(status) => view! { <Wizard status on_done/> }.into_any(),
+                    None if load_error.with(Option::is_none) => view! { <Loading/> }.into_any(),
+                    None => ().into_any(),
+                }}
+            </div>
+        </AuthLayout>
     }
 }
 
@@ -423,7 +429,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
         let current = step.get();
         let body = match current {
             Step::Welcome => view! {
-                <p>"slskr is almost ready. Set up a web sign-in, optionally connect your Soulseek account and choose folders to share. Everything can be changed later in System → Settings."</p>
+                <p>"slskr is almost ready. Set up a web sign-in, optionally connect your Soulseek account and choose folders to share. Everything can be changed later in Settings."</p>
                 {status.code_required.then(|| view! {
                     <Field id="setup-code" label="Setup code" error=error_of("code")
                         help="This browser is not on the slskr machine, so prove you can read its log: the code is printed in the daemon log (with Docker: docker compose logs slskr).">
@@ -473,13 +479,20 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                         on_input=move |t: String| { soulseek_password.set(t); clear_error("soulseek.password"); test_result.set(None); }/>
                 </Field>
                 <div class="form-actions">
-                    <button type="button" class="ui button setup-test-login" class:loading=testing disabled=testing
-                        on:click=test_login>
+                    <button type="button" class="btn setup-test-login" disabled=testing
+                        aria-busy=move || testing.get().then_some("true") on:click=test_login>
+                        {move || if testing.get() {
+                            view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
+                        } else {
+                            view! { <Icon name="log-in"/> }.into_any()
+                        }}
                         "Test login"
                     </button>
                     {move || test_result.get().map(|(ok, message)| view! {
-                        <span class=if ok { "ui green basic label" } else { "ui red basic label" }
-                            role=if ok { "status" } else { "alert" }>{message}</span>
+                        <span class=if ok { "badge badge--success setup-test-result" } else { "badge badge--danger setup-test-result" }
+                            role=if ok { "status" } else { "alert" }>
+                            <Icon name=if ok { "circle-check" } else { "circle-x" }/>{message}
+                        </span>
                     })}
                 </div>
             }.into_any(),
@@ -490,8 +503,8 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                     <ListEditor items=shares placeholder="/path/to/music"
                         on_change=Callback::new(move |items: Vec<String>| { shares.set(items); clear_error("shares"); })
                         extra=ViewFn::from(move || view! {
-                            <button type="button" class="ui button directory-browse" on:click=move |_| picking.set(true)>
-                                <i class="folder open icon" aria-hidden="true"></i>"Browse…"
+                            <button type="button" class="btn directory-browse" on:click=move |_| picking.set(true)>
+                                <Icon name="folder-open"/>"Browse…"
                             </button>
                         })/>
                 </Field>
@@ -506,7 +519,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                     } else if soulseek_given() {
                         soulseek_username.get_untracked()
                     } else {
-                        "not set up: connect later in System → Settings".to_owned()
+                        "not set up: connect later in Settings".to_owned()
                     }}</dd>
                     <dt>"Shares"</dt>
                     <dd>{move || {
@@ -530,23 +543,33 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
             step.set(current.next());
         };
         view! {
-            <form class="ui form segment setup-step" novalidate
+            <form class="card setup-step" novalidate
                 aria-labelledby="setup-step-title"
                 on:submit=move |event| { event.prevent_default(); advance(); }>
-                <h2 class="ui header" id="setup-step-title" tabindex="-1" node_ref=heading>{current.title()}</h2>
-                {body}
-                <div class="setup-actions">
+                <div class="card__header">
+                    <h2 class="card__title" id="setup-step-title" tabindex="-1" node_ref=heading>{current.title()}</h2>
+                </div>
+                <div class="card__content">{body}</div>
+                <div class="card__footer setup-actions">
                     {(current != Step::Welcome).then(|| view! {
-                        <button type="button" class="ui basic button setup-back" disabled=busy
+                        <button type="button" class="btn btn--ghost setup-back" disabled=busy
                             on:click=move |_| { errors.set(BTreeMap::new()); step.set(current.previous()); }>
-                            "Back"
+                            <Icon name="arrow-left"/>"Back"
                         </button>
                     })}
                     {optional.then(|| view! {
-                        <button type="button" class="ui button setup-skip" disabled=busy on:click=skip>"Skip"</button>
+                        <button type="button" class="btn setup-skip" disabled=busy on:click=skip>"Skip"</button>
                     })}
-                    <button type="submit" class="ui primary button setup-next" class:loading=busy disabled=busy>
+                    <button type="submit" class="btn btn--primary setup-next" disabled=busy
+                        aria-busy=move || busy.get().then_some("true")>
                         {if current == Step::Review { "Finish" } else { "Next" }}
+                        {move || if busy.get() {
+                            view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
+                        } else if current == Step::Review {
+                            view! { <Icon name="check"/> }.into_any()
+                        } else {
+                            view! { <Icon name="arrow-right"/> }.into_any()
+                        }}
                     </button>
                 </div>
             </form>
@@ -554,15 +577,15 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
     };
 
     view! {
-        <ol class="ui mini ordered steps setup-steps" aria-label="Setup progress">
+        <ol class="setup-steps" aria-label="Setup progress">
             {Step::ALL.into_iter().map(|s| {
                 let state = move || {
                     let current = step.get();
-                    if s == current { "active step" } else if s < current { "completed step" } else { "disabled step" }
+                    if s == current { "is-current" } else if s < current { "is-done" } else { "" }
                 };
                 view! {
                     <li class=state aria-current=move || (step.get() == s).then_some("step")>
-                        <div class="content"><div class="title">{s.title()}</div></div>
+                        <span class="title">{s.title()}</span>
                     </li>
                 }
             }).collect_view()}
@@ -570,7 +593,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
         <p class="visually-hidden" aria-live="polite">
             {move || format!("Step {} of {}: {}", step.get().index() + 1, Step::ALL.len(), step.get().title())}
         </p>
-        {move || top_error.get().map(|message| view! { <FormMessage kind="negative"><p>{message}</p></FormMessage> })}
+        {move || top_error.get().map(|message| view! { <FormMessage kind="danger"><p>{message}</p></FormMessage> })}
         {step_view}
         <DirectoryPicker open=picking on_pick=Callback::new(move |path: String| {
             shares.update(|list| if !list.contains(&path) { list.push(path) });

@@ -32,16 +32,17 @@ pub fn System() -> impl IntoView {
         ("events", "Events"),
     ];
     view! {
-        <div class="system">
-            <section class="ui raised segment">
-                <nav class="ui top attached tabular menu" aria-label="System">
-                    {tabs.into_iter().map(|(path, title)| view! {
-                        <A href=format!("{base}/system/{path}") attr:class=move || if tab.get() == path { "active item" } else { "item" }>{title}</A>
-                    }).collect_view()}
-                </nav>
-                <div class="ui bottom attached segment">
-                    {move || match tab.read().as_str() {
-                        "settings" => view! { <settings::SettingsPage/> }.into_any(),
+        <div class="system stack">
+            <nav class="tabs-underline system-tabs" aria-label="System">
+                {tabs.into_iter().map(|(path, title)| view! {
+                    <A href=format!("{base}/system/{path}") attr:class=move || if tab.get() == path { "tabs__tab is-active" } else { "tabs__tab" }>{title}</A>
+                }).collect_view()}
+            </nav>
+            {move || match tab.read().as_str() {
+                "settings" => view! { <settings::SettingsPage/> }.into_any(),
+                other => view! {
+                    <div class="card"><div class="card__content">
+                    {match other {
                         // The tab's former name.
                         "options" => view! {
                             <Redirect path="/system/settings" options=NavigateOptions { replace: true, ..Default::default() }/>
@@ -53,8 +54,9 @@ pub fn System() -> impl IntoView {
                         "events" => view! { <SystemEvents/> }.into_any(),
                         _ => view! { <SystemInfo/> }.into_any(),
                     }}
-                </div>
-            </section>
+                    </div></div>
+                }.into_any(),
+            }}
         </div>
     }
 }

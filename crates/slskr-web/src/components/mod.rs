@@ -1,5 +1,4 @@
 pub mod app;
-mod app_footer;
 pub mod browse;
 pub mod chat;
 pub mod dashboard;

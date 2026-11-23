@@ -4,7 +4,7 @@ use super::fields::use_form;
 use crate::{
     services::{api, util::encode_uri_component},
     ui::{
-        Modal, ModalAction,
+        Badge, Icon, Modal, ModalAction,
         form::{Field, FieldGrid, FormMessage, ListEditor, Section, Select, TextInput},
     },
 };
@@ -13,6 +13,14 @@ use slskr_types::{
     config::ApiKeyRole,
     settings::{CreateApiKey, CreatedApiKey},
 };
+
+fn role_badge(role: ApiKeyRole) -> &'static str {
+    match role {
+        ApiKeyRole::ReadOnly => "neutral",
+        ApiKeyRole::ReadWrite => "primary",
+        ApiKeyRole::Admin => "purple",
+    }
+}
 
 fn role_name(role: ApiKeyRole) -> &'static str {
     match role {
@@ -134,53 +142,58 @@ pub fn ApiKeys() -> impl IntoView {
     view! {
         <Section id="settings-api-keys" title="API keys"
             description="Keys let scripts use the API with the X-API-Key header. Changes here apply at once.">
-            {move || error.get().map(|message| view! { <FormMessage kind="negative"><p>{message}</p></FormMessage> })}
+            {move || error.get().map(|message| view! { <FormMessage kind="danger"><p>{message}</p></FormMessage> })}
             {move || created.get().map(|key| view! {
-                <div class="ui warning message api-key-created" role="alert">
-                    <div class="header">{format!("API key {} created", key.name)}</div>
-                    <p>"Copy it now: it is shown only this once and can not be recovered."</p>
-                    <div class="ui fluid action input">
-                        <input node_ref=key_ref type="text" readonly aria-label="New API key"
-                            class="api-key-value" prop:value=key.key.clone()/>
-                        <button type="button" class="ui button api-key-copy" on:click=copy>
-                            <i class="copy icon" aria-hidden="true"></i>
-                            {move || if copied.get() { "Copied" } else { "Copy" }}
-                        </button>
+                <div class="alert alert--warning api-key-created" role="alert">
+                    <Icon name="key"/>
+                    <div class="alert__body stack stack--sm">
+                        <div class="alert__title">{format!("API key {} created", key.name)}</div>
+                        <p>"Copy it now: it is shown only this once and can not be recovered."</p>
+                        <div class="input-group">
+                            <input node_ref=key_ref type="text" readonly aria-label="New API key"
+                                class="input input--mono api-key-value" prop:value=key.key.clone()/>
+                            <button type="button" class="btn api-key-copy" on:click=copy>
+                                <Icon name=Signal::derive(move || if copied.get() { "check" } else { "copy" }.to_owned())/>
+                                {move || if copied.get() { "Copied" } else { "Copy" }}
+                            </button>
+                        </div>
+                        <div>
+                            <button type="button" class="btn btn--sm api-key-done"
+                                on:click=move |_| created.set(None)>
+                                "I have saved it"
+                            </button>
+                        </div>
                     </div>
-                    <button type="button" class="ui small basic button api-key-done"
-                        on:click=move |_| created.set(None)>
-                        "I have saved it"
-                    </button>
                 </div>
             })}
-            <table class="ui celled table api-keys">
+            <div class="table-wrap">
+            <table class="table table--compact api-keys">
                 <thead>
-                    <tr><th scope="col">"Name"</th><th scope="col">"Role"</th><th scope="col">"Allowed networks"</th><th scope="col"><span class="visually-hidden">"Actions"</span></th></tr>
+                    <tr><th scope="col">"Name"</th><th scope="col">"Role"</th><th scope="col">"Allowed networks"</th><th scope="col" class="actions"><span class="visually-hidden">"Actions"</span></th></tr>
                 </thead>
                 <tbody>
                     {move || {
                         let keys = keys();
                         if keys.is_empty() {
-                            return view! { <tr><td colspan="4">"No API keys yet."</td></tr> }.into_any();
+                            return view! { <tr class="empty-row"><td colspan="4">"No API keys yet."</td></tr> }.into_any();
                         }
                         keys.into_iter().map(|key| {
                             let target = key.name.clone();
                             view! {
                                 <tr class="api-key-row">
-                                    <td>{key.name.clone()}</td>
-                                    <td>{role_name(key.role)}</td>
-                                    <td>{key.allow.join(", ")}</td>
-                                    <td class="collapsing">
+                                    <td class="font-medium">{key.name.clone()}</td>
+                                    <td><Badge variant=role_badge(key.role) text=role_name(key.role)/></td>
+                                    <td class="mono text-xs">{if key.allow.is_empty() { "any".to_owned() } else { key.allow.join(", ") }}</td>
+                                    <td class="actions">
                                         {if key.pinned {
-                                            view! { <span class="ui basic label" title="Set in slskr.toml; remove it there">
-                                                <i class="lock icon" aria-hidden="true"></i>"slskr.toml"
-                                            </span> }.into_any()
+                                            view! { <Badge variant="outline" icon="lock" title="Set in slskr.toml; remove it there" text="slskr.toml"/> }.into_any()
                                         } else {
                                             view! {
-                                                <button type="button" class="ui mini negative basic button api-key-delete"
+                                                <button type="button" class="btn btn--action is-danger api-key-delete"
                                                     aria-label=format!("Delete API key {}", key.name)
+                                                    title="Delete"
                                                     on:click=move |_| deleting.set(Some(target.clone()))>
-                                                    "Delete"
+                                                    <Icon name="trash-2"/>
                                                 </button>
                                             }.into_any()
                                         }}
@@ -191,8 +204,9 @@ pub fn ApiKeys() -> impl IntoView {
                     }}
                 </tbody>
             </table>
-            <form class="api-key-create" on:submit=move |event| { event.prevent_default(); create(); }>
-                <h4 class="ui header">"Create a key"</h4>
+            </div>
+            <form class="api-key-create form-subsection" on:submit=move |event| { event.prevent_default(); create(); }>
+                <h3 class="form-subsection-title">"Create a key"</h3>
                 <FieldGrid>
                     <Field id="api-key-name" label="Name" error=name_error>
                         <TextInput value=name node_ref=name_ref on_input=move |t: String| name.set(t)
@@ -213,14 +227,21 @@ pub fn ApiKeys() -> impl IntoView {
                     <ListEditor items=allow on_change=Callback::new(move |items: Vec<String>| allow.set(items))
                         placeholder="e.g. 192.168.0.0/16"/>
                 </Field>
-                <button type="submit" class="ui primary button api-key-create-button" class:loading=creating
-                    disabled=creating>
-                    "Create key"
-                </button>
+                <div>
+                    <button type="submit" class="btn btn--primary api-key-create-button" disabled=creating
+                        aria-busy=move || creating.get().then_some("true")>
+                        {move || if creating.get() {
+                            view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
+                        } else {
+                            view! { <Icon name="plus"/> }.into_any()
+                        }}
+                        "Create key"
+                    </button>
+                </div>
             </form>
-            <Modal open=delete_open size="mini"
+            <Modal open=delete_open size="sm"
                 on_close=Callback::new(move |()| deleting.set(None))
-                header=|| view! { <div class="header">"Delete API key"</div> }
+                title="Delete API key"
                 content="Scripts using this key will stop working. Delete it?"
                 actions=vec![
                     ModalAction::new("Cancel"),

@@ -1,7 +1,8 @@
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use slskr_types::session::{LoginRequest, Session};
 
-use crate::services::api;
+use super::app::AuthLayout;
+use crate::{services::api, ui::Alert};
 
 #[component]
 pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
@@ -42,10 +43,15 @@ pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
     });
 
     view! {
-        <div class="ui middle aligned center aligned grid" style="height: 100vh">
-            <div class="column" style="max-width: 372px">
-                <h1 class="ui center aligned header" style="font-family: monospace">"slskr"</h1>
-                <form class="ui large form" aria-busy=move || pending.get().to_string()
+        <AuthLayout>
+            <div class="card login-card">
+                <div class="card__header">
+                    <div>
+                        <h1 class="card__title">"Sign in"</h1>
+                        <p class="card__description">"Sign in to manage searches, transfers and shares"</p>
+                    </div>
+                </div>
+                <form class="card__content stack" aria-busy=move || pending.get().to_string()
                     on:submit=move |event| {
                         event.prevent_default();
                         if ready.get_untracked() && !pending.get_untracked() {
@@ -53,40 +59,35 @@ pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
                             pending.set(true);
                         }
                     }>
-                    <div class="ui raised segment">
-                        <div class="field">
-                            <div class="ui left icon fluid input">
-                                <input node_ref=username_input name="username" aria-label="Username"
-                                    autocomplete="username" placeholder="Username" required disabled=move || pending.get()
-                                    on:input=move |event| username.set(event_target_value(&event)) />
-                                <i class="user icon" aria-hidden="true"></i>
-                            </div>
-                        </div>
-                        <div class="field">
-                            <div class="ui left icon fluid input">
-                                <input type="password" name="password" aria-label="Password" autocomplete="current-password"
-                                    placeholder="Password" required disabled=move || pending.get()
-                                    on:input=move |event| password.set(event_target_value(&event)) />
-                                <i class="lock icon" aria-hidden="true"></i>
-                            </div>
-                        </div>
+                    <div class="field">
+                        <label class="label" for="login-username">"Username"</label>
+                        <input node_ref=username_input class="input" id="login-username" name="username"
+                            autocomplete="username" placeholder="Enter username" required disabled=move || pending.get()
+                            on:input=move |event| username.set(event_target_value(&event)) />
                     </div>
-                    <button type="submit" class="ui large fluid primary login-button button"
-                        class:loading=move || pending.get() disabled=move || pending.get() || !ready.get()>
-                        <i class="sign in icon" aria-hidden="true"></i>"Login"
-                    </button>
+                    <div class="field">
+                        <label class="label" for="login-password">"Password"</label>
+                        <input class="input" type="password" id="login-password" name="password"
+                            autocomplete="current-password" placeholder="Enter password" required
+                            disabled=move || pending.get()
+                            on:input=move |event| password.set(event_target_value(&event)) />
+                    </div>
                     {move || error.get().map(|message| view! {
-                        <div class="ui floating negative message login-failure" role="alert">
-                            <i class="x icon" aria-hidden="true"></i>{message}
-                        </div>
+                        <Alert variant="danger" class="login-failure">{message}</Alert>
                     })}
+                    <button type="submit" class="btn btn--primary btn--block login-button"
+                        aria-busy=move || pending.get().then_some("true")
+                        disabled=move || pending.get() || !ready.get()>
+                        "Sign in"
+                        {move || pending.get().then(|| view! { <span class="spinner" aria-hidden="true"></span> })}
+                    </button>
                 </form>
-                <p>
-                    <a href="https://github.com/slskd/slskd" rel="noreferrer" target="_blank">
-                        "UI adapted from slskd (AGPLv3)"
-                    </a>
-                </p>
             </div>
-        </div>
+            <p class="auth__note">
+                <a href="https://github.com/slskd/slskd" rel="noreferrer" target="_blank">
+                    "UI adapted from slskd (AGPLv3)"
+                </a>
+            </p>
+        </AuthLayout>
     }
 }

@@ -55,10 +55,10 @@ Setting `web.password` in `slskr.toml` or `SLSKR_WEB_PASSWORD` skips setup; so d
 
 ## Configuration
 
-Most settings are changed in the web UI (System → Settings). Things you want to keep in a
-file or set before the first start (web credentials, the listen address, the URL base
-behind a reverse proxy) go in `slskr.toml` in the data directory or in
-`SLSKR_<SECTION>_<KEY>` environment variables; anything set there is locked in the UI.
+Most settings are changed in the web UI (Settings: the gear button at the top right).
+Things you want to keep in a file or set before the first start (web credentials, the
+listen address, the URL base behind a reverse proxy) go in `slskr.toml` in the data directory
+or in `SLSKR_<SECTION>_<KEY>` environment variables; anything set there is locked in the UI.
 Start from [`slskr.example.toml`](slskr.example.toml); [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
 lists every key.
 

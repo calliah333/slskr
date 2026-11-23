@@ -1,53 +1,41 @@
-//! `Modal` (rendered through a portal into `document.body`) and its sub-components.
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+//! `Modal`: a dialog over a dimmed backdrop, rendered into `document.body`.
 
 use leptos::ev::{KeyboardEvent, MouseEvent};
 use leptos::html::Div;
-use leptos::portal::Portal as LeptosPortal;
+use leptos::portal::Portal;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use super::button::Button;
-use super::classes::{Classes, KeyOrValue, client_rect, emit, toggle_body_classes};
 use super::icon::Icon;
 
-/// A shorthand action button (`actions={['Cancel', { content, negative, onClick }]}`).
-/// Clicking any action runs its callback and then closes the modal.
+/// A footer button that runs its callback and then closes the modal.
 #[derive(Clone, Debug, Default)]
 pub struct ModalAction {
     pub content: String,
-    pub negative: bool,
-    pub positive: bool,
-    pub primary: bool,
+    /// `Button` variant: `"outline"` (default), `"primary"`, `"destructive"`.
+    pub variant: &'static str,
     pub on_click: Option<Callback<()>>,
 }
 
 impl ModalAction {
-    /// A plain `<button class="ui button">` action.
+    /// An outline button.
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
-            ..Self::default()
+            variant: "outline",
+            on_click: None,
         }
     }
 
-    /// Adds the `negative` class.
+    /// A solid red button (confirming a destructive action).
     pub fn negative(mut self) -> Self {
-        self.negative = true;
+        self.variant = "destructive";
         self
     }
 
-    /// Adds the `positive` class.
-    pub fn positive(mut self) -> Self {
-        self.positive = true;
-        self
-    }
-
-    /// Adds the `primary` class.
+    /// A solid blue button.
     pub fn primary(mut self) -> Self {
-        self.primary = true;
+        self.variant = "primary";
         self
     }
 
@@ -64,196 +52,169 @@ impl From<&str> for ModalAction {
     }
 }
 
-impl From<String> for ModalAction {
-    fn from(value: String) -> Self {
-        ModalAction::new(value)
-    }
-}
-
-struct ModalParts {
-    children: Option<ChildrenFn>,
-    header: Option<ViewFn>,
-    content: Option<String>,
-    actions: Vec<ModalAction>,
-    style: Option<String>,
-}
-
-/// semantic-ui-react `Modal`.
+/// A modal dialog (`role="dialog"`, `aria-modal`): `.modal-backdrop > .modal` with a
+/// header (title, description, close button), a scrolling body and a footer.
 ///
-/// Open state is controlled by `open` when given, otherwise internal (opened by
-/// clicking `trigger`, closed by the close icon, a dimmer click, Escape or an action).
-/// Renders `<div class="ui page modals dimmer transition visible active">` >
-/// `<div class="ui {size} modal transition visible active">` into `document.body`.
-/// `header` is rendered as given (e.g. `<Header icon=.. content=../>` or `<ModalHeader>`),
-/// `content` is wrapped in `<div class="content">`.
+/// Open state is controlled by `open` when given, otherwise internal (opened by clicking
+/// `trigger`; closed by the close button, a backdrop click, Escape or an action). The body
+/// is `content` (a paragraph) or the children; the footer is `actions` or `footer`.
+/// `size`: `"sm"` (24rem), default (32rem), `"lg"` (48rem), `"xl"` (64rem).
 #[component]
 pub fn Modal(
     #[prop(into, optional)] open: Option<Signal<bool>>,
-    #[prop(optional)] default_open: bool,
     #[prop(into, optional)] trigger: Option<ViewFn>,
-    #[prop(into, optional)] on_open: Option<Callback<()>>,
     #[prop(into, optional)] on_close: Option<Callback<()>>,
-    #[prop(into, optional)] class: Signal<String>,
+    #[prop(into)] title: String,
+    #[prop(into, optional)] description: Option<String>,
     #[prop(optional)] size: Option<&'static str>,
-    #[prop(optional)] basic: bool,
-    #[prop(default = true)] centered: bool,
-    /// `true` renders the `close` icon; a name renders that icon.
-    #[prop(into, optional)]
-    close_icon: KeyOrValue,
-    #[prop(default = true)] close_on_dimmer_click: bool,
-    #[prop(default = true)] close_on_escape: bool,
-    /// `"inverted"` or `"blurring"`.
-    #[prop(optional)]
-    dimmer: Option<&'static str>,
-    #[prop(into, optional)] header: Option<ViewFn>,
+    /// Show the close (x) button in the header (default true).
+    #[prop(default = true)]
+    close_button: bool,
     #[prop(into, optional)] content: Option<String>,
     #[prop(optional)] actions: Vec<ModalAction>,
-    #[prop(into, optional)] style: Option<String>,
+    #[prop(optional)] footer: Option<ViewFn>,
+    #[prop(into, optional)] class: Option<String>,
     #[prop(optional)] children: Option<ChildrenFn>,
 ) -> impl IntoView {
-    let internal = RwSignal::new(default_open);
+    let internal = RwSignal::new(false);
     let is_open = move || open.map_or_else(|| internal.get(), |o| o.get());
-    let do_open = move || {
-        emit(on_open, ());
-        internal.set(true);
-    };
-    let do_close = move || {
+    let close = move || {
         internal.set(false);
-        emit(on_close, ());
+        if let Some(cb) = on_close {
+            cb.run(());
+        }
     };
-    let parts = StoredValue::new(ModalParts {
-        children,
-        header,
-        content,
-        actions,
-        style,
-    });
-
     let trigger_view = trigger.map(|t| {
         t.run()
             .add_any_attr(leptos::ev::on(leptos::ev::click, move |_: MouseEvent| {
-                if !is_open_untracked(open, internal) {
-                    do_open();
-                }
+                internal.set(true)
             }))
     });
+    let parts = StoredValue::new((
+        title,
+        description,
+        content,
+        actions,
+        footer,
+        children,
+        class,
+    ));
+    let title_id = StoredValue::new(format!("modal-title-{}", next_modal_id()));
 
     let body = move || {
         let modal_ref = NodeRef::<Div>::new();
-        let scrolling = RwSignal::new(false);
-        let mouse_down_inside = StoredValue::new(false);
-        let alive = Arc::new(AtomicBool::new(true));
-
-        let blurring = dimmer == Some("blurring");
-        toggle_body_classes(&["dimmable", "dimmed"], true);
-        if blurring {
-            toggle_body_classes(&["blurring"], true);
+        let down_inside = StoredValue::new(false);
+        let previous_focus = document()
+            .active_element()
+            .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+        if let Some(body) = document().body() {
+            let _ = body.class_list().add_1("modal-open");
         }
-        Effect::new(move |_| toggle_body_classes(&["scrolling"], scrolling.get()));
-        watch_fit(modal_ref, scrolling, alive.clone());
-
-        let escape = close_on_escape.then(|| {
-            window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
-                if ev.key() == "Escape" {
-                    do_close();
-                }
-            })
-        });
-        on_cleanup(move || {
-            alive.store(false, Ordering::Relaxed);
-            if let Some(handle) = escape {
-                handle.remove();
+        let escape = window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
+            if ev.key() == "Escape" {
+                close();
             }
-            toggle_body_classes(&["dimmable", "dimmed", "blurring", "scrolling"], false);
         });
-
-        let contains = move |ev: &MouseEvent| -> bool {
+        let previous_focus = StoredValue::new_local(previous_focus);
+        on_cleanup(move || {
+            escape.remove();
+            if let Some(body) = document().body() {
+                let _ = body.class_list().remove_1("modal-open");
+            }
+            previous_focus.with_value(|el| {
+                if let Some(el) = el {
+                    let _ = el.focus();
+                }
+            });
+        });
+        // Focus the dialog itself so Escape and Tab start inside it.
+        request_animation_frame(move || {
+            if let Some(modal) = modal_ref.get_untracked() {
+                let already_inside = document()
+                    .active_element()
+                    .is_some_and(|a| modal.contains(Some(&a)));
+                if !already_inside {
+                    let _ = modal.focus();
+                }
+            }
+        });
+        let inside = move |ev: &MouseEvent| {
             let target = ev.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok());
             match (modal_ref.get_untracked(), target) {
                 (Some(modal), Some(node)) => modal.contains(Some(&node)),
                 _ => false,
             }
         };
-        let on_mouse_down = move |ev: MouseEvent| mouse_down_inside.set_value(contains(&ev));
-        let on_dimmer_click = move |ev: MouseEvent| {
-            let down_inside = mouse_down_inside.get_value();
-            mouse_down_inside.set_value(false);
-            if !close_on_dimmer_click || down_inside || contains(&ev) {
-                return;
+        let on_mouse_down = move |ev: MouseEvent| down_inside.set_value(inside(&ev));
+        let on_backdrop_click = move |ev: MouseEvent| {
+            let started_inside = down_inside.get_value();
+            down_inside.set_value(false);
+            if !started_inside && !inside(&ev) {
+                close();
             }
-            do_close();
         };
-
-        let dimmer_classes = Classes::new("ui")
-            .key(dimmer == Some("inverted"), "inverted")
-            .key(!centered, "top aligned")
-            .add("page modals dimmer transition visible active")
-            .build();
-        let modal_classes = move || {
-            Classes::new("ui")
-                .opt(size)
-                .key(basic, "basic")
-                .key(scrolling.get(), "scrolling")
-                .add("modal transition visible active")
-                .add(&class.get())
-                .build()
+        let (title, description, content, actions, footer, children, class) =
+            parts.with_value(|p| {
+                (
+                    p.0.clone(),
+                    p.1.clone(),
+                    p.2.clone(),
+                    p.3.clone(),
+                    p.4.clone(),
+                    p.5.clone(),
+                    p.6.clone(),
+                )
+            });
+        let classes = format!(
+            "modal{}{}",
+            size.map(|s| format!(" modal--{s}")).unwrap_or_default(),
+            class.map(|c| format!(" {c}")).unwrap_or_default()
+        );
+        let body_view = match children {
+            Some(children) => children().into_any(),
+            None => content.map(|c| view! { <p>{c}</p> }).into_any(),
         };
-        let close_icon_view = match close_icon {
-            KeyOrValue::Off => None,
-            KeyOrValue::On => Some("close"),
-            KeyOrValue::Value(name) => Some(name),
-        }
-        .map(|name| view! { <Icon name=name on_click=move |_: MouseEvent| do_close() /> });
-
-        let (inner, style) = parts.with_value(|p| {
-            let inner = match &p.children {
-                Some(children) => children(),
-                None => {
-                    let header = p.header.as_ref().map(|h| h.run());
-                    let content = p
-                        .content
-                        .clone()
-                        .map(|c| view! { <div class="content">{c}</div> });
-                    let actions = (!p.actions.is_empty()).then(|| {
-                        let buttons = p
-                            .actions
-                            .iter()
-                            .cloned()
-                            .map(|action| {
-                                let callback = action.on_click;
-                                view! {
-                                    <Button
-                                        negative=action.negative
-                                        positive=action.positive
-                                        primary=action.primary
-                                        on_click=move |_: MouseEvent| {
-                                            emit(callback, ());
-                                            do_close();
-                                        }
-                                    >
-                                        {action.content}
-                                    </Button>
+        let footer_view = if !actions.is_empty() {
+            let buttons = actions
+                .into_iter()
+                .map(|action| {
+                    let callback = action.on_click;
+                    view! {
+                        <button type="button" class=format!("btn btn--{}", action.variant)
+                            on:click=move |_| {
+                                if let Some(cb) = callback {
+                                    cb.run(());
                                 }
-                            })
-                            .collect_view();
-                        view! { <div class="actions">{buttons}</div> }
-                    });
-                    view! { {header}{content}{actions} }.into_any()
-                }
-            };
-            (inner, p.style.clone())
-        });
-
+                                close();
+                            }>
+                            {action.content}
+                        </button>
+                    }
+                })
+                .collect_view();
+            Some(view! { <div class="modal__footer">{buttons}</div> }.into_any())
+        } else {
+            footer.map(|f| view! { <div class="modal__footer">{f.run()}</div> }.into_any())
+        };
+        let (title_id, labelled_by) = (title_id.get_value(), title_id.get_value());
         view! {
-            <div
-                class=dimmer_classes
-                style="display: flex !important;"
-                on:mousedown=on_mouse_down
-                on:click=on_dimmer_click
-            >
-                <div class=modal_classes node_ref=modal_ref style=style>
-                    {close_icon_view}
-                    {inner}
+            <div class="modal-backdrop" on:mousedown=on_mouse_down on:click=on_backdrop_click>
+                <div class=classes node_ref=modal_ref role="dialog" aria-modal="true"
+                    aria-labelledby=labelled_by tabindex="-1">
+                    <div class="modal__header">
+                        <div>
+                            <h2 class="modal__title" id=title_id>{title}</h2>
+                            {description.map(|d| view! { <p class="modal__description">{d}</p> })}
+                        </div>
+                        {close_button.then(|| view! {
+                            <button type="button" class="btn btn--ghost btn--icon btn--sm modal__close"
+                                aria-label="Close" title="Close" on:click=move |_| close()>
+                                <Icon name="x"/>
+                            </button>
+                        })}
+                    </div>
+                    <div class="modal__body">{body_view}</div>
+                    {footer_view}
                 </div>
             </div>
         }
@@ -262,82 +223,13 @@ pub fn Modal(
     view! {
         {trigger_view}
         <Show when=is_open>
-            <LeptosPortal>{body()}</LeptosPortal>
+            <Portal>{body()}</Portal>
         </Show>
     }
 }
 
-fn is_open_untracked(open: Option<Signal<bool>>, internal: RwSignal<bool>) -> bool {
-    open.map_or_else(|| internal.get_untracked(), |o| o.get_untracked())
-}
-
-/// Re-measures the modal every animation frame and toggles `scrolling` when it no
-/// longer fits the viewport (semantic-ui-react `setPositionAndClassNames`).
-fn watch_fit(modal_ref: NodeRef<Div>, scrolling: RwSignal<bool>, alive: Arc<AtomicBool>) {
-    request_animation_frame(move || {
-        if !alive.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some(modal) = modal_ref.get_untracked() {
-            let height = client_rect(&modal).height;
-            let viewport = window()
-                .inner_height()
-                .ok()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let fits = viewport / 2.0 - height / 2.0 + height + 50.0 < viewport;
-            if scrolling.get_untracked() == fits {
-                scrolling.set(!fits);
-            }
-        }
-        watch_fit(modal_ref, scrolling, alive);
-    });
-}
-
-/// `Modal.Header`: `<div class="header">`.
-#[component]
-pub fn ModalHeader(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(optional)] children: Option<Children>,
-) -> impl IntoView {
-    let classes = move || Classes::new("header").add(&class.get()).build();
-    view! { <div class=classes>{children.map(|c| c())}</div> }
-}
-
-/// `Modal.Content`: `<div class="{class} [image] [scrolling] content">`.
-#[component]
-pub fn ModalContent(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(optional)] image: bool,
-    #[prop(optional)] scrolling: bool,
-    #[prop(optional)] children: Option<Children>,
-) -> impl IntoView {
-    let classes = move || {
-        Classes::new(&class.get())
-            .key(image, "image")
-            .key(scrolling, "scrolling")
-            .add("content")
-            .build()
-    };
-    view! { <div class=classes>{children.map(|c| c())}</div> }
-}
-
-/// `Modal.Description`: `<div class="description">`.
-#[component]
-pub fn ModalDescription(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(optional)] children: Option<Children>,
-) -> impl IntoView {
-    let classes = move || Classes::new("description").add(&class.get()).build();
-    view! { <div class=classes>{children.map(|c| c())}</div> }
-}
-
-/// `Modal.Actions`: `<div class="actions">`.
-#[component]
-pub fn ModalActions(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(optional)] children: Option<Children>,
-) -> impl IntoView {
-    let classes = move || Classes::new("actions").add(&class.get()).build();
-    view! { <div class=classes>{children.map(|c| c())}</div> }
+fn next_modal_id() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }

@@ -167,8 +167,8 @@ fn hashed_names_are_detected() {
     for hashed in [
         "slskr-web-d044874f3f4faf1_bg.wasm",
         "slskr-web-d044874f3f4faf1.js",
-        "static/media/icons.38c6d8bab26db77d8c80.woff2",
-        "static/css/slskd-0f1e2d3c4b5a6978.css",
+        "static/media/logo.38c6d8bab26db77d8c80.woff2",
+        "static/css/app-0f1e2d3c4b5a6978.css",
         "snippets/leptos-0123abcd4567ef89/inline0.js",
     ] {
         assert!(meta::is_hashed(hashed), "{hashed}");

@@ -8,6 +8,6 @@ The slskd source used as a predecessor is commit
 f4accbf9f6437e49374682eacaf520010de5c775. The Soulseek.NET source used as a
 predecessor is commit 10f2c464c610edd9a1d11cf52f5601c24d374dad.
 
-The compiled stylesheet at crates/slskr-web/assets/static/css/slskd.css is
-derived from ref/slskd/src/web/build/static/css/main.e80edb4b.css.
-Reproduce the upstream CSS with `cd ref/slskd/src/web && npm ci && npm run build`.
+The web UI's icons (crates/slskr-web/src/ui/icon_data.rs) are taken from
+Lucide (https://lucide.dev, lucide-static 0.460.0), licensed under the ISC
+License; see licenses/lucide-LICENSE.

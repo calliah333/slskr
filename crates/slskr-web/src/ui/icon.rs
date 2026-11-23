@@ -1,85 +1,165 @@
-//! `Icon` and `Icon.Group`.
+//! `Icon`: inline SVG line icons from a curated set of [lucide](https://lucide.dev) icons
+//! (ISC license, `licenses/lucide-LICENSE`). The markup lives in `icon_data.rs`.
+//!
+//! Names are lucide's (`"folder-open"`, `"trash-2"`); a few common aliases are accepted
+//! (see [`ALIASES`]). An unknown name renders `circle-help` and logs a warning in debug
+//! builds. To add an icon, append its lucide name to the list in the generator noted at
+//! the top of `icon_data.rs`, or copy the inner markup of `lucide-static/icons/<name>.svg`
+//! into `ICONS` keeping it sorted.
+//!
+//! Semantic UI icon names the old UI used, and their lucide equivalents:
+//!
+//! | Semantic UI                      | lucide            |
+//! |----------------------------------|-------------------|
+//! | search                           | search            |
+//! | folder, folder open              | folder, folder-open |
+//! | x, close, delete                 | x                 |
+//! | trash alternate                  | trash-2           |
+//! | redo / refresh / sync (alternate)| rotate-cw / refresh-cw |
+//! | lock                             | lock (unlock: lock-open) |
+//! | download, upload                 | download, upload  |
+//! | chevron right / down             | chevron-right / chevron-down |
+//! | plug (connected/disconnected)    | plug / unplug     |
+//! | flask (canary)                   | flask-conical     |
+//! | exclamation circle               | circle-alert      |
+//! | clock, time                      | clock             |
+//! | circle (status)                  | use `StatusDot`   |
+//! | bullhorn (new version)           | megaphone         |
+//! | users, user                      | users, user       |
+//! | stop circle                      | circle-stop       |
+//! | info circle                      | info              |
+//! | sign in, sign out                | log-in, log-out   |
+//! | plus                             | plus              |
+//! | level up alternate               | corner-left-up    |
+//! | left arrow                       | arrow-left        |
+//! | loading circle notch             | loader-circle (with `spin`) |
+//! | check                            | check             |
+//! | arrow up / down                  | arrow-up / arrow-down |
+//! | filter                           | filter            |
+//! | copy                             | copy              |
+//! | comments (rooms), comment (chat) | messages-square, message-square |
+//! | cogs (system)                    | settings          |
+//! | chart bar (dashboard)            | chart-column      |
+//! | adjust (theme)                   | sun / moon / monitor (`ThemeToggle`) |
 
-use leptos::ev::MouseEvent;
 use leptos::prelude::*;
 
-use super::classes::{Classes, KeyOrValue};
+use super::icon_data::ICONS;
 
-/// `<i aria-hidden="true" class="{color} {name} {size} ... icon">`.
-#[component]
-pub fn Icon(
-    /// Icon name, e.g. `"folder open"`.
-    #[prop(into)]
-    name: Signal<String>,
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(into, optional)] color: Signal<Option<String>>,
-    #[prop(optional)] size: Option<&'static str>,
-    #[prop(optional)] bordered: bool,
-    #[prop(optional)] circular: bool,
-    #[prop(into, optional)] disabled: Signal<bool>,
-    #[prop(optional)] fitted: bool,
-    #[prop(optional)] inverted: bool,
-    #[prop(into, optional)] link: Signal<bool>,
-    #[prop(into, optional)] loading: Signal<bool>,
-    /// `true` or a corner position such as `"top right"`.
-    #[prop(into, optional)]
-    corner: KeyOrValue,
-    /// `"horizontally"` or `"vertically"`.
-    #[prop(optional)]
-    flipped: Option<&'static str>,
-    /// `"clockwise"` or `"counterclockwise"`.
-    #[prop(optional)]
-    rotated: Option<&'static str>,
-    /// When set, rendered as `aria-label` instead of `aria-hidden`.
-    #[prop(into, optional)]
-    aria_label: Option<String>,
-    #[prop(into, optional)] on_click: Option<Callback<MouseEvent>>,
-) -> impl IntoView {
-    let classes = move || {
-        Classes::new("")
-            .opt(color.get().as_deref())
-            .add(&name.get())
-            .opt(size)
-            .key(bordered, "bordered")
-            .key(circular, "circular")
-            .key(disabled.get(), "disabled")
-            .key(fitted, "fitted")
-            .key(inverted, "inverted")
-            .key(link.get(), "link")
-            .key(loading.get(), "loading")
-            .key_or_value(corner, "corner")
-            .value_key(flipped, "flipped")
-            .value_key(rotated, "rotated")
-            .add("icon")
-            .add(&class.get())
-            .build()
-    };
-    let aria_hidden = aria_label.is_none().then_some("true");
-    let on_click_handler = move |ev: MouseEvent| {
-        if disabled.get_untracked() {
-            ev.prevent_default();
-            return;
-        }
-        if let Some(cb) = on_click {
-            cb.run(ev);
-        }
-    };
-    view! { <i aria-hidden=aria_hidden aria-label=aria_label class=classes on:click=on_click_handler></i> }
+/// Alternative names accepted by [`Icon`] (`alias -> lucide name`).
+pub const ALIASES: &[(&str, &str)] = &[
+    ("alert-circle", "circle-alert"),
+    ("alert-triangle", "triangle-alert"),
+    ("bar-chart", "chart-column"),
+    ("help", "circle-help"),
+    ("loader", "loader-circle"),
+    ("messages", "messages-square"),
+    ("more-horizontal", "ellipsis"),
+    ("sort", "arrow-up-down"),
+    ("stop", "square"),
+    ("trash", "trash-2"),
+    ("unlock", "lock-open"),
+    ("warning", "triangle-alert"),
+];
+
+/// The inner SVG markup of a named icon, if known (lucide names or [`ALIASES`]).
+pub fn icon_markup(name: &str) -> Option<&'static str> {
+    let name = ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map_or(name, |(_, real)| real);
+    ICONS
+        .binary_search_by(|(known, _)| (*known).cmp(name))
+        .ok()
+        .map(|index| ICONS[index].1)
 }
 
-/// `Icon.Group`: `<i class="{size} icons">`.
+/// All icon names (lucide names, sorted), e.g. for documentation.
+pub fn icon_names() -> impl Iterator<Item = &'static str> {
+    ICONS.iter().map(|(name, _)| *name)
+}
+
+/// An inline SVG icon: `<svg class="icon icon--{size}">`, `1rem` square by default and
+/// drawn in `currentColor`.
+///
+/// Decorative (`aria-hidden`) unless `label` is given, which makes it an `img` with that
+/// accessible name. Icon-only buttons should put the label on the button instead.
 #[component]
-pub fn IconGroup(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(optional)] size: Option<&'static str>,
-    #[prop(optional)] children: Option<Children>,
+pub fn Icon(
+    /// lucide icon name, e.g. `"folder-open"`.
+    #[prop(into)]
+    name: Signal<String>,
+    /// `"xs"` (12px), `"sm"` (14px), `"lg"` (20px), `"xl"` (24px) or `"2xl"` (32px).
+    #[prop(optional)]
+    size: Option<&'static str>,
+    /// Rotate continuously (loaders).
+    #[prop(into, optional)]
+    spin: Signal<bool>,
+    /// Extra classes, e.g. `text-success`.
+    #[prop(into, optional)]
+    class: Signal<String>,
+    /// Accessible name; without it the icon is hidden from assistive technology.
+    #[prop(into, optional)]
+    label: Option<String>,
 ) -> impl IntoView {
     let classes = move || {
-        Classes::new("")
-            .opt(size)
-            .add("icons")
-            .add(&class.get())
-            .build()
+        let mut classes = String::from("icon");
+        if let Some(size) = size {
+            classes.push_str(" icon--");
+            classes.push_str(size);
+        }
+        if spin.get() {
+            classes.push_str(" icon--spin");
+        }
+        class.with(|extra| {
+            if !extra.is_empty() {
+                classes.push(' ');
+                classes.push_str(extra);
+            }
+        });
+        classes
     };
-    view! { <i class=classes>{children.map(|c| c())}</i> }
+    let markup = move || {
+        name.with(|name| {
+            icon_markup(name).unwrap_or_else(|| {
+                #[cfg(debug_assertions)]
+                leptos::logging::warn!("unknown icon {name:?}");
+                icon_markup("circle-help").unwrap_or_default()
+            })
+        })
+    };
+    let hidden = label.is_none().then_some("true");
+    let role = label.is_some().then_some("img");
+    view! {
+        <svg
+            class=classes
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden=hidden
+            role=role
+            aria-label=label
+            focusable="false"
+            inner_html=markup
+        ></svg>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icons_are_sorted_and_aliases_resolve() {
+        assert!(ICONS.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        for (alias, real) in ALIASES {
+            assert!(icon_markup(real).is_some(), "{alias} -> {real}");
+        }
+        assert!(icon_markup("folder-open").is_some());
+        assert!(icon_markup("no-such-icon").is_none());
+    }
 }

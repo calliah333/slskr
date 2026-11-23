@@ -9,11 +9,17 @@ use slskr_types::{
     application::State, config::Config, server::ConnectionState, telemetry::CurrentMetrics,
     transfers::TransferDirection,
 };
-use wasm_bindgen::{JsCast, closure::Closure};
 
 use super::{
-    app_footer::AppFooter, browse::Browse, chat::Chat, dashboard::Dashboard, login_form::LoginForm,
-    rooms::Rooms, search::Searches, setup::SetupWizard, system::System, transfers::Transfers,
+    browse::Browse,
+    chat::Chat,
+    dashboard::Dashboard,
+    login_form::LoginForm,
+    rooms::Rooms,
+    search::Searches,
+    setup::SetupWizard,
+    system::{System, settings::SettingsPage},
+    transfers::Transfers,
     users::Users,
 };
 use crate::{
@@ -22,13 +28,14 @@ use crate::{
         api,
         events::{Event, Events, Status, Topic},
     },
-    ui::{Modal, ModalAction},
+    ui::{Alert, Brand, Icon, Loading, Modal, ModalAction, StatusDot, ThemeToggle, theme},
 };
 
 #[derive(Clone, Copy)]
 pub struct AppContext {
     pub state: RwSignal<State>,
-    pub dark: RwSignal<bool>,
+    /// Live transfer metrics (speeds, active and queued counts).
+    pub metrics: RwSignal<CurrentMetrics>,
 }
 
 /// Lets pages end or re-check the session (e.g. after the web password changed).
@@ -41,56 +48,8 @@ pub struct SessionControl {
 /// Session storage key of the page to open once first-run setup is complete.
 const SETUP_RETURN_KEY: &str = "slskr-setup-return";
 
-const THEME_KEY: &str = "slskd-theme";
-
 fn local_storage() -> Option<web_sys::Storage> {
     window().local_storage().ok().flatten()
-}
-
-fn install_theme() -> RwSignal<bool> {
-    let saved = local_storage().and_then(|storage| storage.get_item(THEME_KEY).ok().flatten());
-    let system = window()
-        .match_media("(prefers-color-scheme: dark)")
-        .ok()
-        .flatten();
-    let dark = RwSignal::new(match saved.as_deref() {
-        Some("dark") => true,
-        Some("light") => false,
-        _ => system
-            .as_ref()
-            .is_some_and(web_sys::MediaQueryList::matches),
-    });
-    if let Some(system) = system {
-        let media = system.clone();
-        let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            let saved =
-                local_storage().and_then(|storage| storage.get_item(THEME_KEY).ok().flatten());
-            if !matches!(saved.as_deref(), Some("dark" | "light")) {
-                dark.try_set(media.matches());
-            }
-        });
-        let callback = listener.as_ref().unchecked_ref();
-        if system
-            .add_event_listener_with_callback("change", callback)
-            .is_ok()
-        {
-            let listener = StoredValue::new_local((system, listener));
-            on_cleanup(move || {
-                listener.with_value(|(system, listener)| {
-                    let _ = system.remove_event_listener_with_callback(
-                        "change",
-                        listener.as_ref().unchecked_ref(),
-                    );
-                })
-            });
-        }
-    }
-    Effect::new(move |_| {
-        if let Some(root) = document().document_element() {
-            let _ = root.class_list().toggle_with_force("dark", dark.get());
-        }
-    });
-    dark
 }
 
 #[derive(Clone, PartialEq)]
@@ -136,17 +95,57 @@ async fn check_session() -> Result<Session, api::ApiError> {
 }
 
 fn loading() -> impl IntoView {
-    view! { <div class="ui active large loader" role="status" aria-label="Connecting to slskr"></div> }
+    view! { <Loading page=true label="Connecting to slskr"/> }
+}
+
+/// The centered one-card layout of the sign-in, setup and error screens: the brand and the
+/// theme toggle on top, the content below.
+#[component]
+pub(super) fn AuthLayout(
+    /// Wider content (the setup wizard).
+    #[prop(optional)]
+    wide: bool,
+    children: Children,
+) -> impl IntoView {
+    let class = if wide {
+        "auth__card auth__card--wide"
+    } else {
+        "auth__card"
+    };
+    view! {
+        <div class="auth">
+            <header class="container app-header">
+                <div class="app-header__bar">
+                    <Brand/>
+                    <div class="app-header__actions"><ThemeToggle/></div>
+                </div>
+            </header>
+            <main class="container auth__main">
+                <div class=class>{children()}</div>
+            </main>
+        </div>
+    }
 }
 
 #[component]
 fn ConnectionError(message: String, retry: Callback<()>) -> impl IntoView {
     view! {
-        <div class="ui negative message view" role="alert">
-            <div class="header">"Could not connect to slskr"</div>
-            <p>{message}</p>
-            <button type="button" class="ui button" on:click=move |_| retry.run(())>"Retry"</button>
-        </div>
+        <AuthLayout>
+            <div class="card">
+                <div class="card__header">
+                    <div>
+                        <h1 class="card__title">"Could not connect to slskr"</h1>
+                        <p class="card__description">"The daemon did not answer. Check that it is running, then retry."</p>
+                    </div>
+                </div>
+                <div class="card__content stack">
+                    <Alert variant="danger">{message}</Alert>
+                    <button type="button" class="btn btn--primary btn--block" on:click=move |_| retry.run(())>
+                        <Icon name="refresh-cw"/>"Retry"
+                    </button>
+                </div>
+            </div>
+        </AuthLayout>
     }
 }
 
@@ -195,7 +194,7 @@ fn SetupGate(on_done: Callback<()>) -> impl IntoView {
                 target
             })
             .filter(|target| target.starts_with('/') && !target.starts_with("/setup"))
-            .unwrap_or_else(|| "/dashboard".to_owned());
+            .unwrap_or_else(|| "/overview".to_owned());
         navigate(
             &target,
             NavigateOptions {
@@ -209,7 +208,7 @@ fn SetupGate(on_done: Callback<()>) -> impl IntoView {
 }
 
 #[component]
-fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
+fn SessionView() -> impl IntoView {
     let session = RwSignal::new(Session::Checking);
     let retry = Callback::new(move |()| session.set(Session::Checking));
     provide_context(SessionControl { recheck: retry });
@@ -232,23 +231,20 @@ fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
             session.set(Session::Login);
         });
     });
-    move || {
-        match session.get() {
+    move || match session.get() {
         Session::Checking => loading().into_any(),
         Session::Login => view! { <LoginForm on_login=retry/> }.into_any(),
         Session::SetupRequired => view! { <SetupGate on_done=retry/> }.into_any(),
         Session::Error(message) => view! { <ConnectionError message retry/> }.into_any(),
         Session::Authenticated { passthrough, admin } => view! {
-            <AuthenticatedApp dark=dark passthrough=passthrough admin=admin logout=logout retry=retry/>
+            <AuthenticatedApp passthrough=passthrough admin=admin logout=logout retry=retry/>
         }
         .into_any(),
-    }
     }
 }
 
 #[component]
 fn AuthenticatedApp(
-    dark: RwSignal<bool>,
     passthrough: bool,
     admin: bool,
     logout: Callback<()>,
@@ -258,7 +254,7 @@ fn AuthenticatedApp(
     let options = RwSignal::new(Config::default());
     let metrics = RwSignal::new(CurrentMetrics::default());
     // The live configuration gates readiness; the onboarding banner reads it.
-    provide_context(AppContext { state, dark });
+    provide_context(AppContext { state, metrics });
 
     let events = Events::start();
     let loaded = [
@@ -311,14 +307,18 @@ fn AuthenticatedApp(
 
     view! {
         {move || if status.get() == Status::Reconnecting {
-            view! { <div class="ui warning message view" role="status">"Lost connection to slskr. Reconnecting…"</div> }.into_any()
+            view! {
+                <div class="container reconnect-banner">
+                    <Alert variant="warning" class="reconnect-alert">"Lost connection to slskr. Reconnecting…"</Alert>
+                </div>
+            }.into_any()
         } else if !ready.get() {
             loading().into_any()
         } else {
             ().into_any()
         }}
         <Show when=move || ready.get()>
-            <AppShell metrics=metrics options=options passthrough=passthrough admin=admin logout=logout/>
+            <AppShell options=options passthrough=passthrough admin=admin logout=logout/>
         </Show>
     }
 }
@@ -354,19 +354,22 @@ fn SoulseekOnboarding(options: RwSignal<Config>) -> impl IntoView {
     let base = config::url_base().trim_end_matches('/').to_owned();
     view! {
         <Show when=move || !dismissed.get() && !pinned.get() && !configured.get()>
-            <div class="ui info message onboarding-banner" role="region" aria-label="Soulseek account">
-                <button type="button" class="link-button onboarding-dismiss" style="float:right"
-                    aria-label="Dismiss" on:click=dismiss>
-                    <i class="close icon" aria-hidden="true"></i>
+            <div class="alert alert--info onboarding-banner" role="region" aria-label="Soulseek account">
+                <Icon name="plug"/>
+                <div class="alert__body">
+                    <div class="alert__title">"Connect your Soulseek account"</div>
+                    <p>
+                        "slskr is not connected to the Soulseek network yet. "
+                        <A href=format!("{base}/system/settings?section=soulseek") attr:class="onboarding-link">
+                            "Add your Soulseek username and password in Settings"
+                        </A>
+                        "."
+                    </p>
+                </div>
+                <button type="button" class="btn btn--ghost btn--icon btn--sm alert__dismiss onboarding-dismiss"
+                    aria-label="Dismiss" title="Dismiss" on:click=dismiss>
+                    <Icon name="x"/>
                 </button>
-                <div class="header">"Connect your Soulseek account"</div>
-                <p>
-                    "slskr is not connected to the Soulseek network yet. "
-                    <A href=format!("{base}/system/settings?section=soulseek") attr:class="onboarding-link">
-                        "Add your Soulseek username and password in Settings"
-                    </A>
-                    "."
-                </p>
             </div>
         </Show>
     }
@@ -374,76 +377,79 @@ fn SoulseekOnboarding(options: RwSignal<Config>) -> impl IntoView {
 
 #[component]
 fn HomeRedirect() -> impl IntoView {
-    view! { <Redirect path="/dashboard" options=NavigateOptions { replace: true, ..Default::default() }/> }
+    view! { <Redirect path="/overview" options=NavigateOptions { replace: true, ..Default::default() }/> }
 }
 
 #[component]
 fn AppShell(
-    metrics: RwSignal<CurrentMetrics>,
     options: RwSignal<Config>,
     passthrough: bool,
     admin: bool,
     logout: Callback<()>,
 ) -> impl IntoView {
-    let state = expect_context::<AppContext>().state;
     view! {
-        <div class="ui pushable segment app">
+        <div class="app">
             <Navigation passthrough logout/>
-            <main class="pusher app-content">
+            <main class="container app-main app-content">
                 {admin.then(|| view! { <SoulseekOnboarding options/> })}
-                <div class="app-content-body">
-                    <Routes fallback=HomeRedirect>
-                        <Route path=path!("/dashboard") view=|| view! {
-                            <div class="view"><Dashboard/></div>
-                        }/>
-                        <Route path=path!("/searches/:id?") view=|| view! {
-                            <div class="view"><Searches/></div>
-                        }/>
-                        <Route path=path!("/downloads") view=|| view! {
-                            <div class="view"><Transfers direction=TransferDirection::Download/></div>
-                        }/>
-                        <Route path=path!("/uploads") view=|| view! {
-                            <div class="view"><Transfers direction=TransferDirection::Upload/></div>
-                        }/>
-                        <Route path=path!("/rooms") view=|| view! { <Rooms/> }/>
-                        <Route path=path!("/chat") view=|| view! { <Chat/> }/>
-                        <Route path=path!("/users") view=|| view! { <Users/> }/>
-                        <Route path=path!("/browse") view=|| view! { <Browse/> }/>
-                        <Route path=path!("/system/files/:root") view=System/>
-                        <Route path=path!("/system/:tab?") view=System/>
-                    </Routes>
-                </div>
+                <Routes fallback=HomeRedirect>
+                    <Route path=path!("/overview") view=Dashboard/>
+                    // The page's former name.
+                    <Route path=path!("/dashboard") view=HomeRedirect/>
+                    <Route path=path!("/searches/:id?") view=Searches/>
+                    <Route path=path!("/downloads") view=|| view! {
+                        <Transfers direction=TransferDirection::Download/>
+                    }/>
+                    <Route path=path!("/uploads") view=|| view! {
+                        <Transfers direction=TransferDirection::Upload/>
+                    }/>
+                    <Route path=path!("/rooms") view=Rooms/>
+                    <Route path=path!("/chat") view=Chat/>
+                    <Route path=path!("/users") view=Users/>
+                    <Route path=path!("/browse") view=Browse/>
+                    <Route path=path!("/settings") view=SettingsPage/>
+                    <Route path=path!("/system/files/:root") view=System/>
+                    <Route path=path!("/system/:tab?") view=System/>
+                </Routes>
             </main>
         </div>
-        <AppFooter state=state metrics=metrics/>
     }
+}
+
+/// Whether `path` (an app path such as `/system`) is the current page or one below it.
+fn is_current(current: &str, base: &str, path: &str) -> bool {
+    let current = current
+        .strip_prefix(base)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .unwrap_or(current);
+    current == path
+        || current
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[component]
 fn NavLink(path: &'static str, icon: &'static str, label: &'static str) -> impl IntoView {
     let base = config::url_base().trim_end_matches('/').to_owned();
     let href = format!("{base}{path}");
-    let location = leptos_router::hooks::use_location();
-    // The vendored CSS styles `.active.item`; `<A>` alone only sets `aria-current`.
-    let class = move || {
-        location.pathname.with(|current| {
-            let current = current
-                .strip_prefix(base.as_str())
-                .filter(|rest| rest.is_empty() || rest.starts_with('/'))
-                .unwrap_or(current);
-            let active = current == path
-                || current
-                    .strip_prefix(path)
-                    .is_some_and(|rest| rest.starts_with('/'));
-            if active { "active item" } else { "item" }
-        })
-    };
-    view! { <A href=href attr:class=class><i class=icon aria-hidden="true"></i>{label}</A> }
+    let location = use_location();
+    let active = Memo::new(move |_| {
+        location
+            .pathname
+            .with(|current| is_current(current, &base, path))
+    });
+    // `<A>` sets `aria-current` itself; the class keeps the active look independent of it.
+    view! {
+        <A href=href attr:class=move || if active.get() { "tabs__tab is-active" } else { "tabs__tab" }>
+            <Icon name=icon/>
+            <span>{label}</span>
+        </A>
+    }
 }
 
 #[component]
 fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
-    let AppContext { state, dark, .. } = expect_context();
+    let AppContext { state, .. } = expect_context();
     let canary = Memo::new(move |_| state.with(|state| state.version.is_canary));
     let pending = Memo::new(move |_| {
         state.with(|state| {
@@ -460,58 +466,76 @@ fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
             })
         })
     });
-    let toggle_theme = move |_| {
-        let next = !dark.get_untracked();
-        if let Some(storage) = local_storage() {
-            let _ = storage.set_item(THEME_KEY, if next { "dark" } else { "light" });
-        }
-        dark.set(next);
+    let base = config::url_base().trim_end_matches('/').to_owned();
+    let location = use_location();
+    let settings_active = {
+        let base = base.clone();
+        Memo::new(move |_| {
+            location
+                .pathname
+                .with(|current| is_current(current, &base, "/settings"))
+        })
     };
+    let info_href = format!("{base}/system/info");
+    let settings_href = format!("{base}/settings");
     view! {
-        <nav class="ui inverted labeled icon menu navigation" aria-label="Main navigation">
-            <Show when=move || canary.get()>
-                <span class="item"><i class="yellow flask icon" aria-hidden="true"></i>"Canary"</span>
-            </Show>
-            <NavLink path="/dashboard" icon="chart bar icon" label="Dashboard"/>
-            <NavLink path="/searches" icon="search icon" label="Search"/>
-            <NavLink path="/downloads" icon="download icon" label="Downloads"/>
-            <NavLink path="/uploads" icon="upload icon" label="Uploads"/>
-            <NavLink path="/rooms" icon="comments icon" label="Rooms"/>
-            <NavLink path="/chat" icon="comment icon" label="Chat"/>
-            <NavLink path="/users" icon="users icon" label="Users"/>
-            <NavLink path="/browse" icon="folder open icon" label="Browse"/>
-            <div class="right menu">
-                <button type="button" class="item" aria-pressed=move || dark.get().to_string() on:click=toggle_theme>
-                    <i class="adjust icon" aria-hidden="true"></i>"Theme"
-                </button>
-                <ConnectButton state=state/>
-                <Show when=move || pending.get()>
-                    <NavLink path="/system/info" icon="yellow exclamation circle icon" label="Pending Action"/>
-                </Show>
-                {move || version.get().map(|(current, latest)| view! {
-                    <Modal size="mini" close_icon=true
-                        trigger=|| view! {
-                            <button type="button" class="item"><i class="yellow bullhorn icon" aria-hidden="true"></i>"New Version"</button>
-                        }
-                        header=|| view! { <div class="header">"New Version"</div> }
-                        content=format!("You are running {current}. Version {latest} is available.")
-                        actions=vec![ModalAction::new("Close")]/>
-                })}
-                <NavLink path="/system" icon="cogs icon" label="System"/>
-                <Show when=move || !passthrough>
-                    <Modal size="mini"
-                        trigger=|| view! {
-                            <button type="button" class="item"><i class="sign out icon" aria-hidden="true"></i>"Log Out"</button>
-                        }
-                        header=|| view! { <div class="header">"Confirm Log Out"</div> }
-                        content="Are you sure you want to log out?"
-                        actions=vec![
-                            ModalAction::new("Cancel"),
-                            ModalAction::new("Log Out").negative().on_click(move || logout.run(())),
-                        ]/>
-                </Show>
+        <header class="container app-header">
+            <div class="app-header__bar">
+                <Brand href=format!("{base}/overview")/>
+                <div class="app-header__actions">
+                    <Show when=move || canary.get()>
+                        <span class="badge badge--amber hide-sm"><Icon name="flask-conical"/>"Canary"</span>
+                    </Show>
+                    <Show when=move || pending.get()>
+                        <A href=info_href.clone() attr:class="btn btn--sm pending-action"
+                            attr:title="Pending action" attr:aria-label="Pending action">
+                            <Icon name="circle-alert" class="text-warning"/>
+                            <span class="hide-sm">"Pending action"</span>
+                        </A>
+                    </Show>
+                    {move || version.get().map(|(current, latest)| view! {
+                        <Modal size="sm" title="New version"
+                            trigger=|| view! {
+                                <button type="button" class="btn btn--sm" title="New version" aria-label="New version">
+                                    <Icon name="megaphone" class="text-warning"/>
+                                    <span class="hide-sm">"New version"</span>
+                                </button>
+                            }
+                            content=format!("You are running {current}. Version {latest} is available.")
+                            actions=vec![ModalAction::new("Close")]/>
+                    })}
+                    <ConnectButton state=state/>
+                    <ThemeToggle/>
+                    <A href=settings_href attr:class="btn btn--icon settings-link"
+                        attr:aria-label="Settings" attr:title="Settings"
+                        attr:aria-current=move || settings_active.get().then_some("page")>
+                        <Icon name="settings"/>
+                    </A>
+                    <Show when=move || !passthrough>
+                        <Modal size="sm" title="Log out?"
+                            trigger=|| view! { <button type="button" class="btn logout-button">"Logout"</button> }
+                            content="You will need your username and password to sign in again."
+                            actions=vec![
+                                ModalAction::new("Cancel"),
+                                ModalAction::new("Log out").negative().on_click(move || logout.run(())),
+                            ]/>
+                    </Show>
+                </div>
             </div>
-        </nav>
+            <div class="app-nav-row">
+                <nav class="tabs app-nav navigation" aria-label="Main navigation">
+                    <NavLink path="/overview" icon="gauge" label="Overview"/>
+                    <NavLink path="/searches" icon="search" label="Search"/>
+                    <NavLink path="/downloads" icon="download" label="Downloads"/>
+                    <NavLink path="/uploads" icon="upload" label="Uploads"/>
+                    <NavLink path="/browse" icon="folder-open" label="Browse"/>
+                    <NavLink path="/users" icon="users" label="Users"/>
+                    <NavLink path="/rooms" icon="messages-square" label="Rooms"/>
+                    <NavLink path="/chat" icon="message-square" label="Chat"/>
+                    <NavLink path="/system" icon="server" label="System"/>
+                </nav>
+            </div>
+        </header>
     }
 }
 
@@ -520,24 +544,25 @@ fn ConnectButton(state: RwSignal<State>) -> impl IntoView {
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let connected = Memo::new(move |_| state.with(|state| state.server.state.is_connected()));
+    // (dot status, text, busy)
     let status = Memo::new(move |_| {
         state.with(|state| {
             if state.server.state.is_connected() {
-                let icon = if state.pending_reconnect {
-                    "yellow plug icon"
+                let dot = if state.pending_reconnect {
+                    "away"
                 } else {
-                    "green plug icon"
+                    "online"
                 };
-                (icon, "Connected")
+                (dot, "Connected", false)
             } else if matches!(
                 state.server.state,
                 ConnectionState::Connecting | ConnectionState::LoggingIn
             ) {
-                ("green sync alternate loading icon", "Connecting")
+                ("away", "Connecting", true)
             } else if state.connection_watchdog.is_attempting_connection {
-                ("yellow clock icon", "Waiting to Reconnect")
+                ("away", "Waiting to Reconnect", false)
             } else {
-                ("red plug icon", "Disconnected")
+                ("offline", "Disconnected", false)
             }
         })
     });
@@ -562,25 +587,43 @@ fn ConnectButton(state: RwSignal<State>) -> impl IntoView {
             pending.set(false);
         });
     });
+    let hint = move || {
+        let action = if connected.get() {
+            "click to disconnect"
+        } else {
+            "click to connect"
+        };
+        format!("Soulseek: {} ({action})", status.get().1)
+    };
     view! {
-        <button type="button" class="item" disabled=move || pending.get() on:click=move |_| {
-            error.set(None);
-            pending.set(true);
-        }>
-            <i class=move || status.get().0 aria-hidden="true"></i>
-            {move || status.get().1}
+        <button type="button" class="btn connection" title=hint aria-label=hint
+            disabled=move || pending.get() on:click=move |_| {
+                error.set(None);
+                pending.set(true);
+            }>
+            {move || {
+                let (dot, _, busy) = status.get();
+                if busy || pending.get() {
+                    view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
+                } else {
+                    view! { <StatusDot status=dot/> }.into_any()
+                }
+            }}
+            <span class="connection__text">{move || status.get().1}</span>
         </button>
-        {move || error.get().map(|message| view! { <span class="item" role="alert">{message}</span> })}
+        {move || error.get().map(|message| view! {
+            <span class="connection-error" role="alert">{message}</span>
+        })}
     }
 }
 
 #[component]
 pub fn App() -> impl IntoView {
     let base = config::url_base();
-    let dark = install_theme();
+    theme::install();
     view! {
         <Router base=base.trim_end_matches('/').to_owned()>
-            <SessionView dark=dark/>
+            <SessionView/>
         </Router>
     }
 }

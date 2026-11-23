@@ -238,7 +238,7 @@ with its content type, a SHA-256 ETag and brotli/gzip variants when they save at
 Without the variable the binary embeds a placeholder page explaining how to build the UI,
 so `cargo build` and `cargo test` need no wasm toolchain. `--web-dir DIR` serves a
 directory instead (UI development; paths are confined to the directory, symlinks
-included). Names with a content hash (`slskr-web-<hash>_bg.wasm`, `static/css/slskd-<hash>.css`)
+included). Names with a content hash (`slskr-web-<hash>_bg.wasm`, `static/css/app-<hash>.css`)
 are sent with `Cache-Control: public, max-age=31536000, immutable`, everything else with
 `no-cache`; `If-None-Match` answers 304. `index.html` gets `<base href="{url_base}/">` and
 `window.urlBase` once at startup. Paths without an extension fall back to `index.html` so

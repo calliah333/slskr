@@ -18,7 +18,7 @@ Toolchain: `nix develop` (flake.nix) provides stable Rust (edition 2024) with th
 | `crates/soulseek` | lib | async (tokio) Soulseek network client |
 | `crates/slskr-types` | lib | serde types of the HTTP API and live events; shared by daemon and UI |
 | `crates/slskr` | bin `slskr` (+ lib) | the daemon: axum HTTP API, live events WebSocket, services, sqlite, the embedded UI |
-| `crates/slskr-web` | bin (wasm) | Leptos 0.8 CSR port of the slskd React UI, built with trunk |
+| `crates/slskr-web` | bin (wasm) | Leptos 0.8 CSR web UI (derived from the slskd React UI), built with trunk |
 
 ## soulseek crate layout
 
@@ -160,18 +160,20 @@ upgrades; see [daemon internals](DAEMON.md#authentication).
 ## Web UI
 
 `crates/slskr-web` is a Leptos UI derived from slskd's React UI (`ref/slskd/src/web/src`),
-calling the API through `services/api.rs` with the `slskr-types` types. Styling: the
-compiled semantic-ui + slskd CSS is vendored as `assets/static/css/slskd.css` (+ fonts/flags
-in `assets/static/media`), so UI components must emit the same DOM/class names as
-semantic-ui-react.
-`src/ui/` holds semantic-ui-react equivalents; `src/services/` ports `src/lib/*.js`;
-`src/components/` ports `src/components/**`.
+calling the API through `services/api.rs` with the `slskr-types` types. Styling is slskr's
+own design system (shadcn/ui-style slate tokens, light and dark): one hand-written
+stylesheet, `assets/static/css/app.css`, and the components in `src/ui/` (buttons, cards,
+badges, tables, modal, lucide icons, theme toggle, …), documented with examples in
+[UI.md](UI.md). `src/services/` ports `src/lib/*.js`; `src/components/` holds the pages.
+The app shell (`components/app.rs`) is a header with the brand, connection status, theme,
+settings and logout, and a tab bar of pages; Overview (`/overview`) shows live transfer
+speeds and history.
 
-The setup wizard (`components/setup.rs`, route `/setup`) and System → Settings
-(`components/system/settings*`) are slskr's own. They build their forms only from the
+The setup wizard (`components/setup.rs`, route `/setup`) and Settings (`/settings`, also
+under System; `components/system/settings*`) are slskr's own. They build their forms only from the
 components in `src/ui/form.rs` (`Section`, `Field`, `TextInput`, `Toggle`, `ListEditor`,
-`SaveBar`, …), which carry no logic and are styled by `assets/static/css/forms.css`; a new
-look for forms means restyling those two files. `Field` provides the control's `id`,
+`SaveBar`, …), which carry no logic and are styled by the "forms" section of
+`assets/static/css/app.css`. `Field` provides the control's `id`,
 `aria-describedby` and lock state as context. The settings page keeps a sparse draft of
 changed dotted keys (`settings/model.rs`) and saves it with one `PATCH /api/settings`.
 While first-run setup is required, every route shows the wizard at `/setup` and returns
@@ -180,8 +182,8 @@ to the requested page afterwards.
 ## Build and packaging
 
 `trunk build --release` in `crates/slskr-web` writes the UI to the workspace `dist/`:
-`index.html`, the hashed wasm/JS, the hashed stylesheet under `static/css/`, fonts and
-flags under `static/media/`, a favicon, and `LICENSE`/`NOTICE`/`licenses/`. Building the
+`index.html`, the hashed wasm/JS, the hashed stylesheet under `static/css/`, a favicon, and
+`LICENSE`/`NOTICE`/`licenses/`. Building the
 daemon with `SLSKR_EMBED_UI=<dist>` compiles those files into the binary (see
 [daemon internals](DAEMON.md#web-ui-webrs-buildrs)), so a release is one executable.
 `nix build .#slskr` builds the UI as its own derivation (`.#slskr-web`) and passes it in;

@@ -1,34 +1,32 @@
-//! Semantic UI primitives used by the slskd web UI.
+//! slskr's design system components (styled by `assets/static/css/app.css`; reference in
+//! `docs/UI.md`). They carry no business logic.
+//!
+//! Many components are offered ahead of their first use while pages move over to them.
+#![allow(dead_code)]
 
+mod brand;
 mod button;
-mod classes;
+mod card;
 mod controls;
-mod divider;
-mod dropdown;
-mod flag;
+mod feedback;
 pub mod form;
-mod header;
 mod icon;
-mod image;
-mod label;
-mod loader;
-mod menu;
+mod icon_data;
 mod modal;
-mod segment;
-mod table;
-pub use classes::{KeyOrValue, Width};
+pub mod theme;
 
-pub use button::*;
-pub use controls::*;
-pub use divider::*;
-pub use dropdown::*;
-pub use flag::*;
-pub use header::*;
-pub use icon::*;
-pub use image::*;
-pub use label::*;
-pub use loader::*;
-pub use menu::*;
-pub use modal::*;
-pub use segment::*;
-pub use table::*;
+// Not every component is used yet.
+#[allow(unused_imports)]
+pub use self::{
+    brand::*, button::*, card::*, controls::*, feedback::*, icon::*, modal::*, theme::ThemeToggle,
+};
+
+/// Joins non-empty class fragments with spaces.
+pub(crate) fn join_classes(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}

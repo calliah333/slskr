@@ -19,7 +19,10 @@ use crate::{
         api,
         events::{Events, Topic},
     },
-    ui::form::{Field, FieldGrid, FormMessage, SaveBar, Section, TextInput, focus_first_invalid},
+    ui::{
+        Icon, Loading,
+        form::{Field, FieldGrid, FormMessage, SaveBar, Section, TextInput, focus_first_invalid},
+    },
 };
 
 /// Sections in display order: `(anchor, title)`. The anchor is `?section=` and the
@@ -126,29 +129,40 @@ pub fn SettingsPage() -> impl IntoView {
         })
     });
 
+    // The page is served at /settings and at /system/settings: stay on the current one.
     let base = crate::config::url_base().trim_end_matches('/').to_owned();
+    let current = leptos_router::hooks::use_location()
+        .pathname
+        .get_untracked();
+    let page = current
+        .strip_prefix(base.as_str())
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(&current);
+    let page_path = format!("{base}{page}");
     view! {
-        <div class="settings ui form">
+        <div class="settings">
             <PendingRestart/>
             {move || form.top_error.get().map(|message| view! {
-                <FormMessage kind="negative"><p>{message}</p></FormMessage>
+                <FormMessage kind="danger"><p>{message}</p></FormMessage>
             })}
             {move || form.notice.get().map(|message| view! {
-                <FormMessage kind="positive"><p>{message}</p></FormMessage>
+                <FormMessage kind="success"><p>{message}</p></FormMessage>
             })}
             <Show when=move || form.settings.with(Option::is_some)
-                fallback=|| view! { <div class="ui active centered inline loader" role="status" aria-label="Loading settings"></div> }>
+                fallback=|| view! { <Loading label="Loading settings"/> }>
                 <div class="settings-layout">
-                    <nav class="ui vertical secondary pointing menu settings-nav" aria-label="Settings sections">
+                    <nav class="settings-nav" aria-label="Settings sections">
+                        <div class="nav-list">
                         {SECTIONS.into_iter().map(|(anchor, title)| {
                             let active = move || query.with(|q| q.get("section").as_deref() == Some(anchor));
                             view! {
-                                <A href=format!("{base}/system/settings?section={anchor}")
-                                    attr:class=move || if active() { "active item" } else { "item" }>
+                                <A href=format!("{page_path}?section={anchor}")
+                                    attr:class=move || if active() { "nav-list__item is-active" } else { "nav-list__item" }>
                                     {title}
                                 </A>
                             }
                         }).collect_view()}
+                        </div>
                     </nav>
                     <div class="settings-sections">
                         <SoulseekSection/>
@@ -195,9 +209,9 @@ fn PendingRestart() -> impl IntoView {
             <FormMessage kind="warning">
                 <div class="pending-restart">
                     <p>"Some saved changes take effect after slskr restarts."</p>
-                    <button type="button" class="ui small primary button" class:loading=restarting
-                        disabled=restarting on:click=restart>
-                        "Restart now"
+                    <button type="button" class="btn btn--sm btn--primary" disabled=restarting
+                        aria-busy=move || restarting.get().then_some("true") on:click=restart>
+                        <Icon name="power"/>"Restart now"
                     </button>
                     {move || error.get().map(|message| view! { <p role="alert">{message}</p> })}
                 </div>
@@ -309,12 +323,12 @@ fn SharesSection() -> impl IntoView {
             <Setting key="shares.rescan_interval" label="Rescan every" kind=Kind::OptionalDuration
                 help="Empty scans only on start and on request."/>
             <div class="form-actions">
-                <button type="button" class="ui button shares-rescan" class:loading=scanning disabled=scanning
-                    on:click=rescan>
-                    <i class="sync icon" aria-hidden="true"></i>"Rescan now"
+                <button type="button" class="btn shares-rescan" disabled=scanning
+                    aria-busy=move || scanning.get().then_some("true") on:click=rescan>
+                    <Icon name="refresh-cw" spin=scanning/>"Rescan now"
                 </button>
                 {move || status.get().map(|(ok, message)| view! {
-                    <span class="form-help" role=if ok { "status" } else { "alert" }>{message}</span>
+                    <span class=if ok { "help form-help" } else { "error form-help" } role=if ok { "status" } else { "alert" }>{message}</span>
                 })}
             </div>
         </Section>
@@ -380,8 +394,10 @@ fn UploadsSection() -> impl IntoView {
                     kind=Kind::Number { min: 1, max: u64::from(u32::MAX) } help="At least 1."/>
                 <Setting key="uploads.speed_limit" label="Speed limit (KiB/s)" kind=Kind::COUNT help="0 is unlimited."/>
             </FieldGrid>
-            <h4 class="ui header">"Limits per user"</h4>
-            <p class="form-help">"0 is unlimited. A group's own non-zero limits take precedence."</p>
+            <div>
+            <h3 class="form-subsection-title">"Limits per user"</h3>
+            <p class="help form-help">"0 is unlimited. A group's own non-zero limits take precedence."</p>
+            </div>
             <Limits prefix="uploads.limits".to_owned()/>
         </Section>
     }
@@ -449,9 +465,9 @@ fn GroupsSection() -> impl IntoView {
     view! {
         <Section id="settings-groups" title="Groups"
             description="Upload queue groups. Privileged users always go first, then lower priority numbers. Users in no group are in Default; users sharing too little are Leechers.">
-            <h4 class="ui header">"Default"</h4>
+            <h3 class="form-subsection-title">"Default"</h3>
             <GroupFields name="default".to_owned()/>
-            <h4 class="ui header">"Leechers"</h4>
+            <h3 class="form-subsection-title">"Leechers"</h3>
             <GroupFields name="leechers".to_owned()/>
             <For each=move || form.custom_groups() key=|name| name.clone() let:group>
                 {
@@ -462,14 +478,14 @@ fn GroupsSection() -> impl IntoView {
                     };
                     view! {
                         <div class="form-subsection custom-group">
-                            <h4 class="ui header">
+                            <h3 class="form-subsection-title">
                                 {group.clone()}
-                                <button type="button" class="ui mini basic negative button group-remove" disabled=locked
+                                <button type="button" class="btn btn--sm btn--danger-outline group-remove" disabled=locked
                                     aria-label=format!("Remove group {group}")
                                     on:click=move |_| form.remove_group(&removing)>
-                                    "Remove group"
+                                    <Icon name="trash-2"/>"Remove group"
                                 </button>
-                            </h4>
+                            </h3>
                             <GroupFields name=group.clone()/>
                         </div>
                     }
@@ -477,10 +493,10 @@ fn GroupsSection() -> impl IntoView {
             </For>
             <Field id="settings-new-group" label="New group" error=error
                 help="Saved with the other changes.">
-                <div class="ui action input">
+                <div class="input-group">
                     <TextInput value=name on_input=move |t: String| name.set(t)
                         placeholder="e.g. friends"/>
-                    <button type="button" class="ui button group-add" on:click=move |_| add()>"Add group"</button>
+                    <button type="button" class="btn group-add" on:click=move |_| add()><Icon name="plus"/>"Add group"</button>
                 </div>
             </Field>
         </Section>

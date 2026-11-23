@@ -5,10 +5,19 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>slskr</title>
     <base href="/" />
+    <script>
+      // Apply the saved theme (light, dark or system; default system) before the first
+      // paint. Same key as src/ui/theme.rs.
+      (function () {
+        var theme = null;
+        try { theme = localStorage.getItem("slskr-theme"); } catch (e) {}
+        var dark = theme === "dark" ||
+          (theme !== "light" && window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.classList.toggle("dark", dark);
+      })();
+    </script>
     <link data-trunk rel="icon" href="assets/favicon.svg" />
-    <link data-trunk rel="copy-dir" href="assets/static/media" data-target-path="static/media" />
-    <link data-trunk rel="css" href="assets/static/css/slskd.css" data-target-path="static/css" data-no-minify />
-    <link data-trunk rel="css" href="assets/static/css/forms.css" data-target-path="static/css" />
+    <link data-trunk rel="css" href="assets/static/css/app.css" data-target-path="static/css" />
     <link data-trunk rel="copy-file" href="../../LICENSE" />
     <link data-trunk rel="copy-file" href="../../NOTICE" />
     <link data-trunk rel="copy-dir" href="../../licenses" />

@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use super::model::{Form, Parse, field_id};
+use crate::ui::Icon;
 use crate::ui::form::{
     DurationInput, Field, ListEditor, NumberInput, PasswordInput, Select, TextArea, TextInput,
     Toggle,
@@ -90,15 +91,15 @@ pub fn Setting(
         };
         view! {
             <Show when=move || form.is_dirty(&k())>
-                <button type="button" class="ui mini basic button form-revert"
+                <button type="button" class="btn btn--xs btn--ghost form-revert"
                     on:click=move |_| { editing_secret.set(false); form.revert(&k()); }>
-                    "Undo change"
+                    <Icon name="undo-2"/>"Undo change"
                 </button>
             </Show>
             <Show when=move || !form.is_dirty(&k()) && form.is_stored(&k()) && form.pinned_by(&k()).is_none()>
-                <button type="button" class="ui mini basic button form-reset" on:click=reset
+                <button type="button" class="btn btn--xs btn--ghost form-reset" on:click=reset
                     title="Remove the value saved from this page">
-                    "Reset to default"
+                    <Icon name="rotate-ccw"/>"Reset to default"
                 </button>
             </Show>
         }
@@ -184,9 +185,9 @@ pub fn Setting(
                 <ListEditor items placeholder="/path/to/music or [Alias]/path"
                     on_change=Callback::new(move |items: Vec<String>| set(items))
                     extra=ViewFn::from(move || view! {
-                        <button type="button" class="ui button directory-browse" disabled=locked
+                        <button type="button" class="btn directory-browse" disabled=locked
                             on:click=move |_| picking.set(true)>
-                            <i class="folder open icon" aria-hidden="true"></i>"Browse…"
+                            <Icon name="folder-open"/>"Browse…"
                         </button>
                     })/>
                 <crate::components::directory_picker::DirectoryPicker open=picking on_pick=pick/>
@@ -250,15 +251,17 @@ fn SecretControl(key: String, confirm: bool, editing: RwSignal<bool>) -> impl In
     let confirm_id = format!("{}-confirm", field_id(&k()));
     view! {
         <div class="form-secret">
-            <span class="ui label form-secret-state">{move || if is_set.get() { "Set" } else { "Not set" }}</span>
+            <span class=move || if is_set.get() { "badge badge--success form-secret-state" } else { "badge form-secret-state" }>
+                {move || if is_set.get() { "Set" } else { "Not set" }}
+            </span>
             <Show when=move || !editing.get()>
-                <button type="button" class="ui small button form-secret-change" disabled=locked
+                <button type="button" class="btn btn--sm form-secret-change" disabled=locked
                     on:click=move |_| editing.set(true)>
                     {move || if is_set.get() { "Change" } else { "Set" }}
                 </button>
             </Show>
             <Show when=move || editing.get()>
-                <button type="button" class="ui small basic button"
+                <button type="button" class="btn btn--sm btn--ghost form-secret-cancel"
                     on:click=move |_| {
                         value.set(String::new());
                         again.set(String::new());
@@ -275,8 +278,8 @@ fn SecretControl(key: String, confirm: bool, editing: RwSignal<bool>) -> impl In
             {confirm.then(|| {
                 let confirm_id = confirm_id.clone();
                 view! {
-                    <label class="form-label form-confirm-label" for=confirm_id.clone()>"Repeat it"</label>
-                    <input class="form-input" type="password" id=confirm_id autocomplete="new-password"
+                    <label class="label form-label form-confirm-label" for=confirm_id.clone()>"Repeat it"</label>
+                    <input class="input form-input" type="password" id=confirm_id autocomplete="new-password"
                         prop:value=move || again.get()
                         on:input=move |event| { again.set(event_target_value(&event)); check(); }/>
                 }

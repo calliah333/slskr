@@ -15,8 +15,10 @@ use slskr_types::{
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
+    components::app::AppContext,
     config,
     services::{api, util},
+    ui::{PageHeader, Stat},
 };
 use charts::HistoryChart;
 
@@ -233,11 +235,13 @@ pub fn Dashboard() -> impl IntoView {
     let submit_search = create_search.clone();
 
     view! {
-        <main class="dashboard" on:keydown=move |ev: web_sys::KeyboardEvent| {
+        <div class="dashboard stack" on:keydown=move |ev: web_sys::KeyboardEvent| {
             if ev.key() == "/" && !ev.ctrl_key() && !ev.meta_key() && !ev.alt_key() {
                 if let Some(input) = search.get() { ev.prevent_default(); let _ = input.focus(); }
             }
         }>
+            <PageHeader title="Overview" description="Live transfers, history and reports."/>
+            <LiveStats/>
             <section class="ui raised segment search-segment" aria-label="Search">
                 <div class="search-segment-icon" aria-hidden="true">"⌕"</div>
                 <form class="search-input" on:submit=move |ev| { ev.prevent_default(); submit_search(true); }>
@@ -284,7 +288,36 @@ pub fn Dashboard() -> impl IntoView {
                     </> }.into_any()
                 }}
             </section>
-        </main>
+        </div>
+    }
+}
+
+fn format_speed(speed: f64) -> String {
+    if speed < 1.0 || !speed.is_finite() {
+        "0 B/s".to_owned()
+    } else {
+        format!("{}/s", util::format_bytes_with(speed, 1, 4, ' ').trim())
+    }
+}
+
+/// Live transfer tiles: speed, active and queued files per direction, from the live
+/// metrics the daemon pushes over the events socket.
+#[component]
+fn LiveStats() -> impl IntoView {
+    let metrics = expect_context::<AppContext>().metrics;
+    let tile = move |label: &'static str,
+                     value: fn(&slskr_types::telemetry::CurrentMetrics) -> String| {
+        view! { <Stat label=label value=Signal::derive(move || metrics.with(value)) large=true/> }
+    };
+    view! {
+        <section class="stats live-stats" aria-label="Live transfers">
+            {tile("Download speed", |m| format_speed(m.downloads.in_progress.average_speed))}
+            {tile("Active downloads", |m| m.downloads.in_progress.files.to_string())}
+            {tile("Queued downloads", |m| m.downloads.queued.files.to_string())}
+            {tile("Upload speed", |m| format_speed(m.uploads.in_progress.average_speed))}
+            {tile("Active uploads", |m| m.uploads.in_progress.files.to_string())}
+            {tile("Queued uploads", |m| m.uploads.queued.files.to_string())}
+        </section>
     }
 }
 

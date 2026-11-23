@@ -1,207 +1,227 @@
-//! Form and status controls.
+//! Stand-alone controls: `Checkbox`, `Switch`, `Tabs`, `DropdownMenu`.
+//!
+//! Form controls bound to a labelled field (settings, setup) are in [`super::form`]. Plain
+//! inputs need no component: `<input class="input">`, `<select class="select">`,
+//! `<textarea class="textarea">`.
 
-use leptos::ev::Event;
+use leptos::ev::{KeyboardEvent, MouseEvent};
+use leptos::html::Div;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use super::classes::Classes;
+use super::icon::Icon;
+use super::join_classes;
 
-/// Semantic UI input backed by a native browser `<input>`.
-#[component]
-pub fn Input(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(into, optional)] value: Signal<String>,
-    #[prop(into, optional)] placeholder: Option<String>,
-    #[prop(optional)] input_type: Option<&'static str>,
-    #[prop(optional)] name: Option<&'static str>,
-    #[prop(optional)] id: Option<&'static str>,
-    #[prop(optional)] disabled: bool,
-    #[prop(optional)] readonly: bool,
-    #[prop(optional)] required: bool,
-    #[prop(optional)] autofocus: bool,
-    #[prop(into, optional)] on_input: Option<Callback<String>>,
-) -> impl IntoView {
-    let classes = move || Classes::new("ui").add("input").add(&class.get()).build();
-    let handle_input = move |ev: Event| {
-        let target = ev.target().expect("input event target");
-        let value = target.unchecked_into::<web_sys::HtmlInputElement>().value();
-        if let Some(callback) = on_input {
-            callback.run(value);
-        }
-    };
-    view! {
-        <div class=classes>
-            <input
-                type=input_type.unwrap_or("text")
-                name=name
-                id=id
-                value=move || value.get()
-                placeholder=placeholder
-                disabled=disabled
-                readonly=readonly
-                required=required
-                autofocus=autofocus
-                on:input=handle_input
-            />
-        </div>
-    }
-}
-
-/// Native multiline text input with Semantic UI form styling.
-#[component]
-pub fn TextArea(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(into, optional)] value: Signal<String>,
-    #[prop(into, optional)] placeholder: Option<String>,
-    #[prop(optional)] name: Option<&'static str>,
-    #[prop(optional)] id: Option<&'static str>,
-    #[prop(optional)] rows: Option<u32>,
-    #[prop(optional)] disabled: bool,
-    #[prop(optional)] readonly: bool,
-    #[prop(optional)] required: bool,
-    #[prop(into, optional)] on_input: Option<Callback<String>>,
-) -> impl IntoView {
-    let classes = move || Classes::new("ui").add(&class.get()).build();
-    let handle_input = move |ev: Event| {
-        let target = ev.target().expect("textarea event target");
-        let value = target
-            .unchecked_into::<web_sys::HtmlTextAreaElement>()
-            .value();
-        if let Some(callback) = on_input {
-            callback.run(value);
-        }
-    };
-    view! {
-        <textarea
-            class=classes
-            name=name
-            id=id
-            rows=rows.unwrap_or(3)
-            prop:value=move || value.get()
-            placeholder=placeholder
-            disabled=disabled
-            readonly=readonly
-            required=required
-            on:input=handle_input
-        />
-    }
-}
-
-/// Accessible native checkbox, optionally styled as a Semantic UI toggle.
+/// A native checkbox with its label: `<label class="check"><input class="checkbox">…`.
+/// Without `label` give `aria_label`.
 #[component]
 pub fn Checkbox(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(into, optional)] checked: Signal<bool>,
-    #[prop(into, optional)] label: Option<String>,
-    #[prop(optional)] name: Option<&'static str>,
-    #[prop(optional)] id: Option<&'static str>,
-    #[prop(optional)] disabled: bool,
-    #[prop(optional)] toggle: bool,
-    #[prop(into, optional)] on_change: Option<Callback<bool>>,
+    #[prop(into)] checked: Signal<bool>,
+    #[prop(into)] on_change: Callback<bool>,
+    #[prop(into, optional)] label: Option<Signal<String>>,
+    #[prop(into, optional)] aria_label: Option<String>,
+    #[prop(into, optional)] disabled: Signal<bool>,
+    #[prop(into, optional)] id: Option<String>,
 ) -> impl IntoView {
-    let classes = move || {
-        Classes::new("ui")
-            .key(toggle, "toggle")
-            .add("checkbox")
-            .add(&class.get())
-            .build()
-    };
-    let handle_change = move |ev: Event| {
-        let input = ev
-            .target()
-            .expect("checkbox event target")
-            .unchecked_into::<web_sys::HtmlInputElement>();
-        if let Some(callback) = on_change {
-            callback.run(input.checked());
-        }
-    };
     view! {
-        <div class=classes>
+        <label class="check">
             <input
                 type="checkbox"
-                name=name
+                class="checkbox"
                 id=id
+                aria-label=aria_label
+                disabled=move || disabled.get()
                 prop:checked=move || checked.get()
-                disabled=disabled
-                on:change=handle_change
+                on:change=move |ev| on_change.run(event_target_checked(&ev))
             />
-            <label for=id>{label}</label>
+            {label.map(|l| view! { <span>{move || l.get()}</span> })}
+        </label>
+    }
+}
+
+/// An on/off switch with its label (`role="switch"`).
+#[component]
+pub fn Switch(
+    #[prop(into)] checked: Signal<bool>,
+    #[prop(into)] on_change: Callback<bool>,
+    #[prop(into, optional)] label: Option<Signal<String>>,
+    #[prop(into, optional)] aria_label: Option<String>,
+    #[prop(into, optional)] disabled: Signal<bool>,
+    #[prop(into, optional)] id: Option<String>,
+    #[prop(into, optional)] class: Signal<String>,
+) -> impl IntoView {
+    let classes = move || join_classes(&["switch", &class.get()]);
+    view! {
+        <label class=classes>
+            <input
+                type="checkbox"
+                role="switch"
+                id=id
+                aria-label=aria_label
+                disabled=move || disabled.get()
+                prop:checked=move || checked.get()
+                on:change=move |ev| on_change.run(event_target_checked(&ev))
+            />
+            <span class="switch__track" aria-hidden="true"></span>
+            {label.map(|l| view! { <span class="switch__label">{move || l.get()}</span> })}
+        </label>
+    }
+}
+
+/// One tab of [`Tabs`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabItem {
+    pub value: String,
+    pub label: String,
+    pub icon: Option<&'static str>,
+}
+
+impl TabItem {
+    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+            icon: None,
+        }
+    }
+
+    pub fn icon(mut self, icon: &'static str) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+}
+
+/// Button tabs that switch content in place (`role="tablist"`). The segmented control by
+/// default; `underline` for sub-section tabs. For tabs that change the URL, write links
+/// with the same classes instead (see docs/UI.md).
+#[component]
+pub fn Tabs(
+    items: Vec<TabItem>,
+    #[prop(into)] value: Signal<String>,
+    #[prop(into)] on_change: Callback<String>,
+    #[prop(optional)] underline: bool,
+    /// Accessible name of the tab list.
+    #[prop(into)]
+    label: String,
+) -> impl IntoView {
+    let class = if underline { "tabs-underline" } else { "tabs" };
+    view! {
+        <div class=class role="tablist" aria-label=label>
+            {items.into_iter().map(|item| {
+                let selected = {
+                    let v = item.value.clone();
+                    Memo::new(move |_| value.with(|current| *current == v))
+                };
+                let selected = move || selected.get();
+                let pick = item.value.clone();
+                view! {
+                    <button type="button" class="tabs__tab" role="tab"
+                        aria-selected=move || selected().to_string()
+                        tabindex=move || if selected() { "0" } else { "-1" }
+                        on:click=move |_| on_change.run(pick.clone())
+                        on:keydown=move |ev: KeyboardEvent| move_tab_focus(&ev)>
+                        {item.icon.map(|name| view! { <Icon name=name/> })}
+                        {item.label}
+                    </button>
+                }
+            }).collect_view()}
         </div>
     }
 }
 
-/// Semantic UI progress bar; `value=None` renders an indeterminate bar.
-#[component]
-pub fn Progress(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(into, optional)] value: Option<Signal<f64>>,
-    #[prop(optional)] total: f64,
-    #[prop(optional)] indicating: bool,
-    #[prop(optional)] success: bool,
-    #[prop(optional)] warning: bool,
-    #[prop(optional)] error: bool,
-    #[prop(into, optional)] label: Option<String>,
-) -> impl IntoView {
-    let total = if total > 0.0 { total } else { 100.0 };
-    let classes = move || {
-        Classes::new("ui")
-            .key(indicating, "indicating")
-            .key(success, "success")
-            .key(warning, "warning")
-            .key(error, "error")
-            .add(&class.get())
-            .add("progress")
-            .build()
+/// Arrow keys move focus between sibling tabs (and activate them by clicking).
+fn move_tab_focus(ev: &KeyboardEvent) {
+    let forward = match ev.key().as_str() {
+        "ArrowRight" | "ArrowDown" => true,
+        "ArrowLeft" | "ArrowUp" => false,
+        _ => return,
     };
-    let percent = move || value.map(|v| (v.get() / total * 100.0).clamp(0.0, 100.0));
-    let width = move || percent().map(|p| format!("{p}%"));
-    let aria_value = move || percent().map(|p| p.to_string());
-    let aria_label = label.clone();
-    let progress_label = label.clone();
-    view! {
-        <div
-            class=classes
-            role="progressbar"
-            aria-valuemin="0"
-            aria-valuemax=total.to_string()
-            aria-valuenow=move || value.map(|v| v.get().to_string())
-            aria-label=aria_label
-        >
-            <div class="bar" style:width=width>
-                <div class="progress">{move || progress_label.clone().or_else(|| aria_value().map(|p| format!("{p}%")))}</div>
-            </div>
-        </div>
+    let Some(current) = ev
+        .current_target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+    else {
+        return;
+    };
+    let next = if forward {
+        current.next_element_sibling()
+    } else {
+        current.previous_element_sibling()
+    };
+    if let Some(next) = next.and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok()) {
+        ev.prevent_default();
+        let _ = next.focus();
+        next.click();
     }
 }
 
-/// Tooltip using the browser's native, keyboard-compatible `title` behavior.
+/// A button that opens a popover menu. Children are the menu entries, usually
+/// `<button class="menu__item" role="menuitem">`; any click inside the menu closes it, as
+/// do Escape and clicks outside.
+///
+/// `icon` without `text` makes an icon-only trigger (e.g. `"ellipsis"` for row actions);
+/// `label` is then its accessible name. `align`: `"start"` (default) or `"end"`.
 #[component]
-pub fn Tooltip(
-    #[prop(into)] text: String,
-    #[prop(optional)] children: Option<Children>,
+pub fn DropdownMenu(
+    #[prop(into)] label: String,
+    #[prop(into, optional)] text: Option<Signal<String>>,
+    #[prop(optional)] icon: Option<&'static str>,
+    /// Trigger button variant (see `Button`); default outline, `"action"` for row menus.
+    #[prop(optional)]
+    variant: Option<&'static str>,
+    #[prop(optional)] size: Option<&'static str>,
+    #[prop(optional)] align: Option<&'static str>,
+    children: ChildrenFn,
 ) -> impl IntoView {
-    view! {
-        <span title=text>
-            {children.map(|children| children())}
-        </span>
-    }
-}
-
-/// Accessible live-region status notification.
-#[component]
-pub fn Toast(
-    #[prop(into, optional)] class: Signal<String>,
-    #[prop(into, optional)] content: Option<Signal<String>>,
-    #[prop(optional)] children: Option<Children>,
-) -> impl IntoView {
-    let inner = match children {
-        Some(children) => children().into_any(),
-        None => view! { {move || content.map(|content| content.get())} }.into_any(),
+    let open = RwSignal::new(false);
+    let root = NodeRef::<Div>::new();
+    let icon_only = text.is_none();
+    let trigger_class = join_classes(&[
+        "btn",
+        &variant.map(|v| format!("btn--{v}")).unwrap_or_default(),
+        &size.map(|s| format!("btn--{s}")).unwrap_or_default(),
+        if icon_only { "btn--icon" } else { "" },
+    ]);
+    let menu_class = if align == Some("end") {
+        "menu menu--end"
+    } else {
+        "menu"
     };
-    let classes = move || Classes::new("ui").add("message").add(&class.get()).build();
+    let outside = window_event_listener(leptos::ev::mousedown, move |ev: MouseEvent| {
+        if !open.get_untracked() {
+            return;
+        }
+        let target = ev.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok());
+        if let (Some(root), Some(target)) = (root.get_untracked(), target)
+            && !root.contains(Some(&target))
+        {
+            open.set(false);
+        }
+    });
+    let escape = window_event_listener(leptos::ev::keydown, move |ev: KeyboardEvent| {
+        if ev.key() == "Escape" && open.get_untracked() {
+            open.set(false);
+        }
+    });
+    on_cleanup(move || {
+        outside.remove();
+        escape.remove();
+    });
+    let aria = label.clone();
     view! {
-        <div class=classes role="status" aria-live="polite" aria-atomic="true">
-            {inner}
+        <div class="dropdown" node_ref=root>
+            <button type="button" class=trigger_class aria-haspopup="menu"
+                aria-expanded=move || open.get().to_string()
+                aria-label=icon_only.then(|| aria.clone()) title=icon_only.then_some(label)
+                on:click=move |_| open.update(|o| *o = !*o)>
+                {icon.map(|name| view! { <Icon name=name/> })}
+                {move || text.map(|t| view! { <span>{t.get()}</span> })}
+                {(!icon_only).then(|| view! { <Icon name="chevron-down" size="sm" class="muted"/> })}
+            </button>
+            <Show when=move || open.get()>
+                <div class=menu_class role="menu" on:click=move |_| open.set(false)>
+                    {children()}
+                </div>
+            </Show>
         </div>
     }
 }

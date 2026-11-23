@@ -2,9 +2,9 @@
 //!
 //! These components only lay out and wire up native form controls: they hold no business
 //! logic (parsing, validation and saving belong to the pages). They emit plain semantic HTML
-//! with a few stable class names, all prefixed `form-` (plus `list-editor` and `save-bar`),
-//! on top of Semantic UI classes so they match the rest of the UI. Restyling the forms means
-//! restyling these components and `assets/static/css/forms.css`.
+//! with the design-system classes (`card`, `field`, `input`, `switch`, …) plus a few stable
+//! hook classes prefixed `form-` (and `list-editor`, `save-bar`) that tests and page CSS
+//! select on. Their look is the "forms" section of `assets/static/css/app.css`.
 //!
 //! A [`Field`] provides a [`FieldContext`] to the control inside it, so the control picks up
 //! the field's `id` (the `<label for>` target), `aria-describedby` (help, lock and error
@@ -14,6 +14,9 @@ use leptos::ev::{Event, KeyboardEvent};
 use leptos::html;
 use leptos::prelude::*;
 use leptos::tachys::reactive_graph::OwnedView;
+
+use super::feedback::Alert;
+use super::icon::Icon;
 
 /// What a [`Field`] tells the control inside it.
 #[derive(Clone)]
@@ -50,7 +53,7 @@ fn target_value(event: &Event) -> String {
     event_target_value(event)
 }
 
-/// A titled group of fields: `<section class="ui segment form-section">`.
+/// A titled card of fields: `<section class="card form-section">`.
 #[component]
 pub fn Section(
     /// Element id, also the anchor other pages link to.
@@ -62,10 +65,14 @@ pub fn Section(
 ) -> impl IntoView {
     let title_id = format!("{id}-title");
     view! {
-        <section class="ui segment form-section" id=id aria-labelledby=title_id.clone()>
-            <h3 class="ui header form-section-title" id=title_id.clone()>{title}</h3>
-            {description.map(|text| view! { <p class="form-section-help">{text}</p> })}
-            {children()}
+        <section class="card form-section" id=id aria-labelledby=title_id.clone()>
+            <div class="card__header">
+                <div>
+                    <h2 class="card__title form-section-title" id=title_id.clone()>{title}</h2>
+                    {description.map(|text| view! { <p class="card__description form-section-help">{text}</p> })}
+                </div>
+            </div>
+            <div class="card__content">{children()}</div>
         </section>
     }
 }
@@ -78,8 +85,8 @@ pub fn FieldGrid(children: Children) -> impl IntoView {
 
 /// A labelled control with optional help, lock reason and error.
 ///
-/// Renders `<div class="field form-field">` with `error` while an error is shown and
-/// `locked` while the value is set elsewhere; the control inside reads the
+/// Renders `<div class="field form-field">` with `field--error` while an error is shown and
+/// `field--locked` while the value is set elsewhere; the control inside reads the
 /// [`FieldContext`].
 #[component]
 pub fn Field(
@@ -143,21 +150,21 @@ pub fn Field(
     });
     let control = OwnedView::new_with_owner(control, owner);
     view! {
-        <div class="field form-field" class:error=invalid class:locked=locked>
+        <div class="field form-field" class:field--error=invalid class:field--locked=locked>
             <div class="form-field-head">
-                <label for=id.clone() id=label_id class="form-label">{label}</label>
-                {tag.map(|tag| view! { <span class="ui mini basic label form-tag">{tag}</span> })}
+                <label for=id.clone() id=label_id class="label form-label">{label}</label>
+                {tag.map(|tag| view! { <span class="badge badge--outline form-tag">{tag}</span> })}
                 {actions.map(|actions| view! { <span class="form-field-actions">{actions.run()}</span> })}
             </div>
             {control}
-            {help.map(|text| view! { <p class="form-help" id=help_id>{text}</p> })}
+            {help.map(|text| view! { <p class="help form-help" id=help_id>{text}</p> })}
             {move || locked_reason.get().map(|reason| view! {
-                <p class="form-locked" id=locked_id.clone()>
-                    <i class="lock icon" aria-hidden="true"></i>{reason}
+                <p class="help form-locked" id=locked_id.clone()>
+                    <Icon name="lock"/>{reason}
                 </p>
             })}
             {move || error.get().map(|message| view! {
-                <p class="ui basic red pointing prompt label form-error" id=error_id.clone() role="alert">
+                <p class="error form-error" id=error_id.clone() role="alert">
                     {message}
                 </p>
             })}
@@ -193,7 +200,7 @@ pub fn TextInput(
     view! {
         <input
             node_ref=node_ref
-            class="form-input"
+            class="input form-input"
             type=input_type.unwrap_or("text")
             id=id
             name=name.filter(|name| !name.is_empty())
@@ -281,7 +288,7 @@ pub fn TextArea(
     let locked = field.as_ref().map(|f| f.locked);
     view! {
         <textarea
-            class="form-input"
+            class="textarea form-input"
             id=id
             rows=rows
             placeholder=placeholder
@@ -294,7 +301,7 @@ pub fn TextArea(
     }
 }
 
-/// An on/off switch: `<div class="ui toggle checkbox form-toggle">`.
+/// An on/off switch: `<label class="switch form-toggle">` with the state as text.
 #[component]
 pub fn Toggle(
     #[prop(into)] checked: Signal<bool>,
@@ -312,7 +319,7 @@ pub fn Toggle(
     let is_disabled = move || disabled.get() || locked.is_some_and(|l| l.get());
     let (on, off) = states.unwrap_or(("On", "Off"));
     view! {
-        <div class="ui toggle checkbox form-toggle" class:checked=checked class:disabled=is_disabled>
+        <label class="switch form-toggle">
             <input
                 type="checkbox"
                 role="switch"
@@ -323,8 +330,9 @@ pub fn Toggle(
                 prop:checked=move || checked.get()
                 on:change=move |event| on_change.run(event_target_checked(&event))
             />
-            <label for=id aria-hidden="true">{move || if checked.get() { on } else { off }}</label>
-        </div>
+            <span class="switch__track" aria-hidden="true"></span>
+            <span class="switch__label" aria-hidden="true">{move || if checked.get() { on } else { off }}</span>
+        </label>
     }
 }
 
@@ -343,7 +351,7 @@ pub fn Select(
     let locked = field.as_ref().map(|f| f.locked);
     view! {
         <select
-            class="ui dropdown form-select"
+            class="select form-select"
             id=id
             aria-describedby=move || described_by.map(|d| d.get()).filter(|d| !d.is_empty())
             aria-invalid=move || invalid.is_some_and(|i| i.get()).then_some("true")
@@ -424,8 +432,8 @@ pub fn ListEditor(
                         let aria = format!("{} {}", row_label, index + 1);
                         view! {
                             <li class="list-editor-item">
-                                <div class="ui fluid action input">
-                                    <input class="form-input" type="text" spellcheck="false" aria-label=aria
+                                <div class="input-group">
+                                    <input class="input form-input" type="text" spellcheck="false" aria-label=aria
                                         disabled=is_disabled
                                         prop:value=row_value
                                         on:input=move |event| edit(index, target_value(&event))
@@ -434,11 +442,12 @@ pub fn ListEditor(
                                                 remove(index);
                                             }
                                         }/>
-                                    <button type="button" class="ui icon button list-editor-remove"
+                                    <button type="button" class="btn btn--icon list-editor-remove"
                                         disabled=is_disabled
                                         aria-label=move || format!("Remove {}", row_value())
+                                        title="Remove"
                                         on:click=move |_| remove(index)>
-                                        <i class="close icon" aria-hidden="true"></i>
+                                        <Icon name="x"/>
                                     </button>
                                 </div>
                             </li>
@@ -447,8 +456,8 @@ pub fn ListEditor(
                 </For>
             </ul>
             <div class="list-editor-add">
-                <div class="ui fluid action input">
-                    <input class="form-input" type="text" spellcheck="false" id=id
+                <div class="input-group">
+                    <input class="input form-input" type="text" spellcheck="false" id=id
                         placeholder=placeholder
                         aria-describedby=move || described_by.map(|d| d.get()).filter(|d| !d.is_empty())
                         aria-invalid=move || invalid.is_some_and(|i| i.get()).then_some("true")
@@ -462,10 +471,10 @@ pub fn ListEditor(
                                 add();
                             }
                         }/>
-                    <button type="button" class="ui button list-editor-add-button"
+                    <button type="button" class="btn list-editor-add-button"
                         disabled=move || is_disabled.get() || pending.with(|p| p.trim().is_empty())
                         on:click=move |_| add()>
-                        {add_label.unwrap_or_else(|| "Add".to_owned())}
+                        <Icon name="plus"/>{add_label.unwrap_or_else(|| "Add".to_owned())}
                     </button>
                 </div>
                 {extra.map(|extra| extra.run())}
@@ -474,22 +483,23 @@ pub fn ListEditor(
     }
 }
 
-/// A status or error message: `<div class="ui {kind} message form-message">`.
+/// A status or error message: an [`Alert`] with the `form-message` hook class.
 #[component]
 pub fn FormMessage(
-    /// Semantic UI message kind: `negative`, `positive`, `warning` or `info`.
+    /// `danger` (or `negative`), `success` (or `positive`), `warning` or `info`.
     kind: &'static str,
     /// `alert` for errors, `status` for everything else.
     #[prop(optional)]
     role: Option<&'static str>,
     children: Children,
 ) -> impl IntoView {
-    let role = role.unwrap_or(if kind == "negative" {
-        "alert"
-    } else {
-        "status"
-    });
-    view! { <div class=format!("ui {kind} message form-message") role=role>{children()}</div> }
+    match role {
+        Some(role) => {
+            view! { <Alert variant=kind role=role class="form-message">{children()}</Alert> }
+                .into_any()
+        }
+        None => view! { <Alert variant=kind class="form-message">{children()}</Alert> }.into_any(),
+    }
 }
 
 /// The bar with the number of unsaved changes and the Save and Discard buttons, fixed at
@@ -517,11 +527,12 @@ pub fn SaveBar(
                 </span>
                 {move || problem.get().map(|text| view! { <span class="save-bar-problem">{text}</span> })}
                 <span class="save-bar-buttons">
-                    <button type="button" class="ui button" disabled=saving on:click=move |_| on_discard.run(())>
+                    <button type="button" class="btn" disabled=saving on:click=move |_| on_discard.run(())>
                         "Discard"
                     </button>
-                    <button type="button" class="ui primary button" class:loading=saving disabled=saving
+                    <button type="button" class="btn btn--primary" disabled=saving aria-busy=move || saving.get().then_some("true")
                         on:click=move |_| on_save.run(())>
+                        {move || saving.get().then(|| view! { <span class="spinner" aria-hidden="true"></span> })}
                         "Save"
                     </button>
                 </span>
