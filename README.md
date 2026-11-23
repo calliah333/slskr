@@ -7,20 +7,41 @@ replace the central Soulseek server.
 
 ## Run on NixOS
 
-Put a `slskd.yml` in your app directory. Set `soulseek.username` and
-`soulseek.password` for your network account, and set separate
-`web.authentication.username` and `web.authentication.password` values for the
-browser. To inspect the UI without connecting to Soulseek, set
-`flags.no_connect: true`. The default HTTP listener is `127.0.0.1:5030`.
+slskr keeps its configuration, databases, logs and default download directories in a
+data directory: `$XDG_DATA_HOME/slskr` (usually `~/.local/share/slskr`), or the one
+given with `--data-dir`. Configuration is read from `slskr.toml` there (or the file
+given with `--config`); without one, slskr starts with defaults. Copy
+[`slskr.example.toml`](slskr.example.toml), which documents every key, and set at least:
 
-```sh
-nix run . -- --app-dir "$HOME/.local/share/slskr"
+```toml
+[soulseek]
+username = "your-soulseek-account"
+password = "..."
+
+[web]
+username = "admin"
+password = "a separate password for the browser"
 ```
 
-Open `http://127.0.0.1:5030`. The flake packages the daemon and UI together.
-Configure `shares.directories` to share files and `soulseek.listen_port` for
-incoming peers. Use only directories you intend to share. Keep credentials out
-of Git; the daemon's app directory also holds downloads and local SQLite data.
+Then start it:
+
+```sh
+nix run . -- --data-dir "$HOME/.local/share/slskr"
+```
+
+Open `http://127.0.0.1:5030` (`web.listen`). The flake packages the daemon and UI
+together. Configure `shares.directories` to share files and `soulseek.listen_port` for
+incoming peers. Use only directories you intend to share. To inspect the UI without
+connecting to Soulseek, pass `--no-connect` (or set `soulseek.connect = false`).
+
+Every scalar or list key can also come from the environment as
+`SLSKR_<SECTION>_<KEY>`, for example `SLSKR_SOULSEEK_PASSWORD` or `SLSKR_WEB_LISTEN`
+(lists are comma-separated). Environment variables override the file, and
+command-line flags override both. Relative paths in the file resolve against the data
+directory. Changes saved to the file, by hand or from System → Options in the UI, apply
+without a restart except for the web listener, URL base, authentication switch,
+logging, metrics, slot counts and incoming search concurrency; the UI shows when a
+restart is pending. Keep credentials out of Git.
 
 ## Develop
 
@@ -28,7 +49,7 @@ of Git; the daemon's app directory also holds downloads and local SQLite data.
 nix develop
 cargo test --locked --workspace
 (cd crates/slskr-web && NO_COLOR=true trunk build --frozen)
-SLSKR_CONTENT_PATH="$PWD/dist" cargo run --locked -p slskr -- --app-dir ./data
+SLSKR_CONTENT_PATH="$PWD/dist" cargo run --locked -p slskr -- --data-dir ./data
 ```
 
 Protocol and transfer tests use loopback fixtures and do not require a public

@@ -8,7 +8,7 @@ use leptos_router::{
 use serde::de::DeserializeOwned;
 use slskr_api::{
     application::{State, hub_methods as application_methods},
-    options::Options,
+    config::Config,
     telemetry::{CurrentMetrics, hub_methods as metrics_methods},
     transfers::TransferDirection,
 };
@@ -31,7 +31,6 @@ use crate::{
 #[derive(Clone, Copy)]
 pub struct AppContext {
     pub state: RwSignal<State>,
-    pub options: RwSignal<Options>,
     pub dark: RwSignal<bool>,
 }
 
@@ -244,13 +243,10 @@ fn AuthenticatedApp(
     retry: Callback<()>,
 ) -> impl IntoView {
     let state = RwSignal::new(State::default());
-    let options = RwSignal::new(Options::default());
+    let options = RwSignal::new(Config::default());
     let metrics = RwSignal::new(CurrentMetrics::default());
-    provide_context(AppContext {
-        state,
-        options,
-        dark,
-    });
+    // The live configuration is loaded (and gates readiness) but no view reads it yet.
+    provide_context(AppContext { state, dark });
 
     let application = hub::create_application_hub();
     let telemetry = hub::create_metrics_hub();

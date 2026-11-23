@@ -46,12 +46,8 @@ fn default_limit() -> i64 {
 
 impl EventService {
     pub fn new(core: &Core) -> anyhow::Result<Self> {
-        let path = if core.options.get().flags.volatile {
-            std::path::PathBuf::from(":memory:")
-        } else {
-            std::fs::create_dir_all(&core.paths.data_dir)?;
-            core.paths.data_dir.join("events.db")
-        };
+        std::fs::create_dir_all(&core.paths.db_dir)?;
+        let path = core.paths.db_dir.join("events.db");
         let database = Database::open(&path, MIGRATIONS)?;
         let (subscribers, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Ok(Self(Arc::new(Inner {

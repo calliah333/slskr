@@ -1,0 +1,194 @@
+# slskr configuration example.
+#
+# slskr reads `slskr.toml` from its data directory ($XDG_DATA_HOME/slskr or
+# ~/.local/share/slskr unless --data-dir or --config says otherwise). Every key is optional;
+# the values shown are the defaults unless the comment says "example". Unknown keys are
+# errors.
+#
+# Precedence, lowest first: defaults, this file, environment variables, command line.
+# Every scalar or list key can be set from the environment as SLSKR_<SECTION>_<KEY>, for
+# example SLSKR_SOULSEEK_USERNAME, SLSKR_WEB_LISTEN or SLSKR_UPLOADS_LIMITS_QUEUED_FILES.
+# Lists are comma-separated (SLSKR_SHARES_DIRECTORIES="/music,/books"). [[web.api_keys]] and
+# user-defined [groups.<name>] can only be set here.
+#
+# Durations are written like "30s", "5m", "1h30m", "7d" or "2w" (units ms, s, m, h, d, w);
+# where a duration is optional, "" means never. Relative paths resolve against the data
+# directory. Most settings apply when the file is saved; the web, logging, metrics and slot
+# settings noted below need a restart.
+
+[soulseek]
+# Soulseek account. Leave empty to run without connecting until it is configured.
+username = "example-user"                 # example; default ""
+password = "example-password"             # example; default ""
+server = "server.slsknet.org:2242"
+# Address and port for incoming peer connections (port 1024-65535).
+listen_address = "0.0.0.0"
+listen_port = 50300
+# Shown to peers who view your user info.
+description = ""
+# Image shown in your user info; empty for none.
+picture = ""
+# false starts without connecting to the server (same as --no-connect). Restart required.
+connect = true
+# SOCKS5 proxy for outgoing connections, "socks5://[user:pass@]host:port"; empty for none.
+proxy = ""
+# Take part in the distributed search network.
+distributed_network = true
+# Maximum distributed children; 0 accepts none.
+distributed_children = 25
+# Chat rooms joined after every login.
+rooms = []
+
+[web]
+# Address of the web UI and API. Restart required.
+listen = "127.0.0.1:5030"
+# Path prefix when served behind a reverse proxy, e.g. "/slskr". Restart required.
+url_base = "/"
+# Web sign-in. An empty password disables sign-in.
+username = "admin"
+password = "change-me"                    # example; default ""
+# false disables authentication entirely: only for loopback or development use.
+# Restart required.
+auth = true
+# Log every HTTP request at info level. Restart required.
+log_requests = false
+
+# API keys, sent in the X-API-Key header. Zero or more; names and keys must be unique.
+[[web.api_keys]]                          # example; default none
+name = "soularr"
+# 16 to 255 characters.
+key = "0123456789abcdef0123456789abcdef"
+# readonly | readwrite | admin
+role = "readwrite"
+# Networks allowed to use the key.
+allow = ["0.0.0.0/0", "::/0"]
+
+[downloads]
+# Completed downloads.
+directory = "downloads"
+# Partial downloads.
+incomplete_directory = "incomplete"
+# Concurrent downloads; 0 is unlimited. Restart required.
+slots = 0
+# KiB/s; 0 is unlimited.
+speed_limit = 0
+# Attempts per file, and the backoff between them (doubling up to retry_max_delay).
+retry_attempts = 3
+retry_delay = "5s"
+retry_max_delay = "5m"
+# Resume partial files on retry instead of starting over.
+resume = true
+# When the destination file exists: rename | overwrite
+on_conflict = "rename"
+# Subdirectory below `directory` for each download; empty for none. Tokens:
+# ${SOURCE_DIRECTORY} (the remote parent directory), ${SOURCE_PATH}, ${SOURCE_USERNAME},
+# ${BATCH_ID}, ${BATCH_EXTERNAL_ID}, ${SEARCH_ID}, ${SEARCH_TEXT}.
+subdirectory = "${SOURCE_DIRECTORY}"
+# Mode of completed files, octal ("0644") or symbolic ("rw-r--r--"); empty keeps the
+# process default.
+file_mode = ""
+
+[uploads]
+# Concurrent uploads, at least 1. Restart required to raise it.
+slots = 20
+# KiB/s; 0 is unlimited.
+speed_limit = 0
+
+# Per-user limits; 0 is unlimited. A group's own non-zero limits take precedence.
+[uploads.limits]
+queued_files = 500                        # example; default 0
+queued_megabytes = 5000                   # example; default 0
+daily_files = 0
+daily_megabytes = 0
+weekly_files = 0
+weekly_megabytes = 0
+daily_failures = 0
+weekly_failures = 0
+
+[shares]
+# Shared directories. "[Alias]/path" sets the name peers see (default: the last path
+# component); "!/path" excludes a subtree of another share.
+directories = ["/srv/music", "[Books]/srv/audiobooks", "!/srv/music/private"]  # example; default []
+# Case-insensitive regexes on full local paths; matching files and directories are skipped.
+exclude = ['\.DS_Store$', '(?i)thumbs\.db$']  # example; default []
+# Rescan when the last scan is older than this; "" only scans on startup (when no cached
+# scan matches) or on request.
+rescan_interval = ""
+
+# Upload queue groups. Privileged users always go first; then lower priority numbers.
+# Users in no group are in `default`; users sharing too little are `leechers`.
+[groups.default]
+priority = 500
+# roundrobin | firstinfirstout
+strategy = "roundrobin"
+# Upload slots for the group; 0 leaves only the global limit.
+slots = 20
+# KiB/s; 0 is unlimited.
+speed_limit = 0
+# Same keys as [uploads.limits]; non-zero values override them for this group.
+limits = { queued_files = 0, daily_megabytes = 0 }
+
+[groups.leechers]
+priority = 999
+strategy = "roundrobin"
+slots = 20
+speed_limit = 0
+# Users sharing fewer files or directories than this are leechers.
+min_shared_files = 1
+min_shared_directories = 1
+
+# Any other [groups.<name>] is user-defined: the same keys as default, plus members.
+[groups.friends]                          # example
+members = ["alice", "bob"]
+priority = 1
+strategy = "firstinfirstout"
+slots = 0
+
+# Users refused searches, browsing and transfers.
+[blacklist]
+users = []
+# Username wildcards with * and ?, case-insensitive.
+patterns = []
+# IP ranges; when set, search responses and downloads also check the peer's address.
+cidrs = []
+
+# Incoming search requests from the network.
+[search]
+# Searches answered concurrently. Restart required.
+incoming_concurrency = 10
+# Queued searches beyond this are dropped.
+incoming_circuit_breaker = 500
+# Most files returned per response.
+response_file_limit = 500
+# Case-insensitive regexes; matching incoming searches are ignored.
+ignore_queries = []
+
+# How long finished records are kept; "" keeps them forever.
+[retention]
+# Completed searches (at least 5m).
+searches = "7d"
+uploads_succeeded = ""
+uploads_errored = ""
+uploads_cancelled = ""
+uploads_failed = ""
+downloads_succeeded = ""
+downloads_errored = ""
+downloads_cancelled = ""
+downloads_failed = ""
+# Log files under <data_dir>/logs.
+logs = "30d"
+
+# Restart required for every key in this section.
+[logging]
+# trace | debug | info | warn | error. RUST_LOG, when set, takes precedence.
+level = "info"
+# Write daily log files under <data_dir>/logs.
+file = true
+
+# Prometheus metrics. Restart required for every key in this section.
+[metrics]
+enabled = false
+path = "/metrics"
+# Basic auth; leave both empty to serve metrics without authentication.
+username = ""
+password = ""

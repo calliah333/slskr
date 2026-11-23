@@ -4,7 +4,6 @@ mod store;
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -105,11 +104,7 @@ impl Inner {
 
 impl SearchService {
     pub async fn new(core: &Core) -> anyhow::Result<Self> {
-        let path = if core.options.startup().flags.volatile {
-            PathBuf::from(":memory:")
-        } else {
-            core.paths.data_dir.join("search.db")
-        };
+        let path = core.paths.db_dir.join("search.db");
         let db =
             tokio::task::spawn_blocking(move || Database::open(&path, store::MIGRATIONS)).await??;
         let searches = db
@@ -134,7 +129,7 @@ impl SearchService {
             create_slot: Semaphore::new(1),
             searches: Mutex::new(searches),
         }));
-        if let Some(age) = core.options.get().retention.search {
+        if let Some(age) = core.options.get().retention.searches {
             service.prune(age).await?;
         }
         let inner = Arc::downgrade(&service.0);
@@ -161,7 +156,7 @@ impl SearchService {
                     biased;
                     _ = service.0.shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        let Some(age) = options.get().retention.search else { continue };
+                        let Some(age) = options.get().retention.searches else { continue };
                         if let Err(error) = service.prune(age).await {
                             tracing::warn!(%error, "could not apply search retention");
                         }
@@ -171,8 +166,8 @@ impl SearchService {
         });
     }
 
-    async fn prune(&self, minutes: i32) -> anyhow::Result<()> {
-        let cutoff = Utc::now() - chrono::TimeDelta::minutes(i64::from(minutes));
+    async fn prune(&self, age: Duration) -> anyhow::Result<()> {
+        let cutoff = Utc::now() - chrono::TimeDelta::from_std(age)?;
         let inner = self.0.clone();
         self.0
             .db
@@ -947,7 +942,7 @@ mod tests {
             .await
             .unwrap();
 
-        service.prune(5).await.unwrap();
+        service.prune(Duration::from_secs(5 * 60)).await.unwrap();
         assert_eq!(service.0.list().len(), 2);
         assert!(service.get(&current.id, false).await.unwrap().is_complete);
         assert!(!service.get(&active.id, false).await.unwrap().is_complete);

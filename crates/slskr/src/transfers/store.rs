@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use slskr_api::{
-    options::TransferRetentionOptions,
+    config::RetentionConfig,
     transfers::{Batch, BatchOptions, Transfer, TransferDirection, TransferStates},
 };
 
@@ -282,17 +282,41 @@ fn batch_metadata(db: &Connection, id: &str) -> rusqlite::Result<Option<Batch>> 
     })).optional()
 }
 
-pub(super) async fn prune(db: &Database, options: TransferRetentionOptions) -> anyhow::Result<()> {
+pub(super) async fn prune(db: &Database, r: &RetentionConfig) -> anyhow::Result<()> {
+    let rules = [
+        (
+            "Download",
+            [
+                r.downloads_succeeded,
+                r.downloads_cancelled,
+                r.downloads_errored,
+                r.downloads_failed,
+            ],
+        ),
+        (
+            "Upload",
+            [
+                r.uploads_succeeded,
+                r.uploads_cancelled,
+                r.uploads_errored,
+                r.uploads_failed,
+            ],
+        ),
+    ];
     db.call(move |db| {
         let tx = db.transaction()?;
         let now = Utc::now();
-        for (direction, options) in [("Download", options.download), ("Upload", options.upload)] {
-            for (state, age) in [(48, options.succeeded), (80, options.cancelled), (272, options.errored),
-                (144, options.failed), (528, options.failed), (1040, options.failed)] {
-                if let Some(age) = age.filter(|age| *age >= 0) {
-                    tx.execute("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND state = ?2 AND NOT removed AND ended_at <= ?3",
-                        params![direction, state, timestamp(now - chrono::TimeDelta::minutes(i64::from(age)))])?;
-                }
+        for (direction, [succeeded, cancelled, errored, failed]) in rules {
+            for (state, age) in [(48, succeeded), (80, cancelled), (272, errored),
+                (144, failed), (528, failed), (1040, failed)] {
+                let Some(cutoff) = age
+                    .and_then(|age| chrono::TimeDelta::from_std(age).ok())
+                    .and_then(|age| now.checked_sub_signed(age))
+                else {
+                    continue;
+                };
+                tx.execute("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND state = ?2 AND NOT removed AND ended_at <= ?3",
+                    params![direction, state, timestamp(cutoff)])?;
             }
         }
         tx.commit()

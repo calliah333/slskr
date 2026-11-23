@@ -6,6 +6,12 @@ mod queue;
 mod store;
 
 pub use api::routes;
+pub(crate) use queue::group_options as group_config;
+
+/// Parses a `downloads.file_mode` value (octal or `rwxr-xr-x`); empty is `None`.
+pub(crate) fn parse_file_mode(value: &str) -> io::Result<Option<u32>> {
+    destination::mode(Some(value))
+}
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,11 +24,11 @@ use std::{
 
 use chrono::{DateTime, TimeDelta, Utc};
 use slskr_api::{
+    config::{Config, DownloadsConfig, OnConflict},
     events::{
         DownloadDirectoryCompleteEvent, DownloadFileCompleteEvent, Event, EventHeader, EventType,
         UploadFileCompleteEvent,
     },
-    options::{DownloadRetryOptions, Options, TransfersOptions},
     telemetry::{CompletedMetrics, CurrentMetrics},
     transfers::{
         Batch, EnqueueDownloadBatchResponseFailure, EnqueueDownloadsResponse, QueueDownloadRequest,
@@ -178,11 +184,7 @@ impl TransferService {
         users: &UserService,
         shares: &ShareService,
     ) -> anyhow::Result<Self> {
-        let path = if core.options.startup().flags.volatile {
-            PathBuf::from(":memory:")
-        } else {
-            core.paths.data_dir.join("transfers.db")
-        };
+        let path = core.paths.db_dir.join("transfers.db");
         Ok(Self(Arc::new(Inner {
             core: core.clone(),
             events: events.clone(),
@@ -223,7 +225,7 @@ impl TransferService {
                     _ = retention.tick() => {
                         service.runtime().history.prune();
                         let cfg = service.0.core.options.get();
-                        if let Err(error) = store::prune(service.database(), cfg.retention.transfers.clone()).await {
+                        if let Err(error) = store::prune(service.database(), &cfg.retention).await {
                             tracing::warn!(%error, "could not apply transfer retention");
                         }
                     }
@@ -238,7 +240,7 @@ impl TransferService {
                                 entry.cancel.cancel();
                             }
                         }
-                        runtime.uploads.dispatch(&service.0.users, &cfg.transfers, service.upload_slots(&cfg.transfers));
+                        runtime.uploads.dispatch(&service.0.users, &cfg, service.upload_slots(&cfg));
                     }
                 }
             }
@@ -270,13 +272,12 @@ impl TransferService {
         self.0.download_requests.try_acquire().ok()
     }
 
-    fn upload_slots(&self, cfg: &TransfersOptions) -> u32 {
+    fn upload_slots(&self, cfg: &Config) -> u32 {
         // The SDK owns a fixed data semaphore. A reload can lower the daemon
         // queue limit immediately, but increases beyond that semaphore need a restart.
-        cfg.upload
+        cfg.uploads
             .slots
-            .min(self.0.core.options.startup().transfers.upload.slots)
-            .max(0) as u32
+            .min(self.0.core.options.startup().uploads.slots)
     }
 
     pub fn enqueue_upload(
@@ -330,7 +331,7 @@ impl TransferService {
                     // Upstream counts every upload that has not ended,
                     // including in-progress ones, against the queued limits.
                     .filter(|t| t.direction == TransferDirection::Upload && t.ended_at.is_none()),
-                &cfg.transfers,
+                &cfg,
                 &group,
                 username,
                 size,
@@ -350,24 +351,19 @@ impl TransferService {
         let cfg = self.0.core.options.get();
         self.runtime()
             .uploads
-            .position(&self.0.users, &cfg.transfers, username, filename)
+            .position(&self.0.users, &cfg, username, filename)
     }
 
     pub fn upload_info(&self) -> (u32, u32, bool) {
         let cfg = self.0.core.options.get();
-        self.runtime()
-            .uploads
-            .info(self.upload_slots(&cfg.transfers))
+        self.runtime().uploads.info(self.upload_slots(&cfg))
     }
 
     pub fn upload_info_for(&self, username: &str) -> (u32, u32, bool) {
         let cfg = self.0.core.options.get();
-        self.runtime().uploads.forecast(
-            &self.0.users,
-            &cfg.transfers,
-            self.upload_slots(&cfg.transfers),
-            username,
-        )
+        self.runtime()
+            .uploads
+            .forecast(&self.0.users, &cfg, self.upload_slots(&cfg), username)
     }
 
     pub fn metrics(&self) -> CurrentMetrics {
@@ -587,11 +583,9 @@ impl TransferService {
             {
                 let mut runtime = service.runtime();
                 runtime.uploads.ready(&id);
-                runtime.uploads.dispatch(
-                    &service.0.users,
-                    &cfg.transfers,
-                    service.upload_slots(&cfg.transfers),
-                );
+                runtime
+                    .uploads
+                    .dispatch(&service.0.users, &cfg, service.upload_slots(&cfg));
             }
             Box::pin(async move {
                 slot.ok_or(Error::Cancelled)?
@@ -599,7 +593,7 @@ impl TransferService {
                     .map_err(|_| Error::Cancelled)
             })
         }));
-        if queue::has_group_speed_limit(&self.0.core.options.get().transfers) {
+        if queue::has_group_speed_limit(&self.0.core.options.get()) {
             let service = self.clone();
             let id = t.id.clone();
             options.governor = Some(Arc::new(move |_, bytes| {
@@ -611,7 +605,7 @@ impl TransferService {
                         ref mut bandwidth,
                         ..
                     } = *runtime;
-                    bandwidth.grant(&cfg.transfers, uploads.group(&id), bytes)
+                    bandwidth.grant(&cfg, uploads.group(&id), bytes)
                 };
                 Box::pin(async move {
                     if ready > tokio::time::Instant::now() {
@@ -639,7 +633,7 @@ impl TransferService {
         cancel: CancellationToken,
     ) {
         let cfg = self.0.core.options.get();
-        let retry = &cfg.transfers.download.retry;
+        let retry = &cfg.downloads;
         let subdirectory = destination::derive(
             &cfg,
             &t,
@@ -717,19 +711,23 @@ impl TransferService {
     fn schedule_retry(
         &self,
         id: &str,
-        retry: &DownloadRetryOptions,
+        retry: &DownloadsConfig,
         error: &Error,
     ) -> Option<DateTime<Utc>> {
         let mut runtime = self.runtime();
         let entry = runtime.active.get_mut(id)?;
         let t = &mut entry.transfer;
-        if t.attempts >= retry.attempts.max(1) as u32 {
+        if t.attempts >= retry.retry_attempts.max(1) {
             return None;
         }
-        let base = i64::from(retry.delay.max(0));
-        let delay =
-            (base << t.attempts.saturating_sub(1).min(30)).min(i64::from(retry.max_delay.max(0)));
-        let at = Utc::now() + TimeDelta::milliseconds(delay);
+        let delay = retry
+            .retry_delay
+            .saturating_mul(1_u32 << t.attempts.saturating_sub(1).min(30))
+            .min(retry.retry_max_delay);
+        let at = TimeDelta::from_std(delay)
+            .ok()
+            .and_then(|delay| Utc::now().checked_add_signed(delay))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
         t.next_attempt_at = Some(at);
         t.state = LOCAL_QUEUE;
         t.exception = Some(exception_text(error));
@@ -741,7 +739,7 @@ impl TransferService {
         &self,
         t: &Transfer,
         expected: u64,
-        cfg: &Options,
+        cfg: &Config,
         subdir: &Path,
         throttle: &Semaphore,
         cancel: CancellationToken,
@@ -755,17 +753,7 @@ impl TransferService {
         if self.0.users.is_blacklisted(&t.username, None) {
             return Err(rejected());
         }
-        if !self
-            .0
-            .core
-            .options
-            .get()
-            .transfers
-            .groups
-            .blacklisted
-            .cidrs
-            .is_empty()
-        {
+        if !self.0.core.options.get().blacklist.cidrs.is_empty() {
             let endpoint = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
@@ -779,10 +767,10 @@ impl TransferService {
                 return Err(rejected());
             }
         }
-        let settings = &cfg.transfers.download;
-        let mode = destination::mode(settings.destination.permissions.mode.as_deref())?;
-        let resume = settings.retry.partial.eq_ignore_ascii_case("resume");
-        let root = PathBuf::from(&cfg.directories.incomplete);
+        let settings = &cfg.downloads;
+        let mode = destination::mode(Some(settings.file_mode.as_str()))?;
+        let resume = settings.resume;
+        let root = PathBuf::from(&settings.incomplete_directory);
         let known = (expected != 0).then(|| {
             Arc::new(destination::Partial::new(
                 root.clone(),
@@ -866,12 +854,9 @@ impl TransferService {
                 completed.size,
             ))
         });
-        let downloads = PathBuf::from(&cfg.directories.downloads);
+        let downloads = PathBuf::from(&settings.directory);
         let subdir = subdir.to_owned();
-        let overwrite = settings
-            .destination
-            .exists
-            .eq_ignore_ascii_case("overwrite");
+        let overwrite = settings.on_conflict == OnConflict::Overwrite;
         tokio::task::spawn_blocking(move || {
             partial.finish(&downloads, &subdir, completed.size, overwrite, mode)
         })
@@ -952,11 +937,9 @@ impl TransferService {
             if transfer.direction == TransferDirection::Upload {
                 runtime.uploads.release(id);
                 runtime.history.record(&transfer);
-                runtime.uploads.dispatch(
-                    &self.0.users,
-                    &cfg.transfers,
-                    self.upload_slots(&cfg.transfers),
-                );
+                runtime
+                    .uploads
+                    .dispatch(&self.0.users, &cfg, self.upload_slots(&cfg));
             }
             let completed = &mut runtime.completed[direction_index(transfer.direction)];
             if disposition == TransferStates::SUCCEEDED {

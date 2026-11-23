@@ -9,7 +9,7 @@ use std::{
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use slskr_api::{
-    options::Options,
+    config::Config,
     transfers::{Batch, Transfer},
 };
 use tokio::{
@@ -82,7 +82,7 @@ fn sanitized_path(value: &str) -> PathBuf {
 }
 
 pub(super) fn derive(
-    options: &Options,
+    options: &Config,
     t: &Transfer,
     batch: Option<&Batch>,
     search_text: Option<&str>,
@@ -93,14 +93,8 @@ pub(super) fn derive(
     {
         return sanitized_path(explicit);
     }
-    let pattern = options
-        .transfers
-        .download
-        .destination
-        .subdirectory
-        .as_deref()
-        .unwrap_or("${SOURCE_DIRECTORY}");
-    if pattern == "{}" {
+    let pattern = options.downloads.subdirectory.trim();
+    if pattern.is_empty() {
         return PathBuf::new();
     }
     let remote = remote_directory(&t.filename);

@@ -20,7 +20,7 @@ axum = { version = "0.8", features = ["ws", "macros"] }
 tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
-serde_yaml = "0.9"
+toml = "1"
 rusqlite = { version = "0.37", features = ["bundled", "limits"] }
 jsonwebtoken = "9"
 uuid = { version = "1", features = ["v4", "serde"] }

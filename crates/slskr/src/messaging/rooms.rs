@@ -613,7 +613,13 @@ impl Session {
         }
         self.logged_in = true;
         let options = self.app.options.get();
-        let rooms: BTreeSet<_> = options.rooms.iter().chain(&self.rejoin).cloned().collect();
+        let rooms: BTreeSet<_> = options
+            .soulseek
+            .rooms
+            .iter()
+            .chain(&self.rejoin)
+            .cloned()
+            .collect();
         for name in rooms {
             self.begin(name, Action::Join(None));
         }

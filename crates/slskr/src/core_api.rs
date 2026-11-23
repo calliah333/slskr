@@ -1,6 +1,6 @@
 //! Application, session, server, options, and debug HTTP endpoints.
 
-use std::{net::IpAddr, time::Duration};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -11,11 +11,11 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use slskr_api::{
     application::{State as ApplicationState, VersionState},
-    options::Options,
+    config::Config,
     server::ServerState,
     session::LoginRequest,
 };
@@ -23,8 +23,7 @@ use slskr_api::{
 use crate::{
     app::AppState,
     auth::{Authenticated, RequireAdmin, RequireAdminJwt, RequireReadWrite, Role},
-    config::OptionsStore,
-    http::{ApiError, ApiResult},
+    http::ApiError,
 };
 
 type HttpResult<T> = Result<T, Response>;
@@ -42,12 +41,11 @@ pub fn routes() -> Router<AppState> {
         .route("/session", get(check_session).post(login))
         .route("/session/enabled", get(session_enabled))
         .route("/server", get(server).put(connect).delete(disconnect))
-        .route("/options", get(options).patch(patch_options))
+        .route("/options", get(options))
         .route("/options/startup", get(startup_options))
-        .route("/options/debug", get(debug_options))
-        .route("/options/yaml/location", get(yaml_location))
-        .route("/options/yaml", get(read_yaml).put(write_yaml))
-        .route("/options/yaml/validate", post(validate_yaml))
+        .route("/options/toml/location", get(toml_location))
+        .route("/options/toml", get(read_toml).put(write_toml))
+        .route("/options/toml/validate", post(validate_toml))
         .route("/debug/transfers", get(debug_transfers))
 }
 
@@ -175,7 +173,7 @@ async fn check_session(_: Authenticated) -> StatusCode {
 }
 
 async fn session_enabled(State(app): State<AppState>) -> Json<bool> {
-    Json(!app.options.startup().web.authentication.disabled)
+    Json(app.options.startup().web.auth)
 }
 
 async fn login(
@@ -183,10 +181,6 @@ async fn login(
     headers: HeaderMap,
     body: Bytes,
 ) -> HttpResult<Json<crate::auth::TokenResponse>> {
-    if app.options.startup().headless {
-        tracing::warn!("Login rejected: the web UI is disabled in headless mode");
-        return Err(StatusCode::FORBIDDEN.into_response());
-    }
     let request = optional_json::<LoginRequest>(&headers, &body)?
         .ok_or_else(|| bad_request("No credentials provided"))?;
     app.auth
@@ -226,101 +220,29 @@ async fn disconnect(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn options(_: Authenticated, State(app): State<AppState>) -> Json<Options> {
+async fn options(_: Authenticated, State(app): State<AppState>) -> Json<Config> {
     Json(app.options.get().redact())
 }
 
-async fn startup_options(_: RequireAdmin, State(app): State<AppState>) -> Json<Options> {
+async fn startup_options(_: RequireAdmin, State(app): State<AppState>) -> Json<Config> {
     Json(app.options.startup().redact())
 }
 
-fn require_remote(options: &OptionsStore) -> HttpResult<()> {
-    if !options.get().remote_configuration {
-        return Err(StatusCode::FORBIDDEN.into_response());
-    }
-    Ok(())
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OptionsOverlay {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    soulseek: Option<SoulseekOverlay>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SoulseekOverlay {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    listen_ip_address: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    listen_port: Option<i32>,
-}
-
-async fn patch_options(
-    _: RequireAdmin,
-    State(app): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> HttpResult<Response> {
-    require_remote(&app.options)?;
-    let Some(overlay) = optional_json::<OptionsOverlay>(&headers, &body)? else {
-        return Ok(StatusCode::NO_CONTENT.into_response());
-    };
-    if let Some(soulseek) = &overlay.soulseek {
-        if let Some(address) = &soulseek.listen_ip_address {
-            address
-                .parse::<IpAddr>()
-                .map_err(|_| bad_request("ListenIpAddress is not a valid IP address"))?;
-        }
-        if soulseek
-            .listen_port
-            .is_some_and(|port| !(1024..=65535).contains(&port))
-        {
-            return Err(bad_request("ListenPort must be between 1024 and 65535"));
-        }
-    }
-    app.options.patch(|options| {
-        if let Some(soulseek) = &overlay.soulseek {
-            if let Some(address) = &soulseek.listen_ip_address {
-                options.soulseek.listen_ip_address.clone_from(address);
-            }
-            if let Some(port) = soulseek.listen_port {
-                options.soulseek.listen_port = port;
-            }
-        }
-    });
-    Ok(Json(overlay).into_response())
-}
-
-async fn debug_options(
+async fn toml_location(
     _: RequireAdminJwt,
     State(app): State<AppState>,
 ) -> HttpResult<Json<String>> {
-    require_remote(&app.options)?;
-    if !app.options.startup().debug {
-        return Err(StatusCode::FORBIDDEN.into_response());
-    }
-    Ok(Json(app.options.debug_view()))
-}
-
-async fn yaml_location(
-    _: RequireAdminJwt,
-    State(app): State<AppState>,
-) -> HttpResult<Json<String>> {
-    require_remote(&app.options)?;
     Ok(Json(app.paths.config_file.to_string_lossy().into_owned()))
 }
 
-async fn read_yaml(
+async fn read_toml(
     _: RequireAdminJwt,
     State(app): State<AppState>,
     headers: HeaderMap,
 ) -> HttpResult<Response> {
-    require_remote(&app.options)?;
-    let yaml = app
+    let text = app
         .options
-        .read_yaml()
+        .read_toml()
         .map_err(|error| ApiError::Internal(error.into()).into_response())?;
     let json_requested = headers
         .get_all(header::ACCEPT)
@@ -334,48 +256,43 @@ async fn read_yaml(
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
         });
     if json_requested {
-        Ok(Json(yaml).into_response())
+        Ok(Json(text).into_response())
     } else {
         Ok((
-            [(header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
-            yaml,
+            [(header::CONTENT_TYPE, "application/toml; charset=utf-8")],
+            text,
         )
             .into_response())
     }
 }
 
-async fn write_yaml(
+async fn write_toml(
     _: RequireAdminJwt,
     State(app): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> HttpResult<StatusCode> {
-    require_remote(&app.options)?;
-    let yaml = yaml_body(&headers, &body)?;
-    if let Some(error) = OptionsStore::validate_yaml(&yaml) {
+    let text = toml_body(&headers, &body)?;
+    if let Some(error) = app.options.validate_toml(&text) {
         return Err(bad_request(error));
     }
-    app.options.apply_yaml(&yaml).await.map_err(|error| {
+    app.options.apply_toml(&text).await.map_err(|error| {
         ApiError::Internal(anyhow::anyhow!(
             "Failed to update configuration file: {error}"
         ))
         .into_response()
     })?;
-    if app.options.startup().flags.no_config_watch {
-        app.state.update(|state| state.pending_restart = true);
-    }
     Ok(StatusCode::OK)
 }
 
-async fn validate_yaml(
+async fn validate_toml(
     _: RequireAdmin,
     State(app): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> HttpResult<Response> {
-    require_remote(&app.options)?;
-    let yaml = yaml_body(&headers, &body)?;
-    Ok(match OptionsStore::validate_yaml(&yaml) {
+    let text = toml_body(&headers, &body)?;
+    Ok(match app.options.validate_toml(&text) {
         Some(error) => Json(error).into_response(),
         None => StatusCode::OK.into_response(),
     })
@@ -410,21 +327,16 @@ fn optional_json<T: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> HttpR
     serde_json::from_slice(body).map_err(|error| bad_request(error.to_string()))
 }
 
-fn yaml_body<'a>(headers: &HeaderMap, body: &'a [u8]) -> HttpResult<std::borrow::Cow<'a, str>> {
+fn toml_body<'a>(headers: &HeaderMap, body: &'a [u8]) -> HttpResult<std::borrow::Cow<'a, str>> {
     let media = media_type(headers);
     if is_json(media) {
         return Ok(optional_json::<String>(headers, body)?
             .unwrap_or_default()
             .into());
     }
-    if [
-        "application/yaml",
-        "application/x-yaml",
-        "text/yaml",
-        "text/plain",
-    ]
-    .iter()
-    .any(|mime| media.eq_ignore_ascii_case(mime))
+    if ["application/toml", "text/x-toml", "text/plain"]
+        .iter()
+        .any(|mime| media.eq_ignore_ascii_case(mime))
     {
         return std::str::from_utf8(body)
             .map(Into::into)

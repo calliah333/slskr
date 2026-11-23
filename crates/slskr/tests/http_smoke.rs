@@ -20,9 +20,9 @@ impl Drop for Daemon {
 
 #[tokio::test]
 async fn daemon_http_smoke() {
-    let app_dir = tempfile::tempdir().unwrap();
-    let shares_dir = app_dir.path().join("shared");
-    let content_dir = app_dir.path().join("www");
+    let data_dir = tempfile::tempdir().unwrap();
+    let shares_dir = data_dir.path().join("shared");
+    let content_dir = data_dir.path().join("www");
     std::fs::create_dir_all(&shares_dir).unwrap();
     std::fs::create_dir_all(content_dir.join("assets")).unwrap();
     std::fs::write(shares_dir.join("sample.txt"), "shared sample").unwrap();
@@ -36,15 +36,18 @@ async fn daemon_http_smoke() {
         .unwrap()
         .port();
     let share_path = serde_json::to_string(&shares_dir.to_string_lossy()).unwrap();
-    let content_path = serde_json::to_string(&content_dir.to_string_lossy()).unwrap();
+    // JSON string escaping is valid TOML basic-string escaping.
     let config = format!(
-        "flags:\n  no_connect: true\n  no_share_scan: true\nshares:\n  directories:\n    - {share_path}\nweb:\n  port: {port}\n  ip_address: 127.0.0.1\n  url_base: /client\n  content_path: {content_path}\n  authentication:\n    disabled: false\n    username: smoke\n    password: secret\n"
+        "[soulseek]\nconnect = false\n\n[shares]\ndirectories = [{share_path}]\n\n[web]\nlisten = \"127.0.0.1:{port}\"\nurl_base = \"/client\"\nusername = \"smoke\"\npassword = \"secret\"\n"
     );
-    std::fs::write(app_dir.path().join("slskd.yml"), config).unwrap();
+    std::fs::write(data_dir.path().join("slskr.toml"), &config).unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_slskr"))
-        .arg("--app-dir")
-        .arg(app_dir.path())
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .env("SLSKR_CONTENT_PATH", &content_dir)
+        .env_remove("SLSKR_DATA_DIR")
+        .env_remove("SLSKR_CONFIG")
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -121,18 +124,44 @@ async fn daemon_http_smoke() {
         .json()
         .await
         .unwrap();
-    assert_eq!(options["web"]["urlBase"], "/client");
-    assert_eq!(options["web"]["authentication"]["username"], "smoke");
+    assert_eq!(options["web"]["url_base"], "/client");
+    assert_eq!(options["web"]["username"], "smoke");
+    assert_eq!(options["web"]["password"], "*****");
     assert!(options["shares"].get("directories").is_some());
 
-    // Remote filesystem mutation is disabled even for the authenticated admin.
+    let file = client
+        .get(format!("{api}/options/toml"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(
+        file.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/toml")
+    );
+    assert_eq!(file.text().await.unwrap(), config);
+    let invalid = client
+        .put(format!("{api}/options/toml"))
+        .bearer_auth(token)
+        .header("content-type", "application/toml")
+        .body("[web]\nlisten = \"nowhere\"\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Deleting a missing download is a 404; deletion is confined to the downloads root.
     let deletion = client
         .delete(format!("{api}/files/downloads/files/c2FtcGxlLnR4dA%3D%3D"))
         .bearer_auth(token)
         .send()
         .await
         .unwrap();
-    assert_eq!(deletion.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(deletion.status(), reqwest::StatusCode::NOT_FOUND);
 
     let scan = client
         .put(format!("{api}/shares"))
@@ -140,8 +169,9 @@ async fn daemon_http_smoke() {
         .send()
         .await
         .unwrap();
+    // The startup scan may still be running.
     assert!(
-        scan.status().is_success(),
+        scan.status().is_success() || scan.status() == reqwest::StatusCode::CONFLICT,
         "share scan returned {}",
         scan.status()
     );

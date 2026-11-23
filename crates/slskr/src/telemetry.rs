@@ -18,7 +18,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use slskr_api::{
-    options::MetricsAuthenticationOptions,
+    config::MetricsConfig,
     telemetry::{
         CurrentMetrics, PrometheusMetric, PrometheusMetricSample, PrometheusMetrics, hub_methods,
     },
@@ -40,7 +40,7 @@ impl TelemetryService {
             transfers: transfers.clone(),
             metrics_hub: core.hubs.metrics.clone(),
             scrape_token: if config.enabled {
-                configured_token(&config.authentication)
+                configured_token(config)
             } else {
                 None
             },
@@ -254,8 +254,10 @@ async fn kpis(_: Authenticated, State(state): State<AppState>) -> Json<Prometheu
     Json(metrics_object(&state.services.telemetry.metrics()))
 }
 
-fn configured_token(auth: &MetricsAuthenticationOptions) -> Option<String> {
-    (!auth.disabled).then(|| STANDARD.encode(format!("{}:{}", auth.username, auth.password)))
+/// Basic credentials, or `None` (no authentication) when neither is configured.
+fn configured_token(config: &MetricsConfig) -> Option<String> {
+    (!config.username.is_empty() || !config.password.is_empty())
+        .then(|| STANDARD.encode(format!("{}:{}", config.username, config.password)))
 }
 
 fn scrape_authorized(headers: &HeaderMap, token: Option<&str>) -> bool {
@@ -336,11 +338,11 @@ mod tests {
     }
 
     #[test]
-    fn scrape_requires_configured_basic_credentials_unless_disabled() {
-        let mut auth = MetricsAuthenticationOptions {
-            disabled: false,
+    fn scrape_requires_configured_basic_credentials_unless_unset() {
+        let mut auth = MetricsConfig {
             username: "scraper".into(),
             password: "a:b".into(),
+            ..Default::default()
         };
         let token = configured_token(&auth);
         let mut headers = HeaderMap::new();
@@ -357,7 +359,8 @@ mod tests {
         }
         headers.insert(header::AUTHORIZATION, "Basic !?".parse().unwrap());
         assert!(!scrape_authorized(&headers, token.as_deref()));
-        auth.disabled = true;
+        auth.username.clear();
+        auth.password.clear();
         headers.clear();
         assert!(scrape_authorized(
             &headers,

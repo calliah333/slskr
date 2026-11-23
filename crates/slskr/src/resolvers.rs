@@ -110,13 +110,10 @@ impl Resolvers for AppResolvers {
         Box::pin(async move {
             let app = app?;
             let options = app.options.get();
-            let picture = match options
-                .soulseek
-                .picture
-                .as_deref()
+            let picture = match Some(options.soulseek.picture.as_str())
                 .filter(|path| !path.trim().is_empty())
             {
-                Some(path) => match read_picture(&app.paths.app_dir.join(path)).await {
+                Some(path) => match read_picture(Path::new(path)).await {
                     Ok(bytes) => Some(bytes),
                     Err(error) => {
                         tracing::warn!(%error, "could not read configured Soulseek picture");
@@ -168,11 +165,11 @@ impl Resolvers for AppResolvers {
                 return None;
             }
             let options = app.options.get();
-            let incoming = &options.throttling.search.incoming;
+            let incoming = &options.search;
             let permit = search_permit(
                 searches,
                 &queued,
-                usize::try_from(incoming.circuit_breaker).ok()?,
+                usize::try_from(incoming.incoming_circuit_breaker).ok()?,
             )
             .await?;
             {
@@ -196,7 +193,7 @@ impl Resolvers for AppResolvers {
             if files.is_empty() {
                 return None;
             }
-            if options.blacklist.enabled {
+            if !options.blacklist.cidrs.is_empty() {
                 let endpoint = app.client.get_user_endpoint(&username).await.ok()?;
                 if app
                     .services

@@ -202,24 +202,17 @@ impl UserService {
             return PRIVILEGED.into();
         }
         if let Some((name, _)) = options
-            .transfers
             .groups
-            .user_defined
+            .custom
             .iter()
             .find(|(_, g)| g.members.iter().any(|u| u.eq_ignore_ascii_case(username)))
         {
             return name.clone();
         }
+        let leechers = &options.groups.leechers;
         let leecher = stats.is_some_and(|s| {
-            s.file_count < options.transfers.groups.leechers.thresholds.files.max(0) as u32
-                || s.directory_count
-                    < options
-                        .transfers
-                        .groups
-                        .leechers
-                        .thresholds
-                        .directories
-                        .max(0) as u32
+            s.file_count < leechers.min_shared_files.unwrap_or(1)
+                || s.directory_count < leechers.min_shared_directories.unwrap_or(1)
         });
         if leecher {
             LEECHERS.into()
@@ -228,8 +221,8 @@ impl UserService {
         }
     }
     pub fn is_blacklisted(&self, username: &str, ip: Option<IpAddr>) -> bool {
-        let b = &self.core.options.get().transfers.groups.blacklisted;
-        b.members.iter().any(|v| v.eq_ignore_ascii_case(username))
+        let b = &self.core.options.get().blacklist;
+        b.users.iter().any(|v| v.eq_ignore_ascii_case(username))
             || b.patterns.iter().any(|p| wildcard(p, username))
             || ip.is_some_and(|ip| {
                 b.cidrs
@@ -240,28 +233,12 @@ impl UserService {
     }
     pub fn group_upload_options(&self, group: &str) -> GroupUploadInfo {
         let options = self.core.options.get();
-        let g = if group == PRIVILEGED {
-            &options.transfers.groups.default.upload
-        } else if group == LEECHERS {
-            &options.transfers.groups.leechers.upload
-        } else {
-            options
-                .transfers
-                .groups
-                .user_defined
-                .get(group)
-                .map(|x| &x.upload)
-                .unwrap_or(&options.transfers.groups.default.upload)
-        };
+        let g = crate::transfers::group_config(&options, group);
         GroupUploadInfo {
-            slots: g.slots.max(0) as u32,
-            strategy: if g.strategy.eq_ignore_ascii_case("firstinfirstout") {
-                "firstinfirstout"
-            } else {
-                "roundrobin"
-            },
-            speed_limit: g.speed_limit.max(0) as u32,
-            priority: g.priority.max(0) as u32,
+            slots: g.slots,
+            strategy: g.strategy.as_str(),
+            speed_limit: g.speed_limit,
+            priority: g.priority,
         }
     }
     async fn status(&self, username: &str) -> soulseek::Result<Status> {

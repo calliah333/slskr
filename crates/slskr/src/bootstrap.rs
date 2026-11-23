@@ -8,24 +8,22 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use axum::{
     Router,
     http::StatusCode,
     routing::{any, get},
     serve::{Listener, ListenerExt},
 };
-use clap::{
-    Arg, ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser, value_parser,
-};
-use serde_yaml::Mapping;
+use clap::Parser;
+use slskr_api::config::Config;
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{AppInner, AppState, Core, Hubs, Paths, Services},
     auth::{Auth, Role},
-    config::{self, OptionsStore, SOURCES},
+    config::{self, ConfigStore, Overrides, Sources},
     core_api, events, files, http, logging, messaging,
     resolvers::AppResolvers,
     search, shares,
@@ -34,156 +32,47 @@ use crate::{
     telemetry, transfers, users,
 };
 
+/// Command line. Everything else is configured in `slskr.toml` or `SLSKR_*` variables.
+#[derive(Debug, Parser)]
+#[command(
+    name = "slskr",
+    version,
+    about = "Soulseek client daemon with a web UI"
+)]
 pub struct Cli {
-    app_dir: Option<PathBuf>,
-    config: Option<PathBuf>,
-    overrides: Mapping,
-    envars: bool,
-    generate_secret: Option<usize>,
-}
-
-impl Parser for Cli {}
-
-impl CommandFactory for Cli {
-    fn command() -> Command {
-        let mut command = Command::new("slskr")
-            .version(env!("CARGO_PKG_VERSION"))
-            .about("Soulseek client daemon")
-            .arg(
-                Arg::new("app-dir")
-                    .long("app-dir")
-                    .short('a')
-                    .value_parser(value_parser!(PathBuf)),
-            )
-            .arg(
-                Arg::new("config")
-                    .long("config")
-                    .short('c')
-                    .value_parser(value_parser!(PathBuf)),
-            )
-            .arg(
-                Arg::new("set")
-                    .long("set")
-                    .value_name("KEY=VALUE")
-                    .action(ArgAction::Append),
-            )
-            .arg(
-                Arg::new("envars")
-                    .long("envars")
-                    .short('e')
-                    .action(ArgAction::SetTrue),
-            )
-            .arg(
-                Arg::new("generate-secret")
-                    .long("generate-secret")
-                    .value_parser(value_parser!(usize)),
-            );
-        for &(env, name, short, _, kind) in SOURCES {
-            let mut arg = Arg::new(name)
-                .long(name)
-                .help(format!("Override SLSKD_{env}"));
-            if let Some(short) = short {
-                arg = arg.short(short);
-            }
-            arg = match kind {
-                'b' => arg.action(ArgAction::SetTrue),
-                'i' => arg
-                    .allow_negative_numbers(true)
-                    .value_parser(value_parser!(i32)),
-                'l' => arg.action(ArgAction::Append).value_delimiter(';'),
-                _ => arg,
-            };
-            command = command.arg(arg);
-        }
-        command
-    }
-
-    fn command_for_update() -> Command {
-        Self::command()
-    }
-}
-
-impl FromArgMatches for Cli {
-    fn from_arg_matches(matches: &ArgMatches) -> std::result::Result<Self, clap::Error> {
-        let mut overrides = Mapping::new();
-        for &(_, name, _, path, kind) in SOURCES {
-            if matches.value_source(name) != Some(clap::parser::ValueSource::CommandLine) {
-                continue;
-            }
-            match kind {
-                'b' => config::cli_value(&mut overrides, path, matches.get_flag(name)),
-                'i' => config::cli_value(&mut overrides, path, matches.get_one::<i32>(name)),
-                'l' => config::cli_value(
-                    &mut overrides,
-                    path,
-                    matches
-                        .get_many::<String>(name)
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>(),
-                ),
-                _ => config::cli_value(&mut overrides, path, matches.get_one::<String>(name)),
-            }
-        }
-        for assignment in matches.get_many::<String>("set").into_iter().flatten() {
-            config::cli_assignment(&mut overrides, assignment).map_err(|e| {
-                clap::Error::raw(clap::error::ErrorKind::InvalidValue, e.to_string())
-            })?;
-        }
-        Ok(Self {
-            app_dir: matches.get_one::<PathBuf>("app-dir").cloned(),
-            config: matches.get_one::<PathBuf>("config").cloned(),
-            overrides,
-            envars: matches.get_flag("envars"),
-            generate_secret: matches.get_one::<usize>("generate-secret").copied(),
-        })
-    }
-
-    fn update_from_arg_matches(
-        &mut self,
-        matches: &ArgMatches,
-    ) -> std::result::Result<(), clap::Error> {
-        *self = Self::from_arg_matches(matches)?;
-        Ok(())
-    }
+    /// Data directory holding the configuration, databases, logs and default download
+    /// directories [default: $XDG_DATA_HOME/slskr or ~/.local/share/slskr]
+    #[arg(long, value_name = "DIR", env = "SLSKR_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+    /// Configuration file [default: <DATA_DIR>/slskr.toml]
+    #[arg(long, value_name = "FILE", env = "SLSKR_CONFIG")]
+    pub config: Option<PathBuf>,
+    /// Do not connect to the Soulseek server (overrides soulseek.connect)
+    #[arg(long)]
+    pub no_connect: bool,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    if cli.envars {
-        for name in ["APP_DIR", "CONFIG"]
-            .into_iter()
-            .chain(SOURCES.iter().map(|source| source.0))
-        {
-            println!("SLSKD_{name}");
-        }
-        return Ok(());
-    }
-    if let Some(len) = cli.generate_secret {
-        use rand::distr::{Alphanumeric, SampleString};
-        ensure!(len > 0, "secret length must be positive");
-        println!("{}", Alphanumeric.sample_string(&mut rand::rng(), len));
-        return Ok(());
-    }
-
-    let app_dir = cli
-        .app_dir
-        .or_else(|| config::env_path("APP_DIR").map(PathBuf::from))
-        .map_or_else(default_app_dir, Ok)?;
-    let app_dir = std::path::absolute(app_dir)?;
-    let config_file = cli
-        .config
-        .or_else(|| config::env_path("CONFIG").map(PathBuf::from))
-        .unwrap_or_else(|| app_dir.join("slskd.yml"));
-    let config_file = std::path::absolute(config_file)?;
-    let options = OptionsStore::load(&app_dir, config_file.clone(), cli.overrides).await?;
-    if options.startup().flags.no_start {
-        return Ok(());
-    }
-    let web = &options.startup().web;
-    let tcp = bind_tcp(web.ip_address.as_deref(), web.port).await?;
+    let data_dir = std::path::absolute(cli.data_dir.map_or_else(default_data_dir, Ok)?)?;
+    let config_file = std::path::absolute(
+        cli.config
+            .unwrap_or_else(|| data_dir.join(config::FILE_NAME)),
+    )?;
+    let sources = Sources::from_env(
+        data_dir.clone(),
+        Overrides {
+            no_connect: cli.no_connect,
+        },
+    )?;
+    let options = ConfigStore::load(config_file.clone(), sources).await?;
+    let listen = options.startup().web.listen;
+    let tcp = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding web.listen {listen}"))?;
 
     let startup_key: [u8; 32] = rand::random();
-    let app = build(app_dir, config_file, options, &startup_key).await?;
+    let app = build(data_dir, config_file, options, &startup_key).await?;
+
     let _cancel_on_drop = app.shutdown.clone().drop_guard();
     let router = router(&app);
     let client_events_done = CancellationToken::new();
@@ -191,10 +80,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     let client_events = app.start(startup_key, client_events_done.clone());
 
     let mut servers = JoinSet::new();
-    for listener in tcp {
-        tracing::info!(address = %listener.local_addr()?, "HTTP listener started");
-        serve(&mut servers, listener, router.clone(), app.shutdown.clone());
-    }
+    tracing::info!(address = %tcp.local_addr()?, "HTTP listener started");
+    serve(&mut servers, tcp, router, app.shutdown.clone());
 
     let exit: Result<()> = tokio::select! {
         _ = app.shutdown.cancelled() => Ok(()),
@@ -229,41 +116,31 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn bind_tcp(ips: Option<&str>, port: i32) -> Result<Vec<TcpListener>> {
-    let port = port.try_into()?;
-    let mut listeners = Vec::new();
-    for ip in config::http_ips(ips)? {
-        let address = SocketAddr::new(ip, port);
-        listeners.push(
-            TcpListener::bind(address)
-                .await
-                .with_context(|| format!("binding {address}"))?,
-        );
-    }
-    Ok(listeners)
-}
-
 async fn build(
-    app_dir: PathBuf,
+    data_dir: PathBuf,
     config_file: PathBuf,
-    options: OptionsStore,
+    options: ConfigStore,
     startup_key: &[u8],
 ) -> Result<AppState> {
     let startup = options.startup();
     let exe = std::env::current_exe()?;
     let paths = Paths {
         config_file,
-        data_dir: app_dir.join("data"),
-        logs_dir: app_dir.join("logs"),
-        content_path: (!startup.headless)
-            .then(|| discover_content(&exe, &startup.web.content_path))
-            .flatten(),
-        app_dir,
+        db_dir: data_dir.join("db"),
+        logs_dir: data_dir.join("logs"),
+        content_path: discover_content(&exe, std::env::var_os("SLSKR_CONTENT_PATH")),
+        data_dir,
     };
-    tokio::fs::create_dir_all(&paths.data_dir).await?;
-    tokio::fs::create_dir_all(&startup.directories.downloads).await?;
-    tokio::fs::create_dir_all(&startup.directories.incomplete).await?;
+    tokio::fs::create_dir_all(&paths.db_dir).await?;
+    tokio::fs::create_dir_all(&startup.downloads.directory).await?;
+    tokio::fs::create_dir_all(&startup.downloads.incomplete_directory).await?;
     let logs = logging::init(startup, &paths)?;
+    warn_about_web_access(startup, &paths.config_file);
+    if paths.content_path.is_none() {
+        tracing::warn!(
+            "web UI files not found (set SLSKR_CONTENT_PATH to a directory containing index.html)"
+        );
+    }
     let hubs = Hubs {
         application: Hub::new("application"),
         logs: Hub::new("logs"),
@@ -271,7 +148,7 @@ async fn build(
         metrics: Hub::new("metrics"),
     };
     let auth =
-        Auth::new(config::auth_config(startup, startup_key)?).with_url_base(&startup.web.url_base);
+        Auth::new(config::auth_config(startup, startup_key)).with_url_base(&startup.web.url_base);
     for hub in [&hubs.application, &hubs.search, &hubs.metrics] {
         hub.set_authorizer(auth.hub_authorizer(Role::ReadOnly));
     }
@@ -279,7 +156,7 @@ async fn build(
         .set_authorizer(auth.hub_authorizer(Role::Administrator));
     logs.attach_hub(hubs.logs.clone());
     let state = StateStore::new(hubs.application.clone());
-    let concurrency = startup.throttling.search.incoming.concurrency.try_into()?;
+    let concurrency = startup.search.incoming_concurrency.try_into()?;
     let resolvers = Arc::new(AppResolvers::new(concurrency));
     let client = soulseek::SoulseekClient::new(config::client_options(startup)?, resolvers.clone());
     let core = Core {
@@ -342,8 +219,7 @@ fn router(app: &AppState) -> Router {
         .route("/hub/{*unknown}", any(missing));
     let startup = app.options.startup();
     if startup.metrics.enabled {
-        let url = format!("/{}", startup.metrics.url.trim_start_matches('/'));
-        endpoints = endpoints.merge(telemetry::prometheus_routes(&url));
+        endpoints = endpoints.merge(telemetry::prometheus_routes(&startup.metrics.path));
     }
     let endpoints = endpoints.with_state(app.clone());
     let web = &startup.web;
@@ -357,7 +233,7 @@ fn router(app: &AppState) -> Router {
     if let Some(path) = &app.paths.content_path {
         router = router.merge(http::static_router(path.clone(), base));
     }
-    if web.logging {
+    if web.log_requests {
         use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
         // Log at INFO like slskd request logging; the span records the path only so query
         // strings (SignalR `access_token`) never reach the logs.
@@ -377,7 +253,7 @@ fn router(app: &AppState) -> Router {
     router
 }
 
-fn default_app_dir() -> Result<PathBuf> {
+fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os(if cfg!(windows) {
         "LOCALAPPDATA"
     } else {
@@ -385,37 +261,69 @@ fn default_app_dir() -> Result<PathBuf> {
     })
     .filter(|path| !path.is_empty())
     {
-        return Ok(PathBuf::from(path).join("slskd"));
+        return Ok(PathBuf::from(path).join("slskr"));
     }
-    let home = std::env::var_os("HOME").context("set SLSKD_APP_DIR or pass --app-dir")?;
+    let home = std::env::var_os("HOME").context("set HOME or pass --data-dir")?;
     Ok(PathBuf::from(home)
         .join(if cfg!(target_os = "macos") {
             "Library/Application Support"
         } else {
             ".local/share"
         })
-        .join("slskd"))
+        .join("slskr"))
 }
 
-fn discover_content(exe: &Path, configured: &str) -> Option<PathBuf> {
-    let path = Path::new(configured);
-    let sibling = exe.parent()?.join(path);
-    if sibling.join("index.html").is_file() {
-        return Some(sibling);
-    }
-    if configured == "wwwroot" {
-        let installed = exe.parent()?.parent()?.join("share/slskr/wwwroot");
-        if installed.join("index.html").is_file() {
-            return Some(installed);
+fn warn_about_web_access(config: &Config, file: &Path) {
+    let web = &config.web;
+    if !web.auth {
+        // Process logs only go to the log buffer and files, so say this on stderr as well.
+        eprintln!(
+            "slskr: WARNING: web.auth is disabled; {} is unauthenticated",
+            web.listen
+        );
+        if web.listen.ip().is_loopback() {
+            tracing::warn!(
+                listen = %web.listen,
+                "web.auth is disabled: anyone who can reach the web UI has full control"
+            );
+        } else {
+            tracing::error!(
+                listen = %web.listen,
+                "web.auth is disabled on a non-loopback address: anyone on the network has full control of this daemon"
+            );
         }
-        // Development convenience for `cargo run` after `trunk build`; release builds rely on
-        // the packaged layout or SLSKR_CONTENT_PATH.
-        #[cfg(debug_assertions)]
-        {
-            let dist = Path::new("dist");
-            if dist.join("index.html").is_file() {
-                return Some(dist.to_owned());
-            }
+    } else if web.password.is_empty() {
+        tracing::warn!(
+            file = %file.display(),
+            "web.password is not set; web sign-in is disabled until it is configured"
+        );
+    }
+}
+
+/// `SLSKR_CONTENT_PATH`, else `wwwroot` next to the executable, else the packaged
+/// `../share/slskr/wwwroot` (and `dist/` in debug builds).
+fn discover_content(exe: &Path, configured: Option<OsString>) -> Option<PathBuf> {
+    if let Some(path) = configured.filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        return path.join("index.html").is_file().then_some(path);
+    }
+    let bin = exe.parent()?;
+    let installed = [
+        bin.join("wwwroot"),
+        bin.parent()?.join("share/slskr/wwwroot"),
+    ];
+    if let Some(found) = installed
+        .into_iter()
+        .find(|path| path.join("index.html").is_file())
+    {
+        return Some(found);
+    }
+    // Development convenience for `cargo run` after `trunk build`.
+    #[cfg(debug_assertions)]
+    {
+        let dist = Path::new("dist");
+        if dist.join("index.html").is_file() {
+            return Some(dist.to_owned());
         }
     }
     None
@@ -468,33 +376,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_reference_flags_and_overrides() {
+    fn parse_command_line() {
         let cli = Cli::try_parse_from([
             "slskr",
-            "-a",
+            "--data-dir",
             "/tmp/slskr",
-            "-l",
-            "5090",
+            "--config",
+            "/etc/slskr.toml",
             "--no-connect",
-            "--slsk-username",
-            "peer",
-            "--shared",
-            "/music;/audiobooks",
-            "--set",
-            "web.url_base=/client",
         ])
         .unwrap();
-        let values = serde_yaml::Value::Mapping(cli.overrides);
-        assert_eq!(cli.app_dir.as_deref(), Some(Path::new("/tmp/slskr")));
-        assert_eq!(values["flags"]["noConnect"].as_bool(), Some(true));
-        assert_eq!(values["web"]["port"].as_i64(), Some(5090));
-        assert_eq!(values["web"]["urlBase"].as_str(), Some("/client"));
-        assert_eq!(values["soulseek"]["username"].as_str(), Some("peer"));
-        assert_eq!(
-            values["shares"]["directories"].as_sequence().unwrap().len(),
-            2
-        );
-        assert!(Cli::try_parse_from(["slskr", "--set", "missing-value"]).is_err());
+        assert_eq!(cli.data_dir.as_deref(), Some(Path::new("/tmp/slskr")));
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/etc/slskr.toml")));
+        assert!(cli.no_connect);
+        for removed in [
+            &["slskr", "--app-dir", "/x"][..],
+            &["slskr", "--set", "a=b"],
+            &["slskr", "-g"],
+        ] {
+            assert!(Cli::try_parse_from(removed).is_err(), "{removed:?}");
+        }
     }
 
     #[test]
@@ -504,11 +405,14 @@ mod tests {
         let root = dir.path().join("share/slskr/wwwroot");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("index.html"), "shell").unwrap();
-        assert_eq!(discover_content(&executable, "wwwroot"), Some(root.clone()));
+        assert_eq!(discover_content(&executable, None), Some(root.clone()));
         assert_eq!(
-            discover_content(&executable, root.to_str().unwrap()),
+            discover_content(&executable, Some(root.clone().into())),
             Some(root)
         );
-        assert_eq!(discover_content(&executable, "nonexistent"), None);
+        assert_eq!(
+            discover_content(&executable, Some(dir.path().join("nonexistent").into())),
+            None
+        );
     }
 }

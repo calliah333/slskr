@@ -13,9 +13,9 @@ use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use slskr_api::{
+    config::Config,
     files::FilesystemFile,
     logs::{LogRecord, hub_methods},
-    options::Options,
 };
 use tracing::{
     Event, Level, Subscriber,
@@ -190,11 +190,9 @@ impl Write for LockedFile<'_> {
 }
 
 /// Initializes tracing and returns the shared live log buffer.
-pub fn init(options: &Options, paths: &Paths) -> anyhow::Result<LogBuffer> {
+pub fn init(options: &Config, paths: &Paths) -> anyhow::Result<LogBuffer> {
     let buffer = LogBuffer::default();
-    let file = if options.logger.no_disk {
-        None
-    } else {
+    let file = if options.logging.file {
         std::fs::create_dir_all(&paths.logs_dir)?;
         let path = paths
             .logs_dir
@@ -204,17 +202,66 @@ pub fn init(options: &Options, paths: &Paths) -> anyhow::Result<LogBuffer> {
                 .with_writer(FileWriter(Mutex::new(
                     OpenOptions::new().create(true).append(true).open(path)?,
                 )))
-                .with_ansi(!options.logger.no_color),
+                .with_ansi(false),
         )
+    } else {
+        None
     };
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(if options.debug { "debug" } else { "info" }));
+        .unwrap_or_else(|_| EnvFilter::new(options.logging.level.as_str()));
     tracing_subscriber::registry()
         .with(filter)
         .with(BufferLayer(buffer.clone()))
         .with(file)
         .try_init()?;
     Ok(buffer)
+}
+
+/// Applies `retention.logs` now and hourly: deletes `slskr-*.log` files not written to within
+/// the configured age.
+pub(crate) fn start_retention(core: &crate::app::Core) {
+    let options = core.options.clone();
+    let dir = core.paths.logs_dir.clone();
+    let shutdown = core.shutdown.clone();
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = timer.tick() => {}
+            }
+            let Some(age) = options.get().retention.logs else {
+                continue;
+            };
+            let dir = dir.clone();
+            let _ = tokio::task::spawn_blocking(move || prune_files(&dir, age)).await;
+        }
+    });
+}
+
+fn prune_files(dir: &std::path::Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with("slskr-") && name.ends_with(".log")) {
+            continue;
+        }
+        let expired = entry.metadata().is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age > max_age)
+        });
+        if expired && let Err(error) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(%error, file = name, "could not delete expired log file");
+        }
+    }
 }
 
 pub fn routes() -> Router<AppState> {

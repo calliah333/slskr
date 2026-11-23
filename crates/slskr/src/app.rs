@@ -22,11 +22,11 @@ use slskr_api::{
     application::{
         DistributedNetworkState, ServerConnectionWatchdogState, UserStatisticsState, hub_methods,
     },
+    config::Config,
     events::{
         Event, EventHeader, EventType, SoulseekClientConnectedEvent,
         SoulseekClientDisconnectedEvent,
     },
-    options::Options,
     server::{ServerState, SoulseekClientStates},
 };
 use soulseek::{ClientState, DistributedNetworkInfo, Event as ClientEvent};
@@ -35,7 +35,7 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::Auth, config::OptionsStore, events::EventService, files::FileService, logging::LogBuffer,
+    auth::Auth, config::ConfigStore, events::EventService, files::FileService, logging::LogBuffer,
     messaging::MessagingService, search::SearchService, shares::ShareService, signalr::Hub,
     state::StateStore, telemetry::TelemetryService, transfers::TransferService, users::UserService,
 };
@@ -43,15 +43,15 @@ use crate::{
 /// Filesystem locations resolved at startup.
 #[derive(Clone, Debug)]
 pub struct Paths {
-    /// Application directory (slskd `--app-dir`), holds config, data and logs.
-    pub app_dir: PathBuf,
-    /// YAML configuration file (slskd `--config`, default `{app_dir}/slskd.yml`).
-    pub config_file: PathBuf,
-    /// Sqlite databases (`{app_dir}/data`).
+    /// Data directory (`--data-dir`); relative configuration paths resolve against it.
     pub data_dir: PathBuf,
-    /// Log files (`{app_dir}/logs`).
+    /// Configuration file (`--config`, default `{data_dir}/slskr.toml`).
+    pub config_file: PathBuf,
+    /// Sqlite databases and the share cache (`{data_dir}/db`).
+    pub db_dir: PathBuf,
+    /// Log files (`{data_dir}/logs`).
     pub logs_dir: PathBuf,
-    /// Static web UI root (`web.content_path` / `SLSKR_CONTENT_PATH`), if any.
+    /// Static web UI root (`SLSKR_CONTENT_PATH` or the packaged/sibling `wwwroot`), if any.
     pub content_path: Option<PathBuf>,
 }
 
@@ -68,7 +68,7 @@ pub struct Hubs {
 #[derive(Clone)]
 pub struct Core {
     pub paths: Paths,
-    pub options: OptionsStore,
+    pub options: ConfigStore,
     pub state: StateStore,
     pub client: soulseek::SoulseekClient,
     pub hubs: Hubs,
@@ -108,7 +108,7 @@ struct ConnectionDirective {
 impl AppInner {
     pub(crate) fn new(core: Core, services: Services) -> Self {
         let startup = core.options.startup();
-        let wants_connection = !startup.flags.no_connect;
+        let wants_connection = startup.soulseek.connect;
         let enabled = wants_connection && credentials(startup).is_some();
         if wants_connection && !enabled {
             tracing::warn!(
@@ -231,6 +231,7 @@ impl AppState {
             ]
         });
 
+        crate::logging::start_retention(&self.core);
         self.services.users.start(self.clone());
         self.services.shares.start();
         self.services.files.start(self.clone());
@@ -297,9 +298,9 @@ impl AppState {
                 result = async {
                     tokio::time::sleep(delay).await;
                     let options = self.options.get();
-                    let s = &options.soulseek;
                     let (username, password) = credentials(&options).context("Soulseek credentials are not configured")?;
-                    self.client.connect(&s.address, s.port.try_into()?, username, password).await?;
+                    let (host, port) = crate::config::server_endpoint(&options.soulseek.server)?;
+                    self.client.connect(&host, port, username, password).await?;
                     Ok::<_, anyhow::Error>(())
                 } => result,
             };
@@ -492,7 +493,7 @@ impl AppState {
 
     async fn watch_options(
         self,
-        mut receiver: watch::Receiver<Arc<Options>>,
+        mut receiver: watch::Receiver<Arc<Config>>,
         startup_key: [u8; 32],
     ) {
         let mut previous = receiver.borrow().clone();
@@ -502,15 +503,9 @@ impl AppState {
                 change = receiver.changed() => if change.is_err() { break },
             }
             let current = receiver.borrow_and_update().clone();
-            match crate::config::auth_config(&current, &startup_key) {
-                Ok(auth) => self.auth.update(&auth),
-                Err(error) => {
-                    tracing::warn!(%error, "ignoring invalid updated authentication configuration")
-                }
-            }
-            if previous.filters.search.request != current.filters.search.request
-                || previous.flags.case_sensitive_reg_ex != current.flags.case_sensitive_reg_ex
-            {
+            self.auth
+                .update(&crate::config::auth_config(&current, &startup_key));
+            if previous.search.ignore_queries != current.search.ignore_queries {
                 *self
                     .search_filters
                     .write()
@@ -534,32 +529,10 @@ impl AppState {
             };
             let old = &previous.soulseek;
             let new = &current.soulseek;
-            let credentials_changed = old.address != new.address
-                || old.port != new.port
+            let credentials_changed = old.server != new.server
                 || old.username != new.username
                 || old.password != new.password;
-            let startup = self.options.startup();
-            let web = &current.web;
-            let initial_web = &startup.web;
-            let restart = startup.headless != current.headless
-                || startup.flags != current.flags
-                || startup.logger != current.logger
-                || startup.soulseek.diagnostic_level != current.soulseek.diagnostic_level
-                || startup.transfers.upload.slots != current.transfers.upload.slots
-                || startup.transfers.download.slots != current.transfers.download.slots
-                || startup.throttling.search.incoming.concurrency
-                    != current.throttling.search.incoming.concurrency
-                || startup.metrics.enabled != current.metrics.enabled
-                || startup.metrics.url != current.metrics.url
-                || initial_web.port != web.port
-                || initial_web.ip_address != web.ip_address
-                || initial_web.url_base != web.url_base
-                || initial_web.content_path != web.content_path
-                || initial_web.logging != web.logging
-                // Auth::update reloads credentials and API keys only, as slskd marks these
-                // [RequiresRestart].
-                || initial_web.authentication.disabled != web.authentication.disabled
-                || initial_web.authentication.jwt != web.authentication.jwt;
+            let restart = crate::config::restart_required(self.options.startup(), &current);
             self.state.update(|state| {
                 state.pending_reconnect |=
                     reconnect || (state.server.is_connected && credentials_changed);
@@ -595,16 +568,13 @@ fn terminal_disconnect(error: &soulseek::Error) -> bool {
     )
 }
 
-fn compile_search_filters(options: &Options) -> Vec<regex::Regex> {
+fn compile_search_filters(options: &Config) -> Vec<regex::Regex> {
     options
-        .filters
         .search
-        .request
+        .ignore_queries
         .iter()
         .filter_map(|pattern| {
-            regex::RegexBuilder::new(pattern)
-                .case_insensitive(!options.flags.case_sensitive_reg_ex)
-                .build()
+            crate::config::regex(pattern)
                 .map_err(|error| tracing::warn!(%error, "ignoring invalid search request filter"))
                 .ok()
         })
@@ -620,16 +590,9 @@ fn event_header(kind: EventType) -> EventHeader {
     }
 }
 
-fn credentials(options: &Options) -> Option<(&str, &str)> {
-    let username = options
-        .soulseek
-        .username
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())?;
-    let password = options
-        .soulseek
-        .password
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())?;
+fn credentials(options: &Config) -> Option<(&str, &str)> {
+    let s = &options.soulseek;
+    let username = Some(s.username.as_str()).filter(|value| !value.trim().is_empty())?;
+    let password = Some(s.password.as_str()).filter(|value| !value.trim().is_empty())?;
     Some((username, password))
 }

@@ -31,8 +31,6 @@ pub const DEFAULT_JWT_TTL_MS: u64 = 604_800_000;
 pub const PASSTHROUGH_USERNAME: &str = "Anonymous";
 /// Header carrying API keys.
 pub const API_KEY_HEADER: &str = "X-API-Key";
-/// Name given to the primary (`web.authentication.api_key`) key.
-pub const PRIMARY_API_KEY_NAME: &str = "PrimaryApiKey";
 /// CIDR list allowing every address.
 pub const ALLOW_ALL_CIDR: &str = "0.0.0.0/0,::/0";
 
@@ -132,52 +130,6 @@ pub struct ApiKey {
     pub role: Role,
     /// Comma separated list of address ranges allowed to use the key.
     pub cidr: String,
-}
-
-impl ApiKey {
-    /// Parses slskd's primary key syntax `[role=<role>;][cidr=<cidrs>;]<key>`
-    /// (defaults: Administrator, all addresses). Returns `None` for blank input.
-    pub fn parse_primary(value: &str) -> Option<Result<Self, String>> {
-        if value.trim().is_empty() {
-            return None;
-        }
-
-        let mut key = None;
-        let mut role = None;
-        let mut cidr = None;
-
-        for tuple in value.split(';') {
-            let lower = tuple.to_ascii_lowercase();
-            if lower.starts_with("role=") {
-                role = tuple.rsplit('=').next().map(str::to_owned);
-            } else if lower.starts_with("cidr=") {
-                cidr = tuple.rsplit('=').next().map(str::to_owned);
-            } else {
-                key = Some(tuple.to_owned());
-            }
-        }
-
-        let key = key.filter(|k| !k.is_empty())?;
-
-        let role = match role.filter(|r| !r.trim().is_empty()) {
-            Some(role) => match role.parse() {
-                Ok(role) => role,
-                Err(e) => return Some(Err(e)),
-            },
-            None => Role::Administrator,
-        };
-
-        let cidr = cidr
-            .filter(|c| !c.trim().is_empty())
-            .unwrap_or_else(|| ALLOW_ALL_CIDR.to_owned());
-
-        Some(Ok(Self {
-            name: PRIMARY_API_KEY_NAME.to_owned(),
-            key,
-            role,
-            cidr,
-        }))
-    }
 }
 
 /// Authentication settings (slskd `web.authentication`).
@@ -969,28 +921,6 @@ mod tests {
             auth.authenticate_api_key("nope", "127.0.0.1".parse().unwrap()),
             Err(ApiKeyError::Unknown)
         );
-    }
-
-    #[test]
-    fn primary_api_key_parsing() {
-        let plain = ApiKey::parse_primary("abcdefghijklmnop").unwrap().unwrap();
-        assert_eq!(plain.role, Role::Administrator);
-        assert_eq!(plain.cidr, ALLOW_ALL_CIDR);
-        assert_eq!(plain.name, PRIMARY_API_KEY_NAME);
-
-        let full = ApiKey::parse_primary("role=readonly;cidr=10.0.0.0/8,::1/128;abcdefghijklmnop")
-            .unwrap()
-            .unwrap();
-        assert_eq!(full.key, "abcdefghijklmnop");
-        assert_eq!(full.role, Role::ReadOnly);
-        assert_eq!(full.cidr, "10.0.0.0/8,::1/128");
-
-        assert!(
-            ApiKey::parse_primary("role=root;abcdefghijklmnop")
-                .unwrap()
-                .is_err()
-        );
-        assert!(ApiKey::parse_primary("  ").is_none());
     }
 
     #[test]

@@ -3,7 +3,6 @@ use leptos_router::{components::A, hooks::use_params_map};
 use slskr_api::files::FilesystemDirectory;
 
 use crate::{
-    components::app::AppContext,
     config,
     services::{api, util::encode_path_base64},
 };
@@ -51,8 +50,6 @@ pub fn Files() -> impl IntoView {
 
 #[component]
 fn Directory(root: &'static str) -> impl IntoView {
-    let options = expect_context::<AppContext>().options;
-    let can_delete = Memo::new(move |_| options.with(|options| options.remote_file_management));
     let path = RwSignal::new(String::new());
     let listing = RwSignal::new(None::<(String, FilesystemDirectory)>);
     let error = RwSignal::new(String::new());
@@ -71,7 +68,7 @@ fn Directory(root: &'static str) -> impl IntoView {
         });
     });
     let delete = move |kind, path: &str| {
-        if deleting.get_untracked() || !can_delete.get_untracked() {
+        if deleting.get_untracked() {
             return;
         }
         let confirmed = web_sys::window().is_some_and(|window| {
@@ -101,7 +98,6 @@ fn Directory(root: &'static str) -> impl IntoView {
         <button type="button" class="ui button" on:click=move |_| path.set(String::new())>"Root"</button>
         <p role="alert">{move || error.get()}</p>
         {move || listing.get().map(|(current_path, dir)| {
-            let can_delete = can_delete.get();
             view! {
                 <h3 class="ui header">{format!("/{root}/{current_path}")}</h3>
                 <ul class="ui divided list">
@@ -111,9 +107,7 @@ fn Directory(root: &'static str) -> impl IntoView {
                         view! {
                             <li class="item">
                                 <button type="button" class="ui basic button" on:click=move |_| path.set(target.clone())>{format!("📁 {}", child.name)}</button>
-                                {can_delete.then(|| view! {
-                                    <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete("directories", &child_path)>"Delete directory"</button>
-                                })}
+                                <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete("directories", &child_path)>"Delete directory"</button>
                             </li>
                         }
                     }).collect_view()}
@@ -122,9 +116,7 @@ fn Directory(root: &'static str) -> impl IntoView {
                         view! {
                             <li class="item">
                                 {file.name}{" — "}{file.length}{" bytes"}
-                                {can_delete.then(|| view! {
-                                    <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete("files", &target)>"Delete file"</button>
-                                })}
+                                <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete("files", &target)>"Delete file"</button>
                             </li>
                         }
                     }).collect_view()}

@@ -5,26 +5,37 @@ use std::{
 
 use chrono::{DateTime, TimeDelta, Utc};
 use slskr_api::{
-    options::{GroupUploadOptions, Limits, TransfersOptions, UNLIMITED},
+    config::{Config, GroupConfig, QueueStrategy},
     transfers::{Transfer, TransferStates},
 };
 use tokio::{sync::oneshot, time::Instant};
 
 use crate::users::UserService;
 
-pub(super) fn group_options<'a>(
-    settings: &'a TransfersOptions,
-    group: &str,
-) -> &'a GroupUploadOptions {
+/// Upload settings of `group`; unknown and privileged users use `groups.default`.
+pub(crate) fn group_options<'a>(settings: &'a Config, group: &str) -> &'a GroupConfig {
+    let groups = &settings.groups;
     match group {
-        "default" | "privileged" => &settings.groups.default.upload,
-        "leechers" => &settings.groups.leechers.upload,
-        _ => settings
-            .groups
-            .user_defined
-            .get(group)
-            .map_or(&settings.groups.default.upload, |g| &g.upload),
+        "default" | "privileged" => &groups.default,
+        "leechers" => &groups.leechers,
+        _ => groups.custom.get(group).unwrap_or(&groups.default),
     }
+}
+
+fn fifo(group: &GroupConfig) -> bool {
+    group.strategy == QueueStrategy::FirstInFirstOut
+}
+
+/// Per-user limit: the group's own when set, else the global one; 0 is unlimited.
+#[derive(Default, PartialEq)]
+struct Limits {
+    files: Option<u32>,
+    megabytes: Option<u32>,
+    failures: Option<u32>,
+}
+
+fn limit(own: u32, global: u32) -> Option<u32> {
+    [own, global].into_iter().find(|value| *value != 0)
 }
 
 struct Pending {
@@ -78,7 +89,7 @@ impl UploadQueue {
         }
     }
 
-    pub(super) fn dispatch(&mut self, users: &UserService, cfg: &TransfersOptions, slots: u32) {
+    pub(super) fn dispatch(&mut self, users: &UserService, cfg: &Config, slots: u32) {
         let slots = slots as usize;
         while self.running.len() < slots {
             let mut running_groups = HashMap::<&str, usize>::new();
@@ -105,8 +116,11 @@ impl UploadQueue {
                         "privileged" => (0, slots, true),
                         _ => (
                             options.priority.max(1),
-                            options.slots.max(0) as usize,
-                            options.strategy.eq_ignore_ascii_case("firstinfirstout"),
+                            match options.slots {
+                                0 => slots,
+                                group_slots => group_slots as usize,
+                            },
+                            fifo(options),
                         ),
                     };
                     if running_groups.get(group.as_str()).copied().unwrap_or(0) >= group_slots {
@@ -137,7 +151,7 @@ impl UploadQueue {
     pub(super) fn position(
         &self,
         users: &UserService,
-        cfg: &TransfersOptions,
+        cfg: &Config,
         username: &str,
         filename: &str,
     ) -> Option<u32> {
@@ -147,35 +161,34 @@ impl UploadQueue {
             .position(|p| p.username == username && p.filename == filename)?;
         let group = users.group(username);
         let settings = group_options(cfg, &group);
-        let position =
-            if group == "privileged" || settings.strategy.eq_ignore_ascii_case("firstinfirstout") {
-                self.pending[..target]
-                    .iter()
-                    .filter(|p| users.group(&p.username) == group)
-                    .count()
-            } else {
-                let own = self.pending[..target]
-                    .iter()
-                    .filter(|p| p.username == username)
-                    .count();
-                let mut counts = HashMap::<&str, usize>::new();
-                for p in &self.pending {
-                    if p.username != username && users.group(&p.username) == group {
-                        *counts.entry(&p.username).or_default() += 1;
-                    }
+        let position = if group == "privileged" || fifo(settings) {
+            self.pending[..target]
+                .iter()
+                .filter(|p| users.group(&p.username) == group)
+                .count()
+        } else {
+            let own = self.pending[..target]
+                .iter()
+                .filter(|p| p.username == username)
+                .count();
+            let mut counts = HashMap::<&str, usize>::new();
+            for p in &self.pending {
+                if p.username != username && users.group(&p.username) == group {
+                    *counts.entry(&p.username).or_default() += 1;
                 }
-                own + counts
-                    .values()
-                    .map(|count| (*count).min(own + 1))
-                    .sum::<usize>()
-            };
+            }
+            own + counts
+                .values()
+                .map(|count| (*count).min(own + 1))
+                .sum::<usize>()
+        };
         Some(position.min(u32::MAX as usize) as u32)
     }
 
     pub(super) fn forecast(
         &self,
         users: &UserService,
-        cfg: &TransfersOptions,
+        cfg: &Config,
         global: u32,
         username: &str,
     ) -> (u32, u32, bool) {
@@ -188,7 +201,10 @@ impl UploadQueue {
         let slots = if group == "privileged" {
             global
         } else {
-            global.min(settings.slots.max(0) as usize)
+            match settings.slots {
+                0 => global,
+                group_slots => global.min(group_slots as usize),
+            }
         };
         let used = self
             .running
@@ -205,15 +221,14 @@ impl UploadQueue {
             .pending
             .iter()
             .filter(|p| users.group(&p.username) == group);
-        let position =
-            if group == "privileged" || settings.strategy.eq_ignore_ascii_case("firstinfirstout") {
-                waiting.count()
-            } else {
-                waiting
-                    .map(|p| p.username.as_str())
-                    .collect::<HashSet<_>>()
-                    .len()
-            };
+        let position = if group == "privileged" || fifo(settings) {
+            waiting.count()
+        } else {
+            waiting
+                .map(|p| p.username.as_str())
+                .collect::<HashSet<_>>()
+                .len()
+        };
         (slots as u32, position.min(u32::MAX as usize) as u32, false)
     }
 
@@ -263,7 +278,7 @@ impl UploadHistory {
     pub(super) fn check<'a>(
         &self,
         active: impl Iterator<Item = &'a Transfer>,
-        cfg: &TransfersOptions,
+        cfg: &Config,
         group: &str,
         username: &str,
         size: u64,
@@ -271,9 +286,13 @@ impl UploadHistory {
         if group == "privileged" {
             return Ok(());
         }
-        let limits = &group_options(cfg, group).limits;
-        let defaults = &cfg.upload.limits;
-        let queued = merge(&limits.queued, &defaults.queued);
+        let own = &group_options(cfg, group).limits;
+        let global = &cfg.uploads.limits;
+        let queued = Limits {
+            files: limit(own.queued_files, global.queued_files),
+            megabytes: limit(own.queued_megabytes, global.queued_megabytes),
+            failures: None,
+        };
         if queued.files.is_some() || queued.megabytes.is_some() {
             let mut files = 0;
             let mut bytes = 0_u64;
@@ -291,8 +310,24 @@ impl UploadHistory {
         }
         let now = Utc::now();
         for (days, period, limit) in [
-            (7, "this week", merge(&limits.weekly, &defaults.weekly)),
-            (1, "today", merge(&limits.daily, &defaults.daily)),
+            (
+                7,
+                "this week",
+                Limits {
+                    files: limit(own.weekly_files, global.weekly_files),
+                    megabytes: limit(own.weekly_megabytes, global.weekly_megabytes),
+                    failures: limit(own.weekly_failures, global.weekly_failures),
+                },
+            ),
+            (
+                1,
+                "today",
+                Limits {
+                    files: limit(own.daily_files, global.daily_files),
+                    megabytes: limit(own.daily_megabytes, global.daily_megabytes),
+                    failures: limit(own.daily_failures, global.daily_failures),
+                },
+            ),
         ] {
             if limit == Limits::default() {
                 continue;
@@ -330,20 +365,12 @@ impl UploadHistory {
     }
 }
 
-fn merge(group: &Limits, global: &Limits) -> Limits {
-    Limits {
-        files: group.files.or(global.files),
-        megabytes: group.megabytes.or(global.megabytes),
-        failures: group.failures.or(global.failures),
-    }
-}
-
 fn exceeds(limit: &Limits, files: i64, bytes: u64, size: u64) -> (bool, bool) {
     (
         limit.files.is_some_and(|max| files + 1 > i64::from(max)),
         limit
             .megabytes
-            .is_some_and(|max| bytes.saturating_add(size) > max.max(0) as u64 * 1_000_000),
+            .is_some_and(|max| bytes.saturating_add(size) > u64::from(max) * 1_000_000),
     )
 }
 
@@ -357,7 +384,7 @@ impl Bandwidth {
     // for transfers that share the same group limit.
     pub(super) fn grant(
         &mut self,
-        cfg: &TransfersOptions,
+        cfg: &Config,
         group: Option<&str>,
         bytes: usize,
     ) -> (usize, Instant) {
@@ -383,18 +410,16 @@ impl Bandwidth {
     }
 }
 
-pub(super) fn has_group_speed_limit(cfg: &TransfersOptions) -> bool {
-    rate(cfg.groups.default.upload.speed_limit).is_some()
-        || rate(cfg.groups.leechers.upload.speed_limit).is_some()
-        || cfg
-            .groups
-            .user_defined
-            .values()
-            .any(|group| rate(group.upload.speed_limit).is_some())
+pub(super) fn has_group_speed_limit(cfg: &Config) -> bool {
+    let groups = &cfg.groups;
+    std::iter::once(&groups.default)
+        .chain([&groups.leechers])
+        .chain(groups.custom.values())
+        .any(|group| rate(group.speed_limit).is_some())
 }
 
-fn rate(kib: i32) -> Option<u64> {
-    (kib > 0 && kib != UNLIMITED).then(|| kib as u64 * 1024)
+fn rate(kib: u32) -> Option<u64> {
+    (kib > 0).then(|| u64::from(kib) * 1024)
 }
 
 #[cfg(test)]
@@ -406,9 +431,9 @@ mod tests {
 
     #[test]
     fn applies_group_and_global_quotas_except_to_privileged_users() {
-        let mut cfg = TransfersOptions::default();
-        cfg.upload.limits.daily.files = Some(1);
-        cfg.groups.default.upload.limits.queued.megabytes = Some(1);
+        let mut cfg = Config::default();
+        cfg.uploads.limits.daily_files = 1;
+        cfg.groups.default.limits.queued_megabytes = 1;
         let mut upload = new_transfer(
             TransferDirection::Upload,
             "peer",
@@ -437,8 +462,8 @@ mod tests {
 
     #[test]
     fn serializes_group_bandwidth_reservations() {
-        let mut cfg = TransfersOptions::default();
-        cfg.groups.default.upload.speed_limit = 10;
+        let mut cfg = Config::default();
+        cfg.groups.default.speed_limit = 10;
         let mut bandwidth = Bandwidth::default();
         let (first, ready) = bandwidth.grant(&cfg, Some("default"), 8_192);
         assert_eq!(first, 1_024);

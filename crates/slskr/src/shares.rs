@@ -20,7 +20,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use slskr_api::{
-    options::Options,
+    config::Config,
     shares::{Share, SharesByHost},
     users::FileAttributeType as NamedAttribute,
 };
@@ -47,22 +47,18 @@ const LOCAL: &str = "local";
 struct ScanOptions {
     directories: Vec<String>,
     filters: Vec<String>,
-    case_sensitive: bool,
 }
 
 impl ScanOptions {
-    fn new(options: &Options) -> Self {
+    fn new(options: &Config) -> Self {
         Self {
             directories: options.shares.directories.clone(),
-            filters: options.shares.filters.clone(),
-            case_sensitive: options.flags.case_sensitive_reg_ex,
+            filters: options.shares.exclude.clone(),
         }
     }
 
-    fn matches(&self, options: &Options) -> bool {
-        self.directories == options.shares.directories
-            && self.filters == options.shares.filters
-            && self.case_sensitive == options.flags.case_sensitive_reg_ex
+    fn matches(&self, options: &Config) -> bool {
+        self.directories == options.shares.directories && self.filters == options.shares.exclude
     }
 }
 
@@ -190,8 +186,7 @@ struct Inner {
 impl ShareService {
     pub fn new(core: &Core) -> Result<Self> {
         let options = core.options.get();
-        let cache_path =
-            (!options.flags.volatile).then(|| core.paths.data_dir.join("shares-cache.json"));
+        let cache_path = Some(core.paths.db_dir.join("shares-cache.json"));
         let snapshot = cache_path.as_deref().and_then(|path| {
             remove_partial(path);
             let result = File::open(path)
@@ -257,8 +252,7 @@ impl ShareService {
                     },
                     _ = retention.tick() => {
                         let options = service.0.core.options.get();
-                        if options.shares.cache.retention.is_some_and(|minutes| minutes > 0)
-                            && service.needs_scan(&options)
+                        if options.shares.rescan_interval.is_some() && service.needs_scan(&options)
                         {
                             service.launch_scan(service.0.core.shutdown.child_token());
                         }
@@ -266,21 +260,18 @@ impl ShareService {
                 }
             }
         });
-        if !startup.flags.no_share_scan
-            && (startup.flags.force_share_scan || self.needs_scan(&startup))
-        {
+        if self.needs_scan(&startup) {
             self.launch_scan(core.shutdown.child_token());
         }
     }
 
-    fn needs_scan(&self, options: &Options) -> bool {
+    fn needs_scan(&self, options: &Config) -> bool {
         self.snapshot_for(options).is_none_or(|snapshot| {
-            options.shares.cache.retention.is_some_and(|minutes| {
-                minutes > 0
-                    && Utc::now()
-                        .signed_duration_since(snapshot.scanned_at)
-                        .num_minutes()
-                        >= i64::from(minutes)
+            options.shares.rescan_interval.is_some_and(|interval| {
+                Utc::now()
+                    .signed_duration_since(snapshot.scanned_at)
+                    .to_std()
+                    .is_ok_and(|age| age >= interval)
             })
         })
     }
@@ -431,7 +422,7 @@ impl ShareService {
         })
     }
 
-    fn snapshot_for(&self, options: &Options) -> Option<Arc<Snapshot>> {
+    fn snapshot_for(&self, options: &Config) -> Option<Arc<Snapshot>> {
         self.0
             .snapshot
             .read()
@@ -589,7 +580,7 @@ fn state_count(n: u32) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-fn local_shares(options: &Options, snapshot: Option<&Snapshot>) -> Vec<Share> {
+fn local_shares(options: &Config, snapshot: Option<&Snapshot>) -> Vec<Share> {
     let mut specs: Vec<_> = scan::specs(&options.shares.directories).collect();
     specs.sort_by_key(|spec| std::cmp::Reverse(spec.local.as_os_str().len()));
     specs
@@ -644,6 +635,23 @@ fn remove_partial(path: &Path) {
     {
         tracing::warn!(%error, path = %partial.display(), "unable to remove incomplete share cache");
     }
+}
+
+/// Checks share specifications without touching the filesystem: valid aliases, absolute
+/// paths and no duplicate entries or aliases.
+pub(crate) fn validate_directories(directories: &[String]) -> Result<()> {
+    let mut raw = std::collections::HashSet::new();
+    let mut aliases = std::collections::HashSet::new();
+    for spec in directories.iter().map(|spec| scan::ShareSpec::parse(spec)) {
+        ensure!(raw.insert(spec.raw), "duplicate entry {:?}", spec.raw);
+        spec.validate()?;
+        ensure!(
+            aliases.insert(spec.alias),
+            "duplicate share alias {:?}",
+            spec.alias
+        );
+    }
+    Ok(())
 }
 
 fn remote_root(path: &str) -> &str {
@@ -781,7 +789,7 @@ mod tests {
         use crate::{
             app::{Hubs, Paths},
             auth::{Auth, AuthConfig},
-            config::OptionsStore,
+            config::{ConfigStore, Overrides, Sources},
             signalr::Hub,
             state::StateStore,
         };
@@ -791,15 +799,11 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("first.txt"), b"local").unwrap();
         fs::write(root.join("second.txt"), b"other").unwrap();
-        let config_file = temp.path().join("slskd.yml");
-        let options = OptionsStore::load(temp.path(), config_file.clone(), Default::default())
-            .await
-            .unwrap();
-        options.patch(|options| {
-            options.flags.volatile = false;
-            options.shares.directories = vec![format!("[music]{}", root.display())];
-            options.shares.filters.clear();
-        });
+        let config_file = temp.path().join("slskr.toml");
+        let mut config = slskr_api::config::Config::default();
+        config.shares.directories = vec![format!("[music]{}", root.display())];
+        let sources = Sources::new(temp.path().into(), Vec::new(), Overrides::default()).unwrap();
+        let options = ConfigStore::from_config(config_file.clone(), sources, config);
         let hubs = Hubs {
             application: Hub::new("application"),
             logs: Hub::new("logs"),
@@ -808,8 +812,8 @@ mod tests {
         };
         let core = Core {
             paths: Paths {
-                app_dir: temp.path().into(),
-                data_dir: temp.path().join("data"),
+                data_dir: temp.path().into(),
+                db_dir: temp.path().join("db"),
                 config_file,
                 logs_dir: temp.path().join("logs"),
                 content_path: None,
@@ -866,7 +870,6 @@ mod tests {
             ScanOptions {
                 directories: vec![format!("[music]{}", root.display())],
                 filters: Vec::new(),
-                case_sensitive: false,
             },
             &CancellationToken::new(),
             |_, _| {},

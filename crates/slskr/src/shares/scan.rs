@@ -25,7 +25,7 @@ pub(super) struct ShareSpec<'a> {
 }
 
 impl<'a> ShareSpec<'a> {
-    fn parse(raw: &'a str) -> Self {
+    pub(super) fn parse(raw: &'a str) -> Self {
         let raw = raw.trim_end_matches(['/', '\\']);
         let (excluded, body) = raw
             .strip_prefix(['-', '!'])
@@ -46,7 +46,7 @@ impl<'a> ShareSpec<'a> {
         format!("{:X}", Sha1::digest(self.alias.as_bytes()))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         ensure!(
             valid_remote_component(self.alias) && !self.alias.trim().is_empty(),
             "invalid share alias in {:?}",
@@ -95,7 +95,7 @@ pub(super) fn scan_roots(
     ensure!(!cancel.is_cancelled(), "share scan cancelled");
     let scanned_at = Utc::now();
     let filters = RegexSetBuilder::new(&options.filters)
-        .case_insensitive(!options.case_sensitive)
+        .case_insensitive(true)
         .build()
         .context("compiling share filters")?;
     let mut aliases = HashSet::new();
@@ -319,7 +319,6 @@ mod tests {
                     format!("!{}", root.join("private").display()),
                 ],
                 filters: vec![r"\.tmp$".into(), r"Filtered$".into()],
-                case_sensitive: false,
             },
             &CancellationToken::new(),
             |_, _| {},
@@ -351,7 +350,6 @@ mod tests {
                 ScanOptions {
                     directories: Vec::new(),
                     filters: Vec::new(),
-                    case_sensitive: false
                 },
                 &token,
                 |_, _| {}

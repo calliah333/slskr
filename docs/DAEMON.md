@@ -7,8 +7,8 @@ corresponding slskd area under `ref/slskd/src/slskd/<Area>`.
 src/main.rs           CLI entry (clap), calls slskr::run()
 src/lib.rs            module declarations, pub async fn run(cli) (bootstrap)
 src/app.rs            AppState / Core / Services / Hubs / Paths (contract, already written)
-src/bootstrap.rs      App::build + run(): load options, build core + services, bind HTTP, wire hubs
-src/config.rs         OptionsStore: YAML (snake_case) <-> Options (camelCase), env (SLSKD_*), CLI overrides, file watch
+src/bootstrap.rs      CLI (--data-dir, --config, --no-connect), App::build + run(): load config, build core + services, bind HTTP, wire hubs
+src/config.rs         ConfigStore: slskr.toml <-> slskr_api::config::Config, env (SLSKR_*), CLI overrides, validation, save, file watch
 src/state.rs          StateStore: application State, broadcasts "state" on the application hub
 src/db.rs             Database: sqlite wrapper with migrations
 src/http.rs           ApiError, router assembly helpers, static file serving + SPA fallback, urlBase
@@ -27,16 +27,53 @@ src/messaging/        MessagingService (conversations, rooms) + /conversations, 
 
 ## Shared contracts
 
-### `config::OptionsStore` (Clone)
+### `config::ConfigStore` (Clone)
 ```rust
-pub fn get(&self) -> Arc<Options>;                     // slskr_api::options::Options
-pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Arc<Options>>;
-pub fn debug_view(&self) -> String;                    // for /options/debug
-pub async fn apply_yaml(&self, yaml: &str) -> Result<(), String>; // validate + write config file + reload
-pub fn read_yaml(&self) -> std::io::Result<String>;
-pub fn validate_yaml(yaml: &str) -> Option<String>;    // None = valid, Some(error)
-pub fn patch(&self, f: impl FnOnce(&mut Options));     // runtime-only overlay (remote_configuration PATCH)
+pub fn get(&self) -> Arc<Config>;                      // slskr_api::config::Config, current
+pub fn startup(&self) -> &Config;                      // as loaded at process start
+pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Arc<Config>>;
+pub fn read_toml(&self) -> std::io::Result<String>;    // file text, "" when absent
+pub fn validate_toml(&self, text: &str) -> Option<String>;          // None = valid
+pub async fn apply_toml(&self, text: &str) -> Result<(), String>;   // validate + write + reload
 ```
+Sources, lowest precedence first: `Config::default()`, `slskr.toml` (in `--data-dir`, or
+`--config`), `SLSKR_<SECTION>_<KEY>` environment variables, then CLI flags (`--no-connect`
+sets `soulseek.connect = false`). Environment names are matched against the serialized
+defaults, so keys containing `_` and nested tables (`SLSKR_UPLOADS_LIMITS_QUEUED_FILES`)
+need no extra separator; values are typed like the default (booleans, integers,
+comma-separated lists, strings). `[[web.api_keys]]` and user-defined `[groups.<name>]` are
+file-only. `SLSKR_DATA_DIR`, `SLSKR_CONFIG` and `SLSKR_CONTENT_PATH` are process settings,
+not keys; other `SLSKR_*` names outside the configuration sections are ignored, while an
+unknown key inside a section is an error.
+
+Every section is `#[serde(default, deny_unknown_fields)]`. Loading normalizes `web.url_base`
+(`/` or `/prefix`) and `metrics.path`, resolves relative paths (`downloads.*directory`,
+`soulseek.picture`, `shares.directories`) against the data directory, then validates;
+errors name the key (`web.api_keys[0].key must be between 16 and 255 characters`). A missing
+file means defaults; nothing is written until the UI saves. `apply_toml` refuses blank
+documents, resolves the full layer stack before writing, keeps the previous file as
+`slskr.toml.bak`, and replaces the file atomically (temp file + rename, mode 0600). The text
+is written as given, so comments survive. The file is polled every second; a valid change is
+published to subscribers, an invalid one is logged and ignored.
+
+`config::restart_required(startup, current)` drives `State.pending_restart`: `web.listen`,
+`web.url_base`, `web.auth`, `web.log_requests`, `soulseek.connect`, `uploads.slots`,
+`downloads.slots`, `search.incoming_concurrency`, `[logging]` and `[metrics]` apply only on
+restart. Everything else is read live or applied on change: web credentials and API keys
+(`Auth::update`), Soulseek listener, proxy, distributed network and speed limits
+(`ClientOptionsPatch`, reconnecting when required), Soulseek credentials and server
+(`pending_reconnect`), shares (rescan), groups, blacklist, limits, retry policy, ignored
+searches and retention.
+
+### Data directory
+```
+slskr.toml          configuration (optional)
+db/                 events.db, transfers.db, search.db, messaging.db, shares-cache.json
+logs/               slskr-YYYYMMDD.log (pruned by retention.logs)
+downloads/          default downloads.directory
+incomplete/         default downloads.incomplete_directory
+```
+
 ### `state::StateStore` (Clone)
 ```rust
 pub fn get(&self) -> State;                            // slskr_api::application::State
@@ -45,7 +82,7 @@ pub fn subscribe(&self) -> tokio::sync::watch::Receiver<State>;
 ```
 ### `db::Database` (Clone)
 ```rust
-pub fn open(path: &Path, migrations: &[&str]) -> anyhow::Result<Self>; // path ":memory:" when flags.volatile
+pub fn open(path: &Path, migrations: &[&str]) -> anyhow::Result<Self>; // path ":memory:" in tests
 pub async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
     where F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static, T: Send + 'static; // spawn_blocking
 ```
@@ -119,7 +156,7 @@ Shares routes: `GET /shares`, `/shares/{id}`, `/shares/contents`, and
 `/shares/{id}/contents`. `PUT /shares` starts a scan and `DELETE /shares` cancels it;
 both require read/write access. `ShareService::scan(&self, cancel: CancellationToken)`
 walks configured non-excluded roots without following symlinks,
-builds a replacement snapshot off-lock, persists `data/shares-cache.json` by rename,
+builds a replacement snapshot off-lock, persists `db/shares-cache.json` by rename,
 then publishes the snapshot and updates `State.shares`. Failed/cancelled scans leave
 the previous snapshot intact. Remote paths are normalized and reject traversal;
 resolution canonicalizes both candidate and share root before returning a local path.

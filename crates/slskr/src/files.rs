@@ -15,8 +15,8 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use slskr_api::{
+    config::Config,
     files::{FilesystemDirectory, FilesystemFile},
-    options::Options,
 };
 
 use crate::{
@@ -72,7 +72,7 @@ async fn download_root(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<FilesystemDirectory>> {
     list(
-        state.options.get().directories.downloads.as_str(),
+        state.options.get().downloads.directory.as_str(),
         None,
         q.recursive,
     )
@@ -83,7 +83,7 @@ async fn incomplete_root(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<FilesystemDirectory>> {
     list(
-        state.options.get().directories.incomplete.as_str(),
+        state.options.get().downloads.incomplete_directory.as_str(),
         None,
         q.recursive,
     )
@@ -95,7 +95,7 @@ async fn download_subdir(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<FilesystemDirectory>> {
     list(
-        state.options.get().directories.downloads.as_str(),
+        state.options.get().downloads.directory.as_str(),
         Some(&path),
         q.recursive,
     )
@@ -107,7 +107,7 @@ async fn incomplete_subdir(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<FilesystemDirectory>> {
     list(
-        state.options.get().directories.incomplete.as_str(),
+        state.options.get().downloads.incomplete_directory.as_str(),
         Some(&path),
         q.recursive,
     )
@@ -141,11 +141,11 @@ async fn delete_incomplete_file(
     remove(&state.options.get(), false, true, &path)
 }
 
-fn root_path(options: &Options, downloads: bool) -> PathBuf {
+fn root_path(options: &Config, downloads: bool) -> PathBuf {
     PathBuf::from(if downloads {
-        options.directories.downloads.as_str()
+        options.downloads.directory.as_str()
     } else {
-        options.directories.incomplete.as_str()
+        options.downloads.incomplete_directory.as_str()
     })
 }
 
@@ -284,14 +284,11 @@ fn date(value: io::Result<std::time::SystemTime>) -> DateTime<Utc> {
 }
 
 fn remove(
-    options: &Options,
+    options: &Config,
     downloads: bool,
     is_file: bool,
     encoded: &str,
 ) -> ApiResult<StatusCode> {
-    if !options.remote_file_management {
-        return Ok(StatusCode::FORBIDDEN);
-    }
     let relative = decoded_path(Some(encoded))?;
     if relative.as_os_str().is_empty() {
         return Err(ApiError::Forbidden(

@@ -1,13 +1,14 @@
-//! slskd-compatible API models shared between the daemon and the web UI.
+//! API models shared between the daemon and the web UI.
 //!
-//! JSON shapes mirror slskd exactly (camelCase fields, slskd enum string formats).
+//! JSON shapes mirror slskd (camelCase fields, slskd enum string formats), except
+//! [`config`], which mirrors `slskr.toml` (snake_case).
 
 pub mod application;
+pub mod config;
 pub mod conversations;
 pub mod events;
 pub mod files;
 pub mod logs;
-pub mod options;
 pub mod rooms;
 pub mod search;
 pub mod server;

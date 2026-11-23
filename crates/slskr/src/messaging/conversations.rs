@@ -1,7 +1,5 @@
 //! Persistent private conversations and message delivery acknowledgements.
 
-use std::path::Path;
-
 use axum::{
     Json, Router,
     extract::{Path as RoutePath, Query, State},
@@ -56,11 +54,7 @@ pub struct ConversationService {
 
 impl ConversationService {
     pub fn new(core: &Core, events: &EventService) -> anyhow::Result<Self> {
-        let db = if core.options.get().flags.volatile {
-            Database::open(Path::new(":memory:"), MIGRATIONS)?
-        } else {
-            Database::open(&core.paths.data_dir.join("messaging.db"), MIGRATIONS)?
-        };
+        let db = Database::open(&core.paths.db_dir.join("messaging.db"), MIGRATIONS)?;
         Ok(Self {
             db,
             client: core.client.clone(),
@@ -545,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn acknowledging_is_independent_of_history_limit_and_only_marks_selected_rows() {
-        let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
+        let db = Database::open(std::path::Path::new(":memory:"), MIGRATIONS).unwrap();
         db.call(|db| {
             activate(db, "alice")?;
             assert_eq!(unacknowledged_messages(db, "missing", None)?, None);
@@ -576,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_during_ack_keeps_message_unread_and_conversation_open() {
-        let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
+        let db = Database::open(std::path::Path::new(":memory:"), MIGRATIONS).unwrap();
         db.call(|db| {
             activate(db, "alice")?;
             let upsert = |db: &Connection| {
