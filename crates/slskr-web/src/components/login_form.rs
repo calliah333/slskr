@@ -1,5 +1,5 @@
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
-use slskr_api::session::{LoginRequest, Session};
+use slskr_types::session::{LoginRequest, Session};
 
 use crate::services::api;
 
@@ -21,8 +21,8 @@ pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
             return;
         }
         let request = LoginRequest {
-            username: Some(username.get_untracked()),
-            password: Some(password.get_untracked()),
+            username: username.get_untracked(),
+            password: password.get_untracked(),
         };
         spawn_local_scoped_with_cancellation(async move {
             // The daemon sets an HttpOnly session cookie; the app then re-reads the session.
@@ -32,7 +32,7 @@ pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
                     let message = if err.status == 401 {
                         "Invalid username or password.".into()
                     } else {
-                        serde_json::from_str::<String>(&err.message).unwrap_or(err.message)
+                        err.message
                     };
                     error.set(Some(message));
                     pending.set(false);

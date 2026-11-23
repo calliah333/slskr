@@ -1,4 +1,4 @@
-//! `/api/v0/settings`: the merged configuration as the web UI edits it.
+//! `/api/settings`: the merged configuration as the web UI edits it.
 //!
 //! Settings come from layers, lowest precedence first: built-in defaults, the app-managed
 //! `settings.json` (written from this API), `slskr.toml`, `SLSKR_*` environment variables and
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::config::{ApiKeyRole, Config};
 
-/// `GET`/`PATCH /api/v0/settings` response.
+/// `GET`/`PATCH /api/settings` response.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// The merged configuration without secrets and API keys (see [`Config::public_json`]).
@@ -44,7 +44,7 @@ pub struct ApiKeyInfo {
     pub pinned: bool,
 }
 
-/// `POST /api/v0/settings/api-keys` request.
+/// `POST /api/api-keys` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateApiKey {
@@ -56,7 +56,7 @@ pub struct CreateApiKey {
     pub allow: Vec<String>,
 }
 
-/// `POST /api/v0/settings/api-keys` response: the only time the key is shown.
+/// `POST /api/api-keys` response: the only time the key is shown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatedApiKey {
     pub name: String,

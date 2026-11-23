@@ -1,7 +1,7 @@
 //! `settings.json`: the settings changed from the web UI.
 //!
 //! The file holds only what was changed (a sparse tree shaped like
-//! [`slskr_api::config::Config`]) plus the web password hash and the digests of API keys
+//! [`slskr_types::config::Config`]) plus the web password hash and the digests of API keys
 //! created from the UI. It is written by the daemon alone, atomically with mode 0600. Unlike
 //! `slskr.toml` it is read leniently: an unreadable file, unknown keys and invalid values are
 //! logged and ignored, so the app-managed layer can never prevent startup.
@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use slskr_api::config::{Config, ManagedApiKey};
+use slskr_types::config::{Config, ManagedApiKey};
 use toml::Table;
 
 /// Settings store file name inside the data directory.

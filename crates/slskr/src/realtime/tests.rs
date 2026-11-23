@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
-use slskr_api::{
+use slskr_types::{
     logs::LogRecord,
     realtime::{CLOSE_TIMEOUT, CLOSE_TOO_SLOW, CLOSE_UNAUTHORIZED, Event, Topic},
 };
@@ -201,7 +201,7 @@ async fn close_code(client: &mut Client) -> Option<u16> {
     }
 }
 
-fn state(event: Event) -> slskr_api::application::State {
+fn state(event: Event) -> slskr_types::application::State {
     match event {
         Event::State(state) => *state,
         other => panic!("expected state, got {other:?}"),

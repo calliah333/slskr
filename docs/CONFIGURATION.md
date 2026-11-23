@@ -11,7 +11,7 @@ Settings are merged from these layers, lowest precedence first:
 
 1. built-in defaults (the tables below);
 2. `<data_dir>/settings.json`, written by the daemon when settings are changed from the
-   UI or `PATCH /api/v0/settings`;
+   UI or `PATCH /api/settings`;
 3. `slskr.toml` in the data directory (or the file given with `--config`);
 4. `SLSKR_<SECTION>_<KEY>` environment variables;
 5. command-line flags (`--no-connect` sets `soulseek.connect = false`).
@@ -74,7 +74,7 @@ slskr serves plain HTTP. Terminate TLS at a reverse proxy, have it send
 original `Host` header (browser requests that change state or open a WebSocket are refused
 when their `Origin` differs from `Host`).
 
-API keys are created in the UI (`POST /api/v0/settings/api-keys`), which shows the key
+API keys are created in the UI (`POST /api/api-keys`), which shows the key
 once and stores only its SHA-256, or written in `slskr.toml` (pinned; they can not be
 deleted from the UI):
 
@@ -216,16 +216,19 @@ and `RUST_LOG`.
 
 All routes require an administrator signed in to the web UI (API keys are refused).
 
-- `GET /api/v0/settings` returns `{values, pinned, secrets_set, pending_restart,
+- `GET /api/settings` returns `{values, pinned, secrets_set, pending_restart,
   api_keys}`: the merged configuration without secrets or API keys, the pinned dotted
   keys, the secrets that have a value, whether a restart is pending, and the API keys as
   `{name, role, allow, pinned}`.
-- `PATCH /api/v0/settings` takes any subset of `values`, e.g.
+- `PATCH /api/settings` takes any subset of `values`, e.g.
   `{"uploads": {"slots": 5}}`, and returns the same body as `GET`. Objects are merged,
   other values replace; `null` resets a key. An absent secret is unchanged;
   `web.password` takes the new password in plain text. A pinned key answers 409, an
   invalid value 400 with a message naming the key.
-- `DELETE /api/v0/settings/{key}` resets one dotted key or section to its default.
-- `POST /api/v0/settings/api-keys` with `{name, role, allow}` creates a key and returns
+- `DELETE /api/settings/{key}` resets one dotted key or section to its default.
+- `GET /api/api-keys` lists the keys as `{name, role, allow, pinned}`.
+- `POST /api/api-keys` with `{name, role, allow}` creates a key and answers 201 with
   `{name, role, allow, key}`; the key is not shown again.
-  `DELETE /api/v0/settings/api-keys/{name}` deletes it.
+  `DELETE /api/api-keys/{name}` deletes it.
+
+Errors are `{"error": "<message>"}`; see [the API reference](API.md) for every route.

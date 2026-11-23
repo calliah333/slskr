@@ -17,16 +17,12 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
-use serde_json::json;
-use slskr_api::{
-    application::{DistributedNetworkState, ServerConnectionWatchdogState, UserStatisticsState},
+use slskr_types::{
+    application::{ConnectionWatchdogState, DistributedNetworkState, UserStatisticsState},
     config::Config,
-    events::{
-        Event, EventHeader, EventType, SoulseekClientConnectedEvent,
-        SoulseekClientDisconnectedEvent,
-    },
+    events::{EventData, ServerDisconnected},
     realtime::{Event as LiveEvent, Topic},
-    server::{ServerState, SoulseekClientStates},
+    server::{ConnectionState, ServerState},
 };
 use soulseek::{ClientState, DistributedNetworkInfo, Event as ClientEvent};
 use tokio::sync::{broadcast, watch};
@@ -108,7 +104,7 @@ impl AppInner {
         }
         let search_filters = RwLock::new(compile_search_filters(startup));
         core.state.update(|state| {
-            state.server = ServerState::new(None, None, SoulseekClientStates::DISCONNECTED);
+            state.server = ServerState::default();
             state.connection_watchdog.is_enabled = enabled;
         });
         Self {
@@ -240,7 +236,7 @@ impl AppState {
             let attempted = *desired.borrow_and_update();
             let enabled = attempted.enabled && self.client.state() == ClientState::DISCONNECTED;
             let before = states.borrow_and_update().connection_watchdog.clone();
-            let watchdog = ServerConnectionWatchdogState {
+            let watchdog = ConnectionWatchdogState {
                 is_enabled: enabled,
                 is_attempting_connection: enabled,
                 next_attempt_at: enabled.then(|| Utc::now() + delay),
@@ -344,11 +340,7 @@ impl AppState {
                 }
                 Ok(ClientEvent::Connected) => {
                     tracing::info!("Connected to the Soulseek server");
-                    self.services.events.raise(Event::SoulseekClientConnected(
-                        SoulseekClientConnectedEvent {
-                            header: event_header(EventType::SoulseekClientConnected),
-                        },
-                    ));
+                    self.services.events.raise(EventData::ServerConnected);
                 }
                 Ok(ClientEvent::LoggedIn) => {
                     self.state.update(|state| state.pending_reconnect = false);
@@ -358,16 +350,10 @@ impl AppState {
                     self.state.update(|state| state.pending_reconnect = false);
                     self.services
                         .events
-                        .raise(Event::SoulseekClientDisconnected(
-                            SoulseekClientDisconnectedEvent {
-                                header: event_header(EventType::SoulseekClientDisconnected),
-                                message: Some(message),
-                                exception: error.map_or(
-                                    serde_json::Value::Null,
-                                    |error| json!({"message": error.to_string()}),
-                                ),
-                            },
-                        ));
+                        .raise(EventData::ServerDisconnected(ServerDisconnected {
+                            message: Some(message),
+                            error: error.map(|error| error.to_string()),
+                        }));
                 }
                 Ok(ClientEvent::DiagnosticGenerated { level, message }) => {
                     use soulseek::DiagnosticLevel::{Debug, Info, None, Trace, Warning};
@@ -391,21 +377,21 @@ impl AppState {
 
     fn update_server(&self, current: ClientState) {
         let disconnected = current == ClientState::DISCONNECTED;
-        let server = ServerState::new(
-            if disconnected {
+        let server = ServerState {
+            address: if disconnected {
                 None
             } else {
                 self.client.address()
             },
-            if disconnected {
+            endpoint: if disconnected {
                 None
             } else {
                 self.client
                     .ip_endpoint()
                     .map(|endpoint| endpoint.to_string())
             },
-            SoulseekClientStates(current.0),
-        );
+            state: connection_state(current),
+        };
         self.state.update(|state| {
             state.server = server;
             state.user.username = self.client.username();
@@ -453,17 +439,17 @@ impl AppState {
         if let Ok(seconds) = privileges {
             self.state.update(|state| {
                 state.user.privileges.is_privileged = seconds > 0;
-                state.user.privileges.privileges_remaining = seconds.try_into().unwrap_or(i32::MAX);
+                state.user.privileges.privileges_remaining = seconds;
             });
         }
     }
 
     fn update_statistics(&self, statistics: soulseek::UserStatistics) {
         let stats = UserStatisticsState {
-            average_speed: statistics.average_speed.try_into().unwrap_or(i32::MAX),
-            directory_count: statistics.directory_count.try_into().unwrap_or(i32::MAX),
-            file_count: statistics.file_count.try_into().unwrap_or(i32::MAX),
-            upload_count: statistics.upload_count.try_into().unwrap_or(i64::MAX),
+            average_speed: statistics.average_speed,
+            directory_count: statistics.directory_count,
+            file_count: statistics.file_count,
+            upload_count: statistics.upload_count,
         };
         self.upload_speed
             .store(statistics.average_speed, Ordering::Relaxed);
@@ -509,7 +495,7 @@ impl AppState {
             let restart = crate::config::restart_required(self.options.startup(), &current);
             self.state.update(|state| {
                 state.pending_reconnect |=
-                    reconnect || (state.server.is_connected && credentials_changed);
+                    reconnect || (state.server.state.is_connected() && credentials_changed);
                 state.pending_restart = restart;
             });
             self.bus.publish_with(Topic::Settings, || {
@@ -553,12 +539,20 @@ fn compile_search_filters(options: &Config) -> Vec<regex::Regex> {
         .collect()
 }
 
-fn event_header(kind: EventType) -> EventHeader {
-    EventHeader {
-        id: uuid::Uuid::new_v4().to_string(),
-        timestamp: Utc::now(),
-        kind,
-        version: 1,
+/// The API connection state of the client's state flags.
+pub(crate) fn connection_state(state: ClientState) -> ConnectionState {
+    if state.contains(ClientState::LOGGED_IN) {
+        ConnectionState::LoggedIn
+    } else if state.contains(ClientState::LOGGING_IN) {
+        ConnectionState::LoggingIn
+    } else if state.contains(ClientState::CONNECTED) {
+        ConnectionState::Connected
+    } else if state.contains(ClientState::CONNECTING) {
+        ConnectionState::Connecting
+    } else if state.contains(ClientState::DISCONNECTING) {
+        ConnectionState::Disconnecting
+    } else {
+        ConnectionState::Disconnected
     }
 }
 

@@ -22,7 +22,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use serde_json::Value as JsonValue;
-use slskr_api::{
+use slskr_types::{
     config::{ApiKeyRole, Config, LogLevel, ManagedApiKey, RESERVED_GROUPS},
     settings::{ApiKeyInfo, CreateApiKey, CreatedApiKey, Settings},
 };
@@ -294,7 +294,7 @@ impl ConfigStore {
         &self.0.settings_path
     }
 
-    /// The `GET /api/v0/settings` view of the current configuration.
+    /// The `GET /api/settings` view of the current configuration.
     pub async fn settings(&self) -> Settings {
         let layers = self.0.layers.lock().await;
         self.view(&layers, &self.get())
@@ -354,8 +354,7 @@ impl ConfigStore {
                 }
                 ("web.api_keys", _) => {
                     return Err(SettingsError::Invalid(
-                        "web.api_keys: create and delete API keys with /api/v0/settings/api-keys"
-                            .into(),
+                        "web.api_keys: create and delete API keys with /api/api-keys".into(),
                     ));
                 }
                 (_, JsonValue::Null) if known_key(&path) => {
@@ -398,7 +397,7 @@ impl ConfigStore {
             "web.password" => next.web_password_hash.clear(),
             "web.api_keys" => {
                 return Err(SettingsError::Invalid(
-                    "web.api_keys: delete API keys with /api/v0/settings/api-keys/{name}".into(),
+                    "web.api_keys: delete API keys with /api/api-keys/{name}".into(),
                 ));
             }
             _ => {

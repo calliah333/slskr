@@ -23,16 +23,13 @@ use std::{
 };
 
 use chrono::{DateTime, TimeDelta, Utc};
-use slskr_api::{
+use slskr_types::{
     config::{Config, DownloadsConfig, OnConflict},
-    events::{
-        DownloadDirectoryCompleteEvent, DownloadFileCompleteEvent, Event, EventHeader, EventType,
-        UploadFileCompleteEvent,
-    },
+    events::{DirectoryComplete, EventData, FileComplete},
     telemetry::{CompletedMetrics, CurrentMetrics},
     transfers::{
-        Batch, EnqueueDownloadBatchResponseFailure, EnqueueDownloadsResponse, QueueDownloadRequest,
-        Transfer, TransferDirection, TransferStates,
+        Batch, DownloadFile, EnqueueFailure, EnqueuedDownloads, Transfer, TransferDirection,
+        TransferState,
     },
 };
 use soulseek::{
@@ -53,8 +50,7 @@ use crate::{
 use queue::{Bandwidth, UploadHistory, UploadQueue};
 use store::Snapshot;
 
-const LOCAL_QUEUE: TransferStates = TransferStates::from_bits(2 | 2048);
-const REMOTE_QUEUE: TransferStates = TransferStates::from_bits(2 | 4096);
+pub(crate) use store::state_from_bits;
 
 #[derive(Clone)]
 pub struct TransferService(Arc<Inner>);
@@ -169,8 +165,7 @@ impl Runtime {
                 users.remove(&t.username);
             }
         }
-        if t.direction == TransferDirection::Upload && !t.state.contains(TransferStates::COMPLETED)
-        {
+        if t.direction == TransferDirection::Upload && !t.state.is_complete() {
             self.uploads.release(id);
         }
         done.cancel();
@@ -379,23 +374,23 @@ impl TransferService {
             };
             if is_queued(t.state) {
                 queued[index].insert(t.username.as_str());
-                direction.queued.files += 1.0;
-                direction.queued.bytes += t.size as f64;
+                direction.queued.files += 1;
+                direction.queued.bytes += t.size;
             } else if matches!(
                 t.state,
-                TransferStates::INITIALIZING | TransferStates::IN_PROGRESS
+                TransferState::Initializing | TransferState::InProgress
             ) {
                 in_progress[index].insert(t.username.as_str());
-                direction.in_progress.files += 1.0;
+                direction.in_progress.files += 1;
                 direction.in_progress.total_speed += t.average_speed;
             }
         }
         for (index, direction) in [(0, &mut metrics.downloads), (1, &mut metrics.uploads)] {
-            direction.queued.users = queued[index].len() as f64;
-            direction.in_progress.users = in_progress[index].len() as f64;
-            if direction.in_progress.files > 0.0 {
+            direction.queued.users = queued[index].len() as u64;
+            direction.in_progress.users = in_progress[index].len() as u64;
+            if direction.in_progress.files > 0 {
                 direction.in_progress.average_speed =
-                    direction.in_progress.total_speed / direction.in_progress.files;
+                    direction.in_progress.total_speed / direction.in_progress.files as f64;
             }
             direction.completed = runtime.completed[index].clone();
         }
@@ -452,22 +447,22 @@ impl TransferService {
     async fn enqueue_downloads(
         &self,
         username: String,
-        files: Vec<QueueDownloadRequest>,
+        files: Vec<DownloadFile>,
         context: DownloadContext,
-    ) -> anyhow::Result<EnqueueDownloadsResponse> {
+    ) -> anyhow::Result<EnqueuedDownloads> {
         self.ready().await?;
         let service = self.clone();
         tokio::spawn(async move {
             let context = Arc::new(context);
             let cancel = service.0.core.shutdown.child_token();
-            let mut response = EnqueueDownloadsResponse::default();
+            let mut response = EnqueuedDownloads::default();
             {
                 let mut runtime = service.runtime();
                 for file in files {
                     if runtime.has(TransferDirection::Download, &username, &file.filename) {
-                        response.failed.push(EnqueueDownloadBatchResponseFailure {
+                        response.failed.push(EnqueueFailure {
                             filename: file.filename,
-                            message: "Skipped: Already in progress".into(),
+                            error: "Skipped: Already in progress".into(),
                         });
                         continue;
                     }
@@ -700,7 +695,7 @@ impl TransferService {
         let t = &mut entry.transfer;
         t.attempts = t.attempts.saturating_add(1);
         t.next_attempt_at = None;
-        t.exception = None;
+        t.error = None;
         t.place_in_queue = None;
         t.started_at = None;
         t.average_speed = 0.0;
@@ -729,8 +724,8 @@ impl TransferService {
             .and_then(|delay| Utc::now().checked_add_signed(delay))
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
         t.next_attempt_at = Some(at);
-        t.state = LOCAL_QUEUE;
-        t.exception = Some(exception_text(error));
+        t.state = TransferState::QueuedLocally;
+        t.error = Some(exception_text(error));
         entry.dirty = true;
         Some(at)
     }
@@ -882,15 +877,15 @@ impl TransferService {
         let Some(entry) = runtime.active.get_mut(id) else {
             return;
         };
-        let state = TransferStates::from_bits(wire.state.0);
+        let state = state_from_bits(wire.state.0);
         let t = &mut entry.transfer;
         // A transport completion is not a daemon completion: downloads still
         // need to move the file, and failed attempts can be retried.
-        if !state.contains(TransferStates::COMPLETED) {
+        if !state.is_complete() {
             t.state = state;
         }
-        if (state == REMOTE_QUEUE
-            || t.direction == TransferDirection::Upload && state == LOCAL_QUEUE)
+        if (state == TransferState::QueuedRemotely
+            || t.direction == TransferDirection::Upload && state == TransferState::QueuedLocally)
             && t.enqueued_at.is_none()
         {
             t.enqueued_at = Some(Utc::now());
@@ -924,11 +919,11 @@ impl TransferService {
             }
             let t = &mut entry.transfer;
             let (disposition, reason) = match &result {
-                Ok(_) => (TransferStates::SUCCEEDED, None),
+                Ok(_) => (TransferState::Succeeded, None),
                 Err(error) => (failure_state(error), Some(exception_text(error))),
             };
-            t.state = TransferStates::COMPLETED | disposition;
-            t.exception = reason;
+            t.state = disposition;
+            t.error = reason;
             t.ended_at = Some(Utc::now());
             t.next_attempt_at = None;
             t.refresh_derived(Utc::now());
@@ -942,11 +937,11 @@ impl TransferService {
                     .dispatch(&self.0.users, &cfg, self.upload_slots(&cfg));
             }
             let completed = &mut runtime.completed[direction_index(transfer.direction)];
-            if disposition == TransferStates::SUCCEEDED {
-                completed.succeeded += 1.0;
-                completed.bytes += transfer.bytes_transferred as f64;
+            if disposition == TransferState::Succeeded {
+                completed.succeeded += 1;
+                completed.bytes += transfer.bytes_transferred;
             } else {
-                completed.failed += 1.0;
+                completed.failed += 1;
             }
             let directory = destination::remote_directory(&transfer.filename);
             let last = transfer.direction == TransferDirection::Download
@@ -954,7 +949,7 @@ impl TransferService {
                 && !runtime.active.values().any(|entry| {
                     let t = &entry.transfer;
                     t.direction == TransferDirection::Download
-                        && !t.state.contains(TransferStates::COMPLETED)
+                        && !t.state.is_complete()
                         && t.username == transfer.username
                         && destination::remote_directory(&t.filename) == directory
                 });
@@ -968,51 +963,34 @@ impl TransferService {
     }
 
     fn raise_completed(&self, transfer: Transfer, local: PathBuf, last: bool) {
-        let timestamp = transfer.ended_at.unwrap_or_else(Utc::now);
-        let header = |kind| EventHeader {
-            id: Uuid::new_v4().to_string(),
-            timestamp,
-            kind,
-            version: 1,
-        };
-        let value = serde_json::to_value(&transfer).unwrap_or_default();
         let local_filename = local.to_string_lossy().into_owned();
+        let complete = |transfer: Transfer| FileComplete {
+            local_filename,
+            remote_filename: transfer.filename.clone(),
+            transfer,
+        };
         match transfer.direction {
-            TransferDirection::Upload => {
-                self.0
-                    .events
-                    .raise(Event::UploadFileComplete(UploadFileCompleteEvent {
-                        header: header(EventType::UploadFileComplete),
-                        local_filename,
-                        remote_filename: transfer.filename,
-                        transfer: value,
-                    }))
-            }
+            TransferDirection::Upload => self
+                .0
+                .events
+                .raise(EventData::UploadFileComplete(complete(transfer))),
             TransferDirection::Download => {
+                let directory = last.then(|| DirectoryComplete {
+                    local_directory: local
+                        .parent()
+                        .unwrap_or(&local)
+                        .to_string_lossy()
+                        .into_owned(),
+                    remote_directory: destination::remote_directory(&transfer.filename).into(),
+                    username: transfer.username.clone(),
+                });
                 self.0
                     .events
-                    .raise(Event::DownloadFileComplete(DownloadFileCompleteEvent {
-                        header: header(EventType::DownloadFileComplete),
-                        local_filename,
-                        remote_filename: transfer.filename.clone(),
-                        transfer: value,
-                    }));
-                if last {
-                    self.0.events.raise(Event::DownloadDirectoryComplete(
-                        DownloadDirectoryCompleteEvent {
-                            header: header(EventType::DownloadDirectoryComplete),
-                            local_directory_name: local
-                                .parent()
-                                .unwrap_or(&local)
-                                .to_string_lossy()
-                                .into_owned(),
-                            remote_directory_name: destination::remote_directory(
-                                &transfer.filename,
-                            )
-                            .into(),
-                            username: Some(transfer.username),
-                        },
-                    ));
+                    .raise(EventData::DownloadFileComplete(complete(transfer)));
+                if let Some(directory) = directory {
+                    self.0
+                        .events
+                        .raise(EventData::DownloadDirectoryComplete(directory));
                 }
             }
         }
@@ -1030,7 +1008,7 @@ impl TransferService {
                     return None;
                 }
                 let transfer = &entry.transfer;
-                if transfer.state.contains(TransferStates::COMPLETED) {
+                if transfer.state.is_complete() {
                     finished.push(transfer.id.clone());
                 }
                 Some(Snapshot::new(transfer, entry.offset))
@@ -1105,8 +1083,8 @@ impl TransferService {
     async fn batch(&self, id: String) -> anyhow::Result<Option<Batch>> {
         self.ready().await?;
         let mut batch = store::batch(self.database(), id).await?;
-        if let Some(transfers) = batch.as_mut().and_then(|b| b.transfers.as_mut()) {
-            self.overlay(transfers);
+        if let Some(batch) = batch.as_mut() {
+            self.overlay(&mut batch.transfers);
         }
         Ok(batch)
     }
@@ -1132,8 +1110,7 @@ impl TransferService {
                     entry.done.clone()
                 })
         };
-        // Upstream's TryCancel and Remove report misses as `false`, which the
-        // controller ignores: an unknown id is still `204 No Content`.
+        // A transfer that is no longer active only needs the (optional) removal.
         if let Some(done) = active {
             done.cancelled().await;
         }
@@ -1154,7 +1131,7 @@ impl TransferService {
             .runtime()
             .active
             .get(&t.id)
-            .filter(|entry| !entry.transfer.state.contains(TransferStates::COMPLETED))
+            .filter(|entry| !entry.transfer.state.is_complete())
             .map(|entry| (entry.transfer.attempts, entry.cancel.clone()))
             .ok_or_else(inactive)?;
         let pos = self
@@ -1170,8 +1147,7 @@ impl TransferService {
                 .active
                 .get_mut(&t.id)
                 .filter(|entry| {
-                    entry.transfer.attempts == attempt
-                        && !entry.transfer.state.contains(TransferStates::COMPLETED)
+                    entry.transfer.attempts == attempt && !entry.transfer.state.is_complete()
                 })
                 .ok_or_else(inactive)?;
             entry.transfer.place_in_queue = Some(pos);
@@ -1213,22 +1189,22 @@ fn new_transfer(
         direction,
         filename,
         size,
-        state: LOCAL_QUEUE,
+        state: TransferState::QueuedLocally,
         requested_at: Utc::now(),
         enqueued_at: None,
         started_at: None,
         ended_at: None,
         place_in_queue: None,
-        exception: None,
+        error: None,
         attempts: 0,
         next_attempt_at: None,
         removed: false,
         bytes_transferred: 0,
         average_speed: 0.0,
-        bytes_remaining: size as i64,
+        bytes_remaining: size,
         percent_complete: 0.0,
-        elapsed_time: None,
-        remaining_time: None,
+        elapsed_ms: None,
+        remaining_ms: None,
     }
 }
 
@@ -1239,8 +1215,8 @@ fn direction_index(direction: TransferDirection) -> usize {
     }
 }
 
-fn is_queued(state: TransferStates) -> bool {
-    state == TransferStates::REQUESTED || state.contains(TransferStates::QUEUED)
+fn is_queued(state: TransferState) -> bool {
+    state == TransferState::Requested || state.is_queued()
 }
 
 fn task_error(error: tokio::task::JoinError) -> Error {
@@ -1264,13 +1240,13 @@ fn retryable(error: &Error) -> bool {
     )
 }
 
-fn failure_state(error: &Error) -> TransferStates {
+fn failure_state(error: &Error) -> TransferState {
     match error {
-        Error::Cancelled => TransferStates::CANCELLED,
-        Error::Timeout(_) | Error::NoResponse(_) => TransferStates::TIMED_OUT,
-        Error::TransferRejected(_) => TransferStates::REJECTED,
-        Error::TransferSizeMismatch { .. } => TransferStates::ABORTED,
-        _ => TransferStates::ERRORED,
+        Error::Cancelled => TransferState::Cancelled,
+        Error::Timeout(_) | Error::NoResponse(_) => TransferState::TimedOut,
+        Error::TransferRejected(_) => TransferState::Rejected,
+        Error::TransferSizeMismatch { .. } => TransferState::Aborted,
+        _ => TransferState::Errored,
     }
 }
 
@@ -1305,7 +1281,7 @@ mod tests {
         let mut runtime = Runtime::default();
         let mut first = upload(file);
         first.ended_at = Some(Utc::now());
-        first.state = TransferStates::COMPLETED | TransferStates::SUCCEEDED;
+        first.state = TransferState::Succeeded;
         let first_id = first.id.clone();
         runtime.insert(first, CancellationToken::new(), None, true);
         assert!(runtime.has(TransferDirection::Upload, "peer", file));

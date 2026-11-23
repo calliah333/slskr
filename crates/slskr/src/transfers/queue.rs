@@ -4,9 +4,9 @@ use std::{
 };
 
 use chrono::{DateTime, TimeDelta, Utc};
-use slskr_api::{
+use slskr_types::{
     config::{Config, GroupConfig, QueueStrategy},
-    transfers::{Transfer, TransferStates},
+    transfers::{Transfer, TransferState},
 };
 use tokio::{sync::oneshot, time::Instant};
 
@@ -262,7 +262,7 @@ impl UploadHistory {
                 .push(Completion {
                     started,
                     size: transfer.size,
-                    success: transfer.state.contains(TransferStates::SUCCEEDED),
+                    success: transfer.state == TransferState::Succeeded,
                 });
         }
     }
@@ -424,7 +424,7 @@ fn rate(kib: u32) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use slskr_api::transfers::TransferDirection;
+    use slskr_types::transfers::TransferDirection;
 
     use super::*;
     use crate::transfers::new_transfer;
@@ -447,7 +447,7 @@ mod tests {
             Err("Too many megabytes".into())
         );
         upload.started_at = Some(Utc::now());
-        upload.state = TransferStates::COMPLETED | TransferStates::SUCCEEDED;
+        upload.state = TransferState::Succeeded;
         history.record(&upload);
         assert_eq!(
             history.check(std::iter::empty(), &cfg, "default", "peer", 1),

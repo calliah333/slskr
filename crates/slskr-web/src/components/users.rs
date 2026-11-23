@@ -7,7 +7,7 @@ use leptos_router::{
     components::A,
     hooks::{use_navigate, use_url},
 };
-use slskr_api::users::{Endpoint, Info, Status, UserPresence};
+use slskr_types::users::{Endpoint, Info, Status, UserPresence};
 
 #[component]
 pub fn Users() -> impl IntoView {
@@ -88,7 +88,7 @@ pub fn Users() -> impl IntoView {
                 let name = username.get();
                 let href = format!("{}/browse?username={}", config::url_base().trim_end_matches('/'), util::encode_uri_component(&name));
                 view! { <section class="ui raised segment users-user"><div class="ui items"><article class="item">
-                    {if info.has_picture { view! { <img class="ui small image" alt="User picture" src=format!("data:image;base64,{}", picture)/> }.into_any() }
+                    {if info.picture.is_some() { view! { <img class="ui small image" alt="User picture" src=format!("data:image;base64,{}", picture)/> }.into_any() }
                      else { view! { <div class="users-picture-placeholder"><span class="ui big icon">"▧"</span></div> }.into_any() }}
                     <div class="content"><A attr:class="header" href=href>
                         <span class=format!("ui {} empty circular label", color)></span>{name}

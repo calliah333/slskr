@@ -7,20 +7,21 @@ use std::{fmt::Write as _, time::Duration};
 use crate::{
     app::{AppState, Core},
     auth::{Authenticated, constant_time_eq},
+    http::{Json, Routes},
     transfers::TransferService,
 };
 use axum::{
-    Json, Router,
+    Router,
     extract::State,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use slskr_api::{
+use slskr_types::{
     config::MetricsConfig,
     realtime::{Event, Topic},
-    telemetry::{CurrentMetrics, PrometheusMetric, PrometheusMetricSample, PrometheusMetrics},
+    telemetry::CurrentMetrics,
 };
 
 #[derive(Clone)]
@@ -84,16 +85,16 @@ fn transfer_metrics(current: &CurrentMetrics) -> impl Iterator<Item = Metric> {
         ($(($kind:literal, $suffix:literal, $before:literal, $after:literal, $group:ident.$field:ident)),+ $(,)?) => {{
             [
                 $(Metric {
-                    name: concat!("slskd_transfers_downloads_", $suffix),
+                    name: concat!("slskr_transfers_downloads_", $suffix),
                     help: concat!($before, "downloads", $after),
                     kind: $kind,
-                    value: current.downloads.$group.$field,
+                    value: current.downloads.$group.$field as f64,
                 },)+
                 $(Metric {
-                    name: concat!("slskd_transfers_uploads_", $suffix),
+                    name: concat!("slskr_transfers_uploads_", $suffix),
                     help: concat!($before, "uploads", $after),
                     kind: $kind,
-                    value: current.uploads.$group.$field,
+                    value: current.uploads.$group.$field as f64,
                 },)+
             ].into_iter()
         }};
@@ -192,58 +193,8 @@ fn render_metrics(current: &CurrentMetrics) -> String {
     text
 }
 
-fn metrics_object(current: &CurrentMetrics) -> PrometheusMetrics {
-    transfer_metrics(current)
-        .map(
-            |Metric {
-                 name,
-                 help,
-                 kind,
-                 value,
-             }| {
-                (
-                    name.to_owned(),
-                    PrometheusMetric {
-                        name: Some(name.to_owned()),
-                        help: Some(help.to_owned()),
-                        kind: Some(kind.to_owned()),
-                        samples: Some(vec![PrometheusMetricSample {
-                            value: Some(value),
-                            labels: None,
-                        }]),
-                        ..Default::default()
-                    },
-                )
-            },
-        )
-        .collect()
-}
-
-fn wants_json(headers: &HeaderMap) -> bool {
-    let values = headers.get_all(header::ACCEPT);
-    let mut accept = values.iter();
-    accept
-        .next()
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"application/json"))
-        && accept.next().is_none()
-}
-
 async fn current_metrics(_: Authenticated, State(state): State<AppState>) -> Json<CurrentMetrics> {
     Json(state.services.telemetry.metrics())
-}
-
-async fn metrics(_: Authenticated, State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let current = state.services.telemetry.metrics();
-    if wants_json(&headers) {
-        Json(metrics_object(&current)).into_response()
-    } else {
-        render_metrics(&current).into_response()
-    }
-}
-
-async fn kpis(_: Authenticated, State(state): State<AppState>) -> Json<PrometheusMetrics> {
-    // All exposed families are slskd_* and therefore included in the reference KPI filter.
-    Json(metrics_object(&state.services.telemetry.metrics()))
 }
 
 /// Basic credentials, or `None` (no authentication) when neither is configured.
@@ -291,11 +242,8 @@ pub fn prometheus_routes(path: &str) -> Router<AppState> {
     Router::new().route(path, get(scrape))
 }
 
-pub fn routes() -> Router<AppState> {
-    reports::routes()
-        .route("/telemetry/metrics", get(metrics))
-        .route("/telemetry/metrics/kpis", get(kpis))
-        .route("/telemetry/metrics/current", get(current_metrics))
+pub fn routes() -> Routes {
+    reports::routes().get("/api/metrics", current_metrics)
 }
 
 #[cfg(test)]
@@ -303,30 +251,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposition_and_json_report_the_same_transfer_samples() {
+    fn exposition_reports_transfer_samples() {
         let mut current = CurrentMetrics::default();
         current.downloads.in_progress.total_speed = 2_048.5;
-        current.uploads.completed.succeeded = 7.0;
+        current.uploads.completed.succeeded = 7;
         let text = render_metrics(&current);
-        let json = serde_json::to_value(metrics_object(&current)).unwrap();
-        let speed = "slskd_transfers_downloads_in_progress_speed_total_current";
-        let succeeded = "slskd_transfers_uploads_completed_succeeded";
+        let speed = "slskr_transfers_downloads_in_progress_speed_total_current";
+        let succeeded = "slskr_transfers_uploads_completed_succeeded";
         assert!(text.contains(&format!("# TYPE {speed} gauge\n{speed} 2048.5\n")));
         assert!(text.contains(&format!("# TYPE {succeeded} counter\n{succeeded} 7\n")));
-        assert_eq!(json[speed]["samples"][0]["value"], 2048.5);
-        assert!(json[speed]["samples"][0]["labels"].is_null());
-        assert_eq!(json[succeeded]["name"], succeeded);
-        assert_eq!(json[succeeded]["type"], "counter");
-    }
-
-    #[test]
-    fn metrics_json_requires_the_reference_accept_header() {
-        let mut headers = HeaderMap::new();
-        assert!(!wants_json(&headers));
-        headers.insert(header::ACCEPT, "Application/JSON".parse().unwrap());
-        assert!(wants_json(&headers));
-        headers.append(header::ACCEPT, "text/plain".parse().unwrap());
-        assert!(!wants_json(&headers));
     }
 
     #[test]

@@ -9,12 +9,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
+use axum::{extract::State, response::IntoResponse};
 use chrono::{DateTime, Utc};
-use slskr_api::{
+use slskr_types::{
     config::Config,
-    files::FilesystemFile,
-    logs::LogRecord,
+    logs::{LogFile, LogRecord},
     realtime::{Event as LiveEvent, Topic},
 };
 use tracing::{
@@ -26,7 +25,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt::MakeWriter, layer::Context, prel
 use crate::{
     app::{AppState, Paths},
     auth::RequireAdmin,
-    http::{ApiError, ApiResult},
+    http::{ApiError, ApiResult, Json, Path, Routes},
     realtime::EventBus,
 };
 
@@ -254,11 +253,11 @@ fn prune_files(dir: &std::path::Path, max_age: std::time::Duration) {
     }
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/logs/live", get(live))
-        .route("/logs/files", get(list_files))
-        .route("/logs/files/{filename}", get(get_file))
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/logs", live)
+        .get("/api/logs/files", list_files)
+        .get("/api/logs/files/{name}", get_file)
 }
 
 async fn live(_admin: RequireAdmin, State(state): State<AppState>) -> Json<Vec<LogRecord>> {
@@ -268,12 +267,12 @@ async fn live(_admin: RequireAdmin, State(state): State<AppState>) -> Json<Vec<L
 async fn list_files(
     _admin: RequireAdmin,
     State(state): State<AppState>,
-) -> ApiResult<Json<Vec<FilesystemFile>>> {
+) -> ApiResult<Json<Vec<LogFile>>> {
     let dir = &state.core.paths.logs_dir;
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(ApiError::NotFound(String::new()));
+            return Ok(Json(Vec::new()));
         }
         Err(e) => return Err(ApiError::Internal(e.into())),
     };
@@ -294,11 +293,9 @@ async fn list_files(
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        files.push(FilesystemFile {
-            full_name: name.clone(),
+        files.push(LogFile {
             name,
-            length: metadata.len(),
-            attributes: Default::default(),
+            size: metadata.len(),
             created_at: file_date(metadata.created()),
             modified_at: file_date(metadata.modified()),
         });
@@ -317,12 +314,12 @@ fn file_date(value: io::Result<std::time::SystemTime>) -> DateTime<Utc> {
 async fn get_file(
     _admin: RequireAdmin,
     State(state): State<AppState>,
-    axum::extract::Path(filename): axum::extract::Path<String>,
+    Path(filename): Path<String>,
 ) -> ApiResult<axum::response::Response> {
     let file = safe_log_path(&state.core.paths.logs_dir, &filename)?;
     let data = std::fs::read(file).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            ApiError::NotFound(String::new())
+            ApiError::not_found()
         } else {
             ApiError::Internal(e.into())
         }
@@ -357,7 +354,7 @@ fn safe_log_path(root: &PathBuf, filename: &str) -> ApiResult<PathBuf> {
     }
     let root = root.canonicalize().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            ApiError::NotFound(String::new())
+            ApiError::not_found()
         } else {
             ApiError::Internal(e.into())
         }
@@ -365,7 +362,7 @@ fn safe_log_path(root: &PathBuf, filename: &str) -> ApiResult<PathBuf> {
     let path = root.join(filename);
     let meta = std::fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            ApiError::NotFound(String::new())
+            ApiError::not_found()
         } else {
             ApiError::Internal(e.into())
         }

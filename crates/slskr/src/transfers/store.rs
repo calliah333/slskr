@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use slskr_api::{
+use slskr_types::{
     config::RetentionConfig,
-    transfers::{Batch, BatchOptions, Transfer, TransferDirection, TransferStates},
+    transfers::{Batch, Transfer, TransferDirection, TransferState},
 };
 
 use crate::db::Database;
@@ -25,6 +25,56 @@ CREATE INDEX ix_transfers_state ON transfers(state);
 CREATE INDEX ix_transfers_batch_id ON transfers(batch_id);
 CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
 "#];
+
+// `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
+// Initializing 4, InProgress 8, Completed 16, Succeeded 32, Cancelled 64, TimedOut 128,
+// Errored 256, Rejected 512, Aborted 1024, Locally 2048, Remotely 4096); the queries test
+// `state & 16` for completion.
+
+/// The API state of stored (or wire) state bits.
+pub(crate) fn state_from_bits(bits: u32) -> TransferState {
+    if bits & 16 != 0 {
+        [
+            (32, TransferState::Succeeded),
+            (64, TransferState::Cancelled),
+            (128, TransferState::TimedOut),
+            (512, TransferState::Rejected),
+            (1024, TransferState::Aborted),
+        ]
+        .into_iter()
+        .find(|(bit, _)| bits & bit != 0)
+        .map_or(TransferState::Errored, |(_, state)| state)
+    } else if bits & 8 != 0 {
+        TransferState::InProgress
+    } else if bits & 4 != 0 {
+        TransferState::Initializing
+    } else if bits & 2 != 0 {
+        if bits & 4096 != 0 {
+            TransferState::QueuedRemotely
+        } else {
+            TransferState::QueuedLocally
+        }
+    } else {
+        TransferState::Requested
+    }
+}
+
+/// The stored bits of a state.
+pub(crate) fn state_to_bits(state: TransferState) -> u32 {
+    match state {
+        TransferState::Requested => 1,
+        TransferState::QueuedLocally => 2 | 2048,
+        TransferState::QueuedRemotely => 2 | 4096,
+        TransferState::Initializing => 4,
+        TransferState::InProgress => 8,
+        TransferState::Succeeded => 16 | 32,
+        TransferState::Cancelled => 16 | 64,
+        TransferState::TimedOut => 16 | 128,
+        TransferState::Errored => 16 | 256,
+        TransferState::Rejected => 16 | 512,
+        TransferState::Aborted => 16 | 1024,
+    }
+}
 
 const FIELDS: &str = "id, batch_id, username, direction, filename, size, state, requested_at, enqueued_at,\n    started_at, ended_at, bytes_transferred, average_speed, place_in_queue, exception, attempts, next_attempt_at, removed";
 
@@ -65,7 +115,7 @@ fn transfer(row: &Row<'_>) -> rusqlite::Result<Transfer> {
         },
         filename: row.get(4)?,
         size: row.get(5)?,
-        state: TransferStates::from_bits(row.get(6)?),
+        state: state_from_bits(row.get(6)?),
         requested_at: date(row, 7)?.ok_or(rusqlite::Error::InvalidQuery)?,
         enqueued_at: date(row, 8)?,
         started_at: date(row, 9)?,
@@ -73,14 +123,14 @@ fn transfer(row: &Row<'_>) -> rusqlite::Result<Transfer> {
         bytes_transferred: row.get(11)?,
         average_speed: row.get(12)?,
         place_in_queue: row.get(13)?,
-        exception: row.get(14)?,
+        error: row.get(14)?,
         attempts: row.get(15)?,
         next_attempt_at: date(row, 16)?,
         removed: row.get(17)?,
         bytes_remaining: 0,
-        elapsed_time: None,
+        elapsed_ms: None,
         percent_complete: 0.0,
-        remaining_time: None,
+        remaining_ms: None,
     };
     transfer.refresh_derived(Utc::now());
     Ok(transfer)
@@ -91,7 +141,7 @@ pub(super) async fn initialize(db: &Database) -> anyhow::Result<(Vec<Transfer>, 
         let tx = db.transaction()?;
         let now = Utc::now();
         tx.execute(
-            "UPDATE transfers SET state = 1040, state_description = 'Completed, Aborted', ended_at = ?1,
+            "UPDATE transfers SET state = 1040, state_description = 'aborted', ended_at = ?1,
                 next_attempt_at = NULL, exception = 'OperationCanceledException: Interrupted by daemon shutdown'
                 WHERE (state & 16) = 0 AND (direction = 'Upload' OR removed)",
             [timestamp(now)],
@@ -99,7 +149,7 @@ pub(super) async fn initialize(db: &Database) -> anyhow::Result<(Vec<Transfer>, 
         // An interrupted negotiation is not a failed attempt. Move it back to the
         // queue once, while preserving delays for already scheduled retries.
         tx.execute(
-            "UPDATE transfers SET state = 2050, state_description = 'Queued, Locally', ended_at = NULL,
+            "UPDATE transfers SET state = 2050, state_description = 'queued_locally', ended_at = NULL,
                 attempts = CASE WHEN next_attempt_at IS NULL THEN MAX(0, attempts - 1) ELSE attempts END,
                 next_attempt_at = COALESCE(next_attempt_at, ?1), place_in_queue = NULL
                 WHERE direction = 'Download' AND (state & 16) = 0",
@@ -130,7 +180,7 @@ pub(super) async fn insert(db: &Database, transfers: Vec<Transfer>) -> anyhow::R
                 let direction = direction_name(t.direction);
                 supersede.execute(params![direction, t.username, t.filename])?;
                 insert.execute(params![t.id, t.batch_id, t.username, direction, t.filename, t.size,
-                    t.state.bits(), t.state.to_string(), timestamp(t.requested_at), t.enqueued_at.map(timestamp), t.removed])?;
+                    state_to_bits(t.state), t.state.as_str(), timestamp(t.requested_at), t.enqueued_at.map(timestamp), t.removed])?;
             }
         }
         tx.commit()
@@ -141,13 +191,13 @@ pub(super) struct Snapshot {
     id: String,
     size: u64,
     offset: u64,
-    state: TransferStates,
+    state: TransferState,
     enqueued: Option<DateTime<Utc>>,
     started: Option<DateTime<Utc>>,
     ended: Option<DateTime<Utc>>,
     bytes: u64,
     speed: f64,
-    exception: Option<String>,
+    error: Option<String>,
     attempts: u32,
     next_attempt: Option<DateTime<Utc>>,
     removed: bool,
@@ -166,7 +216,7 @@ impl Snapshot {
             ended: t.ended_at,
             bytes: t.bytes_transferred,
             speed: t.average_speed,
-            exception: t.exception.clone(),
+            error: t.error.clone(),
             attempts: t.attempts,
             next_attempt: t.next_attempt_at,
             removed: t.removed,
@@ -184,9 +234,9 @@ pub(super) async fn save(db: &Database, snapshots: Vec<Snapshot>) -> anyhow::Res
                 attempts = ?11, next_attempt_at = ?12, removed = MAX(removed, ?13), state_description = ?14, place_in_queue = ?15
                 WHERE id = ?1 AND (state & 16) = 0 AND attempts <= ?11")?;
             for t in snapshots {
-                stmt.execute(params![t.id, t.size, t.offset, t.state.bits(), t.enqueued.map(timestamp),
+                stmt.execute(params![t.id, t.size, t.offset, state_to_bits(t.state), t.enqueued.map(timestamp),
                     t.started.map(timestamp), t.ended.map(timestamp), t.bytes, t.speed,
-                    t.exception, t.attempts, t.next_attempt.map(timestamp), t.removed, t.state.to_string(), t.position])?;
+                    t.error, t.attempts, t.next_attempt.map(timestamp), t.removed, t.state.as_str(), t.position])?;
             }
         }
         tx.commit()
@@ -246,9 +296,8 @@ pub(super) async fn remove(
 
 pub(super) async fn create_batch(db: &Database, batch: Batch) -> anyhow::Result<bool> {
     db.call(move |db| {
-        let options = batch.options.unwrap_or_default();
         Ok(db.execute("INSERT INTO transfer_batches (id, search_id, username, created_at, destination, external_id)\n            VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
-            params![batch.id, batch.search_id, batch.username, timestamp(batch.created_at), options.destination, options.external_id])? != 0)
+            params![batch.id, batch.search_id, batch.username, timestamp(batch.created_at), batch.destination, batch.external_id])? != 0)
     }).await
 }
 
@@ -260,10 +309,9 @@ pub(super) async fn batch(db: &Database, id: String) -> anyhow::Result<Option<Ba
         let mut stmt = db.prepare(&format!(
             "SELECT {FIELDS} FROM transfers WHERE batch_id = ?1 ORDER BY rowid"
         ))?;
-        batch.transfers = Some(
-            stmt.query_map([id], transfer)?
-                .collect::<rusqlite::Result<_>>()?,
-        );
+        batch.transfers = stmt
+            .query_map([id], transfer)?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(Some(batch))
     })
     .await
@@ -276,9 +324,8 @@ pub(super) async fn batch_info(db: &Database, id: String) -> anyhow::Result<Opti
 fn batch_metadata(db: &Connection, id: &str) -> rusqlite::Result<Option<Batch>> {
     db.query_row("SELECT id, search_id, username, created_at, destination, external_id FROM transfer_batches WHERE id = ?1", [id], |row| Ok(Batch {
         id: row.get(0)?, search_id: row.get(1)?, username: row.get(2)?,
-        direction: TransferDirection::Download,
-        created_at: date(row, 3)?.ok_or(rusqlite::Error::InvalidQuery)?, transfers: None,
-        options: Some(BatchOptions { destination: row.get(4)?, external_id: row.get(5)? }),
+        created_at: date(row, 3)?.ok_or(rusqlite::Error::InvalidQuery)?, transfers: Vec::new(),
+        destination: row.get(4)?, external_id: row.get(5)?,
     })).optional()
 }
 
@@ -328,7 +375,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::transfers::{LOCAL_QUEUE, new_transfer};
+    use crate::transfers::new_transfer;
 
     #[tokio::test]
     async fn preserves_delayed_retries_and_recovers_interrupted_jobs() {
@@ -364,9 +411,9 @@ mod tests {
         retry.next_attempt_at = Some(scheduled);
         retry.bytes_transferred = 2;
         live.attempts = 2;
-        live.state = TransferStates::IN_PROGRESS;
+        live.state = TransferState::InProgress;
         upload.started_at = Some(Utc::now());
-        upload.state = TransferStates::IN_PROGRESS;
+        upload.state = TransferState::InProgress;
         save(
             &db,
             [&retry, &live, &upload]
@@ -381,15 +428,12 @@ mod tests {
         let db = Database::open(&path, MIGRATIONS).unwrap();
         let (history, pending) = initialize(&db).await.unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(
-            history[0].state,
-            TransferStates::COMPLETED | TransferStates::ABORTED
-        );
+        assert_eq!(history[0].state, TransferState::Aborted);
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].next_attempt_at, Some(scheduled));
         assert_eq!(pending[0].attempts, 2);
         assert_eq!(pending[0].bytes_transferred, 2);
-        assert_eq!(pending[1].state, LOCAL_QUEUE);
+        assert_eq!(pending[1].state, TransferState::QueuedLocally);
         assert_eq!(pending[1].attempts, 1);
         assert!(pending[1].next_attempt_at.is_some());
         assert_eq!(initialize(&db).await.unwrap().1[1].attempts, 1);
@@ -403,12 +447,9 @@ mod tests {
             search_id: None,
             username: "peer".into(),
             created_at: Utc::now(),
-            direction: TransferDirection::Download,
-            transfers: None,
-            options: Some(BatchOptions {
-                destination: Some("folder".into()),
-                external_id: Some("record".into()),
-            }),
+            transfers: Vec::new(),
+            destination: Some("folder".into()),
+            external_id: Some("record".into()),
         };
         assert!(create_batch(&db, b.clone()).await.unwrap());
         assert!(!create_batch(&db, b.clone()).await.unwrap());
@@ -420,7 +461,7 @@ mod tests {
             Some(b.id.clone()),
         );
         insert(&db, vec![t.clone()]).await.unwrap();
-        t.state = TransferStates::COMPLETED | TransferStates::SUCCEEDED;
+        t.state = TransferState::Succeeded;
         t.bytes_transferred = t.size;
         save(&db, vec![Snapshot::new(&t, 0)]).await.unwrap();
         remove(&db, TransferDirection::Download, None)
@@ -433,9 +474,19 @@ mod tests {
                 .is_empty()
         );
         let batch = batch(&db, b.id).await.unwrap().unwrap();
-        assert_eq!(batch.options, b.options);
-        let transfers = batch.transfers.unwrap();
+        assert_eq!(batch.destination, b.destination);
+        assert_eq!(batch.external_id, b.external_id);
+        let transfers = batch.transfers;
         assert_eq!(transfers[0].id, t.id);
         assert!(transfers[0].removed);
+    }
+
+    #[test]
+    fn state_bits_round_trip() {
+        for state in TransferState::ALL {
+            assert_eq!(state_from_bits(state_to_bits(state)), state);
+        }
+        assert_eq!(state_from_bits(16), TransferState::Errored);
+        assert_eq!(state_from_bits(2 | 4096), TransferState::QueuedRemotely);
     }
 }

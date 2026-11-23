@@ -5,10 +5,10 @@ use std::{
 };
 
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
-use slskr_api::{
-    search::{File, SearchResponse},
-    transfers::{EnqueueDownloadsResponse, QueueDownloadRequest},
-    users::{Directory, DirectoryContentsRequest},
+use slskr_types::{
+    search::SearchResponse,
+    transfers::{DownloadFile, EnqueueDownloads, EnqueuedDownloads},
+    users::{self, Directory},
 };
 
 use crate::services::{api, util};
@@ -16,6 +16,37 @@ use crate::services::{api, util};
 use super::LiveResponses;
 
 const PAGE_SIZE: usize = 5;
+
+/// A result row: a file of a response, and whether it can not be downloaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct File {
+    filename: String,
+    size: u64,
+    bit_rate: Option<u32>,
+    bit_depth: Option<u32>,
+    sample_rate: Option<u32>,
+    /// Seconds.
+    length: Option<u32>,
+    is_variable_bit_rate: Option<bool>,
+    is_locked: bool,
+}
+
+impl File {
+    fn new(file: users::File, is_locked: bool) -> Self {
+        Self {
+            length: file
+                .duration_ms
+                .map(|ms| u32::try_from(ms / 1000).unwrap_or(u32::MAX)),
+            filename: file.filename,
+            size: file.size,
+            bit_rate: file.bit_rate,
+            bit_depth: file.bit_depth,
+            sample_rate: file.sample_rate,
+            is_variable_bit_rate: file.is_variable_bit_rate,
+            is_locked,
+        }
+    }
+}
 
 #[derive(Default, PartialEq, Eq)]
 struct Filter {
@@ -100,11 +131,7 @@ struct Group {
 }
 
 fn group(response: &SearchResponse, filter: &Filter, hide_locked: bool) -> Option<Group> {
-    let count = response
-        .files
-        .iter()
-        .filter(|file| !hide_locked || !file.is_locked)
-        .count()
+    let count = response.files.len()
         + if hide_locked {
             0
         } else {
@@ -116,15 +143,14 @@ fn group(response: &SearchResponse, filter: &Filter, hide_locked: bool) -> Optio
     let mut dirs: BTreeMap<String, Vec<File>> = BTreeMap::new();
     for (rows, locked) in [(&response.files, false), (&response.locked_files, true)] {
         for file in rows {
-            if (hide_locked && (locked || file.is_locked)) || !filter.matches(file) {
+            let file = File::new(file.clone(), locked);
+            if (hide_locked && file.is_locked) || !filter.matches(&file) {
                 continue;
             }
             let directory = file
                 .filename
                 .rsplit_once(['\\', '/'])
                 .map_or("", |(path, _)| path);
-            let mut file = file.clone();
-            file.is_locked |= locked;
             dirs.entry(directory.to_owned()).or_default().push(file);
         }
     }
@@ -135,7 +161,7 @@ fn group(response: &SearchResponse, filter: &Filter, hide_locked: bool) -> Optio
         username: response.username.clone(),
         speed: response.upload_speed,
         free_slot: response.has_free_upload_slot,
-        queue: response.queue_length,
+        queue: response.queue_length.into(),
         dirs,
     })
 }
@@ -259,7 +285,7 @@ pub(super) fn SearchResults(
     }
 }
 
-type Selection = BTreeMap<String, QueueDownloadRequest>;
+type Selection = BTreeMap<String, DownloadFile>;
 
 #[component]
 fn ResultCard(
@@ -288,14 +314,14 @@ fn ResultCard(
         if requests.is_empty() {
             return;
         }
-        let endpoint = format!(
-            "/transfers/downloads/{}",
-            username.with_value(|name| util::encode_uri_component(name))
-        );
+        let request = EnqueueDownloads {
+            username: username.get_value(),
+            files: requests,
+        };
         pending.set(true);
         message.set(None);
         spawn_local_scoped_with_cancellation(async move {
-            match api::post::<_, EnqueueDownloadsResponse>(&endpoint, &requests).await {
+            match api::post::<_, EnqueuedDownloads>("/transfers/downloads", &request).await {
                 Ok(response) if response.failed.is_empty() => {
                     selecting.update(BTreeMap::clear);
                     message.set(Some((
@@ -312,8 +338,8 @@ fn ResultCard(
                     let detail = response
                         .failed
                         .iter()
-                        .filter(|failure| !failure.message.is_empty())
-                        .map(|failure| failure.message.as_str())
+                        .filter(|failure| !failure.error.is_empty())
+                        .map(|failure| failure.error.as_str())
                         .collect::<Vec<_>>()
                         .join("; ");
                     message.set(Some((
@@ -337,21 +363,19 @@ fn ResultCard(
         looking_up.set(true);
         directory_error.set(None);
         let endpoint = format!(
-            "/users/{}/directory",
-            username.with_value(|name| util::encode_uri_component(name))
+            "/users/{}/directory?path={}",
+            username.with_value(|name| util::encode_uri_component(name)),
+            util::encode_uri_component(&directory)
         );
         spawn_local_scoped_with_cancellation(async move {
-            let request = DirectoryContentsRequest {
-                directory: directory.clone(),
-            };
-            match api::post::<_, Vec<Directory>>(&endpoint, &request).await {
+            match api::get::<Vec<Directory>>(&endpoint).await {
                 Ok(dirs) => {
                     if let Some(root) = dirs.into_iter().next() {
                         let files = root
                             .files
                             .into_iter()
                             .map(|file| {
-                                let mut file = File::from(file);
+                                let mut file = File::new(file, false);
                                 file.filename = format!(
                                     "{directory}{separator}{}",
                                     util::get_file_name(&file.filename)
@@ -525,7 +549,7 @@ fn select(selected: &mut Selection, filename: &str, size: u64, checked: bool) {
     if checked {
         selected
             .entry(filename.to_owned())
-            .or_insert_with(|| QueueDownloadRequest {
+            .or_insert_with(|| DownloadFile {
                 filename: filename.to_owned(),
                 size,
             });

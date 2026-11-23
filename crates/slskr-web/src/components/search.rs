@@ -8,7 +8,7 @@ use leptos_router::{
     components::A,
     hooks::{use_navigate, use_params_map},
 };
-use slskr_api::search::{Search, SearchRequest, SearchResponse, SearchStates};
+use slskr_types::search::{Search, SearchRequest, SearchResponse, SearchState};
 
 use crate::{
     components::app::AppContext,
@@ -64,13 +64,13 @@ fn endpoint(id: &str) -> String {
 }
 
 fn complete(search: &Search) -> bool {
-    search.is_complete || search.state.contains(SearchStates::COMPLETED)
+    search.state.is_complete()
 }
 
 #[component]
 pub fn Searches() -> impl IntoView {
     let state = expect_context::<AppContext>().state;
-    let connected = Signal::derive(move || state.with(|state| state.server.is_connected));
+    let connected = Signal::derive(move || state.with(|state| state.server.state.is_connected()));
     let params = use_params_map();
     let route = Memo::new(move |_| params.with(|params| params.get("id")));
     let navigate = StoredValue::new_local(use_navigate());
@@ -114,7 +114,7 @@ pub fn Searches() -> impl IntoView {
                     live.responses.clear();
                 }
                 for response in responses {
-                    let response = SearchResponse::from(response.clone());
+                    let response = response.clone();
                     live.responses.insert(response.username.clone(), response);
                 }
             });
@@ -131,7 +131,7 @@ pub fn Searches() -> impl IntoView {
             return;
         }
         let request = SearchRequest {
-            search_text: text.into(),
+            query: text.into(),
             ..Default::default()
         };
         busy.set(true);
@@ -176,12 +176,17 @@ pub fn Searches() -> impl IntoView {
         action_error.set(None);
         spawn_local_scoped_with_cancellation(async move {
             let path = endpoint(&id);
-            let method = if remove {
-                gloo_net::http::Method::DELETE
+            let result = if remove {
+                api::request_text(gloo_net::http::Method::DELETE, &path, None).await
             } else {
-                gloo_net::http::Method::PUT
+                api::request_text(
+                    gloo_net::http::Method::POST,
+                    &format!("{path}/cancel"),
+                    None,
+                )
+                .await
             };
-            match api::request_text(method, &path, None).await {
+            match result {
                 Ok(_) if remove => {
                     searches.update(|catalog| catalog.update(id.clone(), None));
                     if route.with_untracked(|current| current.as_ref() == Some(&id)) {
@@ -285,7 +290,7 @@ fn SearchHistory(
                         let action = if done { "Delete search" } else { "Stop search" };
                         view! {
                             <tr>
-                                <td>{status_icon(search.state)}</td><td class="search-list-phrase"><A href=path>{search.search_text}</A></td>
+                                <td>{status_icon(search.state)}</td><td class="search-list-phrase"><A href=path>{search.query}</A></td>
                                 <td>{search.file_count}</td><td><i class="small yellow lock icon" aria-hidden="true"></i>{search.locked_file_count}</td>
                                 <td>{search.response_count}</td><td>{search.ended_at.map_or_else(|| "—".into(), |date| util::format_date(&date.to_rfc3339()))}</td>
                                 <td><button type="button" class="ui mini icon basic button" disabled=busy title=action aria-label=action
@@ -393,10 +398,10 @@ fn SearchDetail(
         <A href=format!("{}/searches", config::url_base().trim_end_matches('/')) attr:class="ui basic button"><i class="left arrow icon" aria-hidden="true"></i>"Search history"</A>
         {move || match search.get() {
             Some(search) => {
-                let phrase = search.search_text.clone();
+                let phrase = search.query.clone();
                 view! {
                     <div class="ui raised segment search-detail-header-segment">
-                        <h2 class="ui header">{status_icon(search.state)}{search.search_text}</h2>
+                        <h2 class="ui header">{status_icon(search.state)}{search.query}</h2>
                         <div class="search-detail-header-buttons">
                             <button type="button" class="ui button" disabled=move || busy.get() || !connected.get() || !done.get()
                                 on:click=move |_| create.run((phrase.clone(), true))><i class="refresh icon" aria-hidden="true"></i>"Search Again"</button>
@@ -430,17 +435,13 @@ fn action_icon(done: bool) -> &'static str {
     }
 }
 
-fn status_icon(state: SearchStates) -> impl IntoView {
-    let class = if state.contains(SearchStates::ERRORED) {
-        "red x icon"
-    } else if state.contains(SearchStates::CANCELLED) {
-        "green stop circle icon"
-    } else if state.contains(SearchStates::COMPLETED) {
-        "green check icon"
-    } else if state.contains(SearchStates::IN_PROGRESS) {
-        "green loading circle notch icon"
-    } else {
-        "time icon"
+fn status_icon(state: SearchState) -> impl IntoView {
+    let class = match state {
+        SearchState::Errored => "red x icon",
+        SearchState::Cancelled => "green stop circle icon",
+        SearchState::InProgress => "green loading circle notch icon",
+        SearchState::Requested | SearchState::Queued => "time icon",
+        _ => "green check icon",
     };
-    view! { <i class=class title=state.to_string() aria-label=state.to_string()></i> }
+    view! { <i class=class title=state.label() aria-label=state.label()></i> }
 }

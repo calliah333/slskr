@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use slskr_api::{
+use slskr_types::{
     application::State,
     realtime::{Event, Topic},
 };

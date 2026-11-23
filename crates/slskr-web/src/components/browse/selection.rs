@@ -1,7 +1,7 @@
 use crate::services::{api, util};
 use leptos::prelude::*;
-use slskr_api::{
-    transfers::{EnqueueDownloadsResponse, QueueDownloadRequest},
+use slskr_types::{
+    transfers::{DownloadFile, EnqueueDownloads, EnqueuedDownloads},
     users::File,
 };
 
@@ -24,10 +24,6 @@ pub fn Selection(
             files.with_value(|files| indexes.iter().map(|&index| files[index].size).sum::<u64>())
         })
     };
-    let endpoint = format!(
-        "/transfers/downloads/{}",
-        util::encode_uri_component(&username)
-    );
     let download = move |_| {
         let indexes = selected.get_untracked();
         if indexes.is_empty() || locked {
@@ -35,23 +31,26 @@ pub fn Selection(
         }
         pending.set(true);
         message.set(None);
-        // Selection displays only direct files; slskd batches are for grouped
-        // downloads from descendant folders.
-        let requests: Vec<QueueDownloadRequest> = files.with_value(|files| {
+        // Selection displays only direct files; batches are for grouped downloads
+        // from descendant folders.
+        let requests: Vec<DownloadFile> = files.with_value(|files| {
             indexes
                 .into_iter()
                 .map(|index| {
                     let file = &files[index];
-                    QueueDownloadRequest {
+                    DownloadFile {
                         filename: format!("{directory}{separator}{}", file.filename),
                         size: file.size,
                     }
                 })
                 .collect()
         });
-        let endpoint = endpoint.clone();
+        let request = EnqueueDownloads {
+            username: username.clone(),
+            files: requests,
+        };
         leptos::task::spawn_local(async move {
-            match api::post::<_, EnqueueDownloadsResponse>(&endpoint, &requests).await {
+            match api::post::<_, EnqueuedDownloads>("/transfers/downloads", &request).await {
                 Ok(response) if !response.failed.is_empty() => {
                     let _ = message.try_set(Some(format!(
                         "Failed to enqueue {} file(s).",

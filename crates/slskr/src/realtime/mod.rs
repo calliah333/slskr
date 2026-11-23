@@ -17,7 +17,7 @@ use std::sync::{
 };
 
 use axum::extract::ws::Utf8Bytes;
-use slskr_api::realtime::{Event, Topic};
+use slskr_types::realtime::{Event, Topic};
 use tokio::sync::broadcast;
 
 pub use socket::{Limits, Snapshots};

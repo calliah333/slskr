@@ -1,4 +1,4 @@
-//! Live updates over one WebSocket at `{url_base}/api/events` (see `slskr_api::realtime`).
+//! Live updates over one WebSocket at `{url_base}/api/events` (see `slskr_types::realtime`).
 //!
 //! [`Events::start`] opens the connection once the session is known to be valid and
 //! provides it as context. Components register handlers per [`Topic`] with
@@ -18,8 +18,8 @@ use std::{
 
 use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
-use slskr_api::realtime::{CLOSE_UNAUTHORIZED, Command};
-pub use slskr_api::realtime::{Event, Topic};
+use slskr_types::realtime::{CLOSE_UNAUTHORIZED, Command};
+pub use slskr_types::realtime::{Event, Topic};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};

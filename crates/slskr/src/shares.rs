@@ -11,19 +11,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use axum::{
-    Json, Router,
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
-    routing::get,
-};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use slskr_api::{
-    config::Config,
-    shares::{Share, SharesByHost},
-    users::FileAttributeType as NamedAttribute,
-};
+use slskr_types::{config::Config, shares::Share};
 use tokio::{
     sync::{broadcast, watch},
     task::JoinHandle,
@@ -33,15 +24,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
-    http::{ApiError, ApiResult},
+    http::{ApiError, ApiResult, Json, Path as RoutePath, Routes},
     users::convert_directory,
 };
 
 mod audio;
 mod scan;
 use scan::ShareSpec;
-
-const LOCAL: &str = "local";
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ScanOptions {
@@ -111,6 +100,16 @@ impl ShareContents {
         ensure!(metadata.is_file(), "shared path is not a regular file");
         Ok((canonical, metadata.len()))
     }
+}
+
+/// Audio properties in the share cache, named as written by earlier versions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum NamedAttribute {
+    BitRate,
+    Length,
+    VariableBitRate,
+    SampleRate,
+    BitDepth,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -282,11 +281,10 @@ impl ShareService {
         let counts = snapshot.as_deref().map_or((0, 0), snapshot_counts);
         self.0.core.state.update(|s| {
             let state = &mut s.shares;
-            state.hosts = Some(vec![LOCAL.into()]);
             state.ready = active.is_none() && snapshot.is_some();
             state.scan_pending = snapshot.is_none() || state.faulted || state.cancelled;
-            state.directories = state_count(counts.0);
-            state.files = state_count(counts.1);
+            state.directories = counts.0;
+            state.files = counts.1;
             if active.is_none() {
                 state.scan_progress = if snapshot.is_some() { 1.0 } else { 0.0 };
             }
@@ -400,9 +398,8 @@ impl ShareService {
             s.shares.cancelled = cancelled;
             s.shares.faulted = !cancelled && result.is_err();
             s.shares.scan_progress = if result.is_ok() { 1.0 } else { 0.0 };
-            s.shares.hosts = Some(vec![LOCAL.into()]);
-            s.shares.directories = state_count(directories);
-            s.shares.files = state_count(files);
+            s.shares.directories = directories;
+            s.shares.files = files;
         });
         match &result {
             Ok(()) => {
@@ -514,10 +511,10 @@ impl ShareService {
         Ok(collect.matches)
     }
 
-    pub fn shares(&self) -> SharesByHost {
+    pub fn shares(&self) -> Vec<Share> {
         let options = self.0.core.options.get();
         let snapshot = self.snapshot_for(&options);
-        BTreeMap::from([(LOCAL.into(), local_shares(&options, snapshot.as_deref()))])
+        local_shares(&options, snapshot.as_deref())
     }
 }
 
@@ -576,10 +573,6 @@ fn snapshot_has_configured_roots(snapshot: &Snapshot) -> bool {
 fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
-fn state_count(n: u32) -> i32 {
-    i32::try_from(n).unwrap_or(i32::MAX)
-}
-
 fn local_shares(options: &Config, snapshot: Option<&Snapshot>) -> Vec<Share> {
     let mut specs: Vec<_> = scan::specs(&options.shares.directories).collect();
     specs.sort_by_key(|spec| std::cmp::Reverse(spec.local.as_os_str().len()));
@@ -674,58 +667,44 @@ fn normalize_remote(path: &str) -> Result<Cow<'_, str>> {
     })
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/shares", get(shares).put(start_scan).delete(cancel_scan))
-        .route("/shares/contents", get(contents))
-        .route("/shares/{id}", get(share))
-        .route("/shares/{id}/contents", get(share_contents))
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/shares", shares)
+        .post("/api/shares/scan", start_scan)
+        .delete("/api/shares/scan", cancel_scan)
+        .get("/api/shares/{id}", share)
+        .get("/api/shares/{id}/contents", share_contents)
 }
 
-async fn shares(_: Authenticated, State(s): State<AppState>) -> Json<SharesByHost> {
+async fn shares(_: Authenticated, State(s): State<AppState>) -> Json<Vec<Share>> {
     Json(s.services.shares.shares())
 }
 
 async fn share(
     _: Authenticated,
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    RoutePath(id): RoutePath<String>,
 ) -> ApiResult<Json<Share>> {
     let service = &s.services.shares;
     let options = s.core.options.get();
-    if let Some(spec) = scan::specs(&options.shares.directories).find(|spec| spec.id() == id) {
-        return Ok(Json(share_model(
-            spec,
-            service.snapshot_for(&options).as_deref(),
-        )));
-    }
-    Err(ApiError::NotFound(String::new()))
-}
-
-async fn contents(
-    _: Authenticated,
-    State(s): State<AppState>,
-) -> ApiResult<Json<Vec<slskr_api::users::Directory>>> {
-    Ok(Json(
-        s.services
-            .shares
-            .browse()?
-            .directories
-            .into_iter()
-            .map(convert_directory)
-            .collect(),
-    ))
+    let spec = scan::specs(&options.shares.directories)
+        .find(|spec| spec.id() == id)
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(share_model(
+        spec,
+        service.snapshot_for(&options).as_deref(),
+    )))
 }
 
 async fn share_contents(
     _: Authenticated,
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult<Json<Vec<slskr_api::users::Directory>>> {
+    RoutePath(id): RoutePath<String>,
+) -> ApiResult<Json<Vec<slskr_types::users::Directory>>> {
     let options = s.core.options.get();
-    let Some(spec) = scan::specs(&options.shares.directories).find(|spec| spec.id() == id) else {
-        return Err(ApiError::NotFound(String::new()));
-    };
+    let spec = scan::specs(&options.shares.directories)
+        .find(|spec| spec.id() == id)
+        .ok_or_else(ApiError::not_found)?;
     let snapshot = s.services.shares.snapshot_for(&options);
     let directories = snapshot
         .as_ref()
@@ -742,21 +721,24 @@ async fn share_contents(
     Ok(Json(directories))
 }
 
+/// Starts a share scan (202); 409 while one is running.
 async fn start_scan(_: RequireReadWrite, State(s): State<AppState>) -> ApiResult<StatusCode> {
     s.services
         .shares
         .launch_scan(s.core.shutdown.child_token())
         .ok_or_else(|| ApiError::Conflict("A share scan is already in progress".into()))?;
-    Ok(StatusCode::OK)
+    Ok(StatusCode::ACCEPTED)
 }
 
+/// Cancels the running share scan (204); 404 when none is running.
 async fn cancel_scan(_: RequireReadWrite, State(s): State<AppState>) -> ApiResult<StatusCode> {
     if s.services.shares.cancel_scan() {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError::NotFound(String::new()))
+        Err(ApiError::NotFound("No share scan is running".into()))
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,7 +781,7 @@ mod tests {
         fs::write(root.join("first.txt"), b"local").unwrap();
         fs::write(root.join("second.txt"), b"other").unwrap();
         let config_file = temp.path().join("slskr.toml");
-        let mut config = slskr_api::config::Config::default();
+        let mut config = slskr_types::config::Config::default();
         config.shares.directories = vec![format!("[music]{}", root.display())];
         let sources = Sources::new(temp.path().into(), Vec::new(), Overrides::default()).unwrap();
         let options = ConfigStore::from_config(config_file.clone(), sources, config);
@@ -830,7 +812,7 @@ mod tests {
         };
         let shares = ShareService::new(&core).unwrap();
         shares.scan(CancellationToken::new()).await.unwrap();
-        assert_eq!(shares.shares()["local"][0].alias.as_deref(), Some("music"));
+        assert_eq!(shares.shares()[0].alias.as_deref(), Some("music"));
         assert_eq!(shares.browse().unwrap().directories.len(), 1);
         assert_eq!(shares.list_directory("music").unwrap()[0].files[0].size, 5);
         let found = shares

@@ -1,4 +1,4 @@
-//! HTTP API client (port of slskd `lib/api.js`, an axios instance).
+//! HTTP API client.
 //!
 //! Paths are relative to [`api_base_url`], e.g. `api::get::<State>("/application")`.
 //! Every request carries `Content-Type: application/json` and, being same-origin, the
@@ -16,11 +16,11 @@ use crate::config::api_base_url;
 /// Routes whose 401 responses do not trigger a logout.
 const UNAUTHORIZED_EXEMPT: [&str; 3] = ["/session", "/server", "/application"];
 
-/// A failed request: HTTP status (0 for network/serialization failures) and the response body.
+/// A failed request: HTTP status (0 for network/serialization failures) and the error message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiError {
     pub status: u16,
-    /// Response body (like axios `error.response.data`), or a generic description when empty.
+    /// The `error` of the JSON error body, or a generic description.
     pub message: String,
 }
 
@@ -87,11 +87,11 @@ pub async fn request_text(
         reload();
     }
 
-    let message = if text.is_empty() {
-        format!("Request failed with status code {status}")
-    } else {
-        text
-    };
+    let message = serde_json::from_str::<slskr_types::error::ErrorBody>(&text)
+        .map(|body| body.error)
+        .ok()
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| format!("Request failed with status code {status}"));
     Err(ApiError { status, message })
 }
 
@@ -140,11 +140,6 @@ pub async fn put<B: Serialize + ?Sized, T: DeserializeOwned>(
     request(Method::PUT, path, Some(to_body(body)?)).await
 }
 
-/// `PUT path` without a body, JSON response.
-pub async fn put_empty<T: DeserializeOwned>(path: &str) -> Result<T, ApiError> {
-    request(Method::PUT, path, None).await
-}
-
 /// `PATCH path` with a JSON body, JSON response.
 pub async fn patch<B: Serialize + ?Sized, T: DeserializeOwned>(
     path: &str,
@@ -156,12 +151,4 @@ pub async fn patch<B: Serialize + ?Sized, T: DeserializeOwned>(
 /// `DELETE path`, JSON response.
 pub async fn delete<T: DeserializeOwned>(path: &str) -> Result<T, ApiError> {
     request(Method::DELETE, path, None).await
-}
-
-/// `DELETE path` with a JSON body (axios `{ data }`), JSON response.
-pub async fn delete_with<B: Serialize + ?Sized, T: DeserializeOwned>(
-    path: &str,
-    body: &B,
-) -> Result<T, ApiError> {
-    request(Method::DELETE, path, Some(to_body(body)?)).await
 }

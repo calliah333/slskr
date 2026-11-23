@@ -11,7 +11,7 @@ use crate::{
     application::State,
     config::Config,
     logs::LogRecord,
-    search::{Search, SoulseekSearchResponse},
+    search::{Search, SearchResponse},
     telemetry::CurrentMetrics,
 };
 
@@ -85,7 +85,7 @@ pub enum Command {
 pub enum Event {
     /// Application state; snapshot and (coalesced) changes of [`Topic::State`].
     State(Box<State>),
-    /// The effective configuration with secrets redacted (`GET /options`).
+    /// The effective configuration with secrets redacted (as `GET /api/config`).
     Settings(Box<Config>),
     /// The buffered recent log records; snapshot of [`Topic::Logs`].
     LogBuffer(Vec<LogRecord>),
@@ -102,7 +102,7 @@ pub enum Event {
     /// Responses received for a search since the previous batch.
     SearchResponses {
         search_id: String,
-        responses: Vec<SoulseekSearchResponse>,
+        responses: Vec<SearchResponse>,
     },
     /// Live transfer metrics, about once a second.
     Metrics(CurrentMetrics),

@@ -11,12 +11,14 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    extract::{Request, State},
     http::StatusCode,
+    response::Response,
     routing::{any, get},
     serve::{Listener, ListenerExt},
 };
 use clap::Parser;
-use slskr_api::config::Config;
+use slskr_types::config::Config;
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +26,9 @@ use crate::{
     app::{AppInner, AppState, Core, Paths, Services},
     auth::{self, Auth, SessionStore},
     config::{self, ConfigStore, Overrides, Sources},
-    core_api, events, files, http, logging, messaging,
+    core_api, events, files,
+    http::{self, Routes},
+    logging, messaging,
     realtime::{self, EventBus},
     resolvers::AppResolvers,
     search, shares,
@@ -186,8 +190,10 @@ async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) ->
     Ok(app)
 }
 
-fn router(app: &AppState) -> Router {
-    let api = Router::new()
+/// Every API route, with paths starting at `/api` (below `web.url_base`). `docs/API.md`
+/// documents each of them; a test keeps the two in step.
+pub fn api_routes() -> Routes {
+    Routes::new()
         .merge(core_api::routes())
         .merge(logging::routes())
         .merge(events::routes())
@@ -197,23 +203,33 @@ fn router(app: &AppState) -> Router {
         .merge(transfers::routes())
         .merge(telemetry::routes())
         .merge(search::routes())
-        .merge(messaging::routes());
-    let missing = || async { StatusCode::NOT_FOUND };
+        .merge(messaging::routes())
+        .get(slskr_types::realtime::PATH, events_socket)
+}
+
+/// `GET /api/events`: the live events WebSocket.
+async fn events_socket(State(app): State<AppState>, request: Request) -> Response {
+    realtime::socket::EventsEndpoint::new(
+        app.auth.clone(),
+        app.bus.clone(),
+        Arc::new(app.clone()),
+        app.shutdown.clone(),
+        realtime::Limits::default(),
+    )
+    .upgrade(request)
+    .await
+}
+
+fn router(app: &AppState) -> Router {
+    let not_found = || async { http::error_response(StatusCode::NOT_FOUND, "") };
+    let api = api_routes()
+        .into_router()
+        .route("/api", any(not_found))
+        .route("/api/{*unknown}", any(not_found))
+        .layer(axum::middleware::from_fn(http::json_errors));
     let mut endpoints = Router::new()
-        .nest("/api/v0", api)
-        .route("/api", any(missing))
-        .route("/api/{*unknown}", any(missing))
-        .route("/health", get(|| async { StatusCode::OK }))
-        .merge(
-            realtime::socket::EventsEndpoint::new(
-                app.auth.clone(),
-                app.bus.clone(),
-                Arc::new(app.clone()),
-                app.shutdown.clone(),
-                realtime::Limits::default(),
-            )
-            .router(),
-        );
+        .merge(api)
+        .route("/health", get(|| async { StatusCode::OK }));
     let startup = app.options.startup();
     if startup.metrics.enabled {
         endpoints = endpoints.merge(telemetry::prometheus_routes(&startup.metrics.path));
@@ -397,6 +413,42 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(removed).is_err(), "{removed:?}");
         }
+    }
+
+    /// `docs/API.md` is the route reference for script authors: it must list exactly the
+    /// routes the router serves.
+    #[test]
+    fn documented_routes_match_router() {
+        use std::collections::BTreeSet;
+        let documented: BTreeSet<(String, String)> = include_str!("../../../docs/API.md")
+            .lines()
+            .filter_map(|line| {
+                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+                let method = *cells.get(1)?;
+                let path = cells.get(2)?.strip_prefix('`')?.strip_suffix('`')?;
+                (!method.is_empty()
+                    && method.bytes().all(|b| b.is_ascii_uppercase())
+                    && path.starts_with("/api"))
+                .then(|| (method.to_owned(), path.to_owned()))
+            })
+            .collect();
+        let routes = api_routes();
+        let registered: BTreeSet<(String, String)> = routes
+            .table()
+            .iter()
+            .map(|(method, path)| (method.to_string(), path.clone()))
+            .collect();
+        assert_eq!(
+            registered.len(),
+            routes.table().len(),
+            "a route is registered twice"
+        );
+        let undocumented: Vec<_> = registered.difference(&documented).collect();
+        let unrouted: Vec<_> = documented.difference(&registered).collect();
+        assert!(
+            undocumented.is_empty() && unrouted.is_empty(),
+            "missing from docs/API.md: {undocumented:?}; documented but not routed: {unrouted:?}"
+        );
     }
 
     #[test]

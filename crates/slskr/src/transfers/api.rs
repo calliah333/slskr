@@ -1,17 +1,17 @@
-use std::collections::{HashMap, HashSet};
+//! `/api/transfers/{downloads,uploads}` and `/api/batches`.
+
+use std::collections::HashSet;
 
 use axum::{
-    Extension, Json, Router,
-    extract::{Path, Query, State, rejection::JsonRejection},
+    extract::State,
     http::StatusCode,
-    routing::{delete, get, post},
+    response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use serde::Deserialize;
-use slskr_api::transfers::{
-    Batch, BatchOptions, DirectoryResponse, EnqueueDownloadBatchRequest,
-    EnqueueDownloadBatchResponse, EnqueueDownloadsResponse, QueueDownloadRequest, Transfer,
-    TransferDirection, UserResponse,
+use slskr_types::transfers::{
+    Batch, CreateBatch, CreatedBatch, DownloadFile, EnqueueDownloads, EnqueuedDownloads,
+    QueuePosition, Transfer, TransferDirection,
 };
 use uuid::Uuid;
 
@@ -19,276 +19,190 @@ use super::{DownloadContext, destination, store};
 use crate::{
     app::AppState,
     auth::{Authenticated, RequireReadWrite},
-    http::{ApiError, ApiResult},
+    http::{ApiError, ApiResult, Json, Path, Query, Routes},
 };
 
-pub fn routes() -> Router<AppState> {
-    direction_routes(TransferDirection::Download)
-        .merge(direction_routes(TransferDirection::Upload))
-        .route("/transfers/downloads/{username}", post(enqueue_downloads))
-        .route(
-            "/transfers/downloads/{username}/{id}/position",
-            get(download_position),
+const DOWNLOADS: bool = false;
+const UPLOADS: bool = true;
+
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/transfers/downloads", list::<DOWNLOADS>)
+        .post("/api/transfers/downloads", enqueue)
+        .delete(
+            "/api/transfers/downloads/completed",
+            clear_completed::<DOWNLOADS>,
         )
-        .route(
-            "/transfers/downloads/batches",
-            get(list_batches_username).post(enqueue_batch),
+        .get("/api/transfers/downloads/{id}", get_one::<DOWNLOADS>)
+        .delete("/api/transfers/downloads/{id}", remove::<DOWNLOADS>)
+        .post("/api/transfers/downloads/{id}/cancel", cancel::<DOWNLOADS>)
+        .get("/api/transfers/downloads/{id}/position", position)
+        .get("/api/transfers/uploads", list::<UPLOADS>)
+        .delete(
+            "/api/transfers/uploads/completed",
+            clear_completed::<UPLOADS>,
         )
-        .route("/transfers/downloads/batches/{id}", get(get_batch))
+        .get("/api/transfers/uploads/{id}", get_one::<UPLOADS>)
+        .delete("/api/transfers/uploads/{id}", remove::<UPLOADS>)
+        .post("/api/transfers/uploads/{id}/cancel", cancel::<UPLOADS>)
+        .post("/api/batches", create_batch)
+        .get("/api/batches/{id}", get_batch)
 }
 
-fn direction_routes(direction: TransferDirection) -> Router<AppState> {
-    let base = format!("/transfers/{}s", direction.as_route());
-    Router::new()
-        .route(&base, get(list_all))
-        .route(&format!("{base}/{{username}}"), get(list_user))
-        .route(
-            &format!("{base}/{{username}}/{{id}}"),
-            get(get_one).delete(cancel),
-        )
-        .route(&format!("{base}/all/completed"), delete(clear_completed))
-        .layer(Extension(direction))
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct IncludeRemoved {
-    include_removed: bool,
+const fn direction<const UPLOAD: bool>() -> TransferDirection {
+    if UPLOAD {
+        TransferDirection::Upload
+    } else {
+        TransferDirection::Download
+    }
 }
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
-struct Remove {
-    remove: bool,
+struct ListQuery {
+    username: Option<String>,
+    include_removed: bool,
 }
 
 fn bad_request(message: &str) -> ApiError {
     ApiError::BadRequest(message.into())
 }
-fn not_found() -> ApiError {
-    ApiError::NotFound(String::new())
-}
+
 fn throttled() -> ApiError {
     ApiError::Status(
         StatusCode::TOO_MANY_REQUESTS,
-        "Only one concurrent operation is permitted. Wait until the previous request completes"
-            .into(),
+        "Only one enqueue request may run at a time; retry when the previous one completes".into(),
     )
 }
 
+/// Ids are UUIDs; anything else names no transfer or batch.
 fn canonical_id(id: &str) -> ApiResult<String> {
     Uuid::parse_str(id)
         .map(|id| id.to_string())
-        .map_err(|_| bad_request(""))
+        .map_err(|_| ApiError::not_found())
 }
 
-fn optional_id(id: Option<String>) -> ApiResult<Option<String>> {
+fn optional_id(id: Option<String>, name: &str) -> ApiResult<Option<String>> {
     id.filter(|id| !id.trim().is_empty())
         .map(|id| {
             Uuid::parse_str(id.trim())
                 .map(|id| id.to_string())
-                .map_err(|_| {
-                    bad_request("One or more provided identifiers is not a valid GUID/UUID")
-                })
+                .map_err(|_| bad_request(&format!("{name} must be a UUID")))
         })
         .transpose()
 }
 
-fn body<T>(body: Result<Json<T>, JsonRejection>) -> ApiResult<T> {
-    body.map(|Json(body)| body)
-        .map_err(|error| bad_request(&error.body_text()))
-}
-
-fn grouped(transfers: Vec<Transfer>) -> Vec<UserResponse> {
-    let mut users = Vec::<UserResponse>::new();
-    let mut index = HashMap::<String, (usize, HashMap<String, usize>)>::new();
-    for file in transfers {
-        let (position, directory_index) = index.entry(file.username.clone()).or_insert_with(|| {
-            let position = users.len();
-            users.push(UserResponse {
-                username: file.username.clone(),
-                directories: Vec::new(),
-            });
-            (position, HashMap::new())
-        });
-        let directories = &mut users[*position].directories;
-        let remote_dir = destination::remote_directory(&file.filename);
-        let directory = if let Some(&position) = directory_index.get(remote_dir) {
-            &mut directories[position]
-        } else {
-            directory_index.insert(remote_dir.into(), directories.len());
-            directories.push(DirectoryResponse {
-                directory: remote_dir.into(),
-                file_count: 0,
-                files: Vec::new(),
-            });
-            directories.last_mut().expect("added directory")
-        };
-        directory.file_count += 1;
-        directory.files.push(file);
-    }
-    users
-}
-
-async fn list_all(
+async fn list<const UPLOAD: bool>(
     _: Authenticated,
     State(app): State<AppState>,
-    Extension(direction): Extension<TransferDirection>,
-    Query(query): Query<IncludeRemoved>,
-) -> ApiResult<Json<Vec<UserResponse>>> {
-    Ok(Json(grouped(
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<Vec<Transfer>>> {
+    let username = query.username.filter(|name| !name.is_empty());
+    Ok(Json(
         app.services
             .transfers
-            .list(direction, None, query.include_removed)
+            .list(direction::<UPLOAD>(), username, query.include_removed)
             .await?,
-    )))
+    ))
 }
 
-async fn list_user(
-    _: Authenticated,
-    State(app): State<AppState>,
-    Extension(direction): Extension<TransferDirection>,
-    Path(username): Path<String>,
-) -> ApiResult<Json<UserResponse>> {
-    user_response(app, direction, username).await
-}
-
-// The static POST /downloads/batches path also matches a user called "batches".
-async fn list_batches_username(
-    _: Authenticated,
-    State(app): State<AppState>,
-) -> ApiResult<Json<UserResponse>> {
-    user_response(app, TransferDirection::Download, "batches".into()).await
-}
-
-async fn user_response(
-    app: AppState,
-    direction: TransferDirection,
-    username: String,
-) -> ApiResult<Json<UserResponse>> {
-    grouped(
-        app.services
-            .transfers
-            .list(direction, Some(username), false)
-            .await?,
-    )
-    .pop()
-    .map(Json)
-    .ok_or_else(not_found)
-}
-
-async fn get_one(
-    _: Authenticated,
-    State(app): State<AppState>,
-    Extension(direction): Extension<TransferDirection>,
-    Path((_username, id)): Path<(String, String)>,
-) -> ApiResult<Json<Transfer>> {
-    app.services
-        .transfers
-        .find(direction, canonical_id(&id)?)
-        .await?
-        .map(Json)
-        .ok_or_else(not_found)
-}
-
-async fn get_batch(
+async fn get_one<const UPLOAD: bool>(
     _: Authenticated,
     State(app): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<Batch>> {
-    let id = canonical_id(&id)
-        .map_err(|_| bad_request(&format!("The specified id {id} is not a valid GUID/UUID")))?;
+) -> ApiResult<Json<Transfer>> {
     app.services
         .transfers
-        .batch(id)
+        .find(direction::<UPLOAD>(), canonical_id(&id)?)
         .await?
         .map(Json)
-        .ok_or_else(not_found)
+        .ok_or_else(ApiError::not_found)
 }
 
-async fn cancel(
+/// Cancels a transfer if it is active and keeps it in the list (204).
+async fn cancel<const UPLOAD: bool>(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    Extension(direction): Extension<TransferDirection>,
-    Path((_username, id)): Path<(String, String)>,
-    Query(query): Query<Remove>,
+    Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    app.services
-        .transfers
-        .cancel(direction, canonical_id(&id)?, query.remove)
-        .await?;
+    stop(&app, direction::<UPLOAD>(), &id, false).await
+}
+
+/// Cancels a transfer if it is active and removes it from the list (204).
+async fn remove<const UPLOAD: bool>(
+    _: RequireReadWrite,
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    stop(&app, direction::<UPLOAD>(), &id, true).await
+}
+
+async fn stop(
+    app: &AppState,
+    direction: TransferDirection,
+    id: &str,
+    remove: bool,
+) -> ApiResult<StatusCode> {
+    let transfers = &app.services.transfers;
+    let id = canonical_id(id)?;
+    transfers
+        .find(direction, id.clone())
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    transfers.cancel(direction, id, remove).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn clear_completed(
+/// Removes every completed transfer from the list (204).
+async fn clear_completed<const UPLOAD: bool>(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    Extension(direction): Extension<TransferDirection>,
 ) -> ApiResult<StatusCode> {
     let transfers = &app.services.transfers;
     transfers.ready().await?;
     transfers.flush().await;
-    store::remove(transfers.database(), direction, None).await?;
+    store::remove(transfers.database(), direction::<UPLOAD>(), None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn download_position(
+/// Asks the peer for a queued download's place in its upload queue.
+async fn position(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    Path((username, id)): Path<(String, String)>,
-) -> ApiResult<Json<u32>> {
-    if app.services.users.is_blacklisted(&username, None) {
-        return Err(not_found());
-    }
+    Path(id): Path<String>,
+) -> ApiResult<Json<QueuePosition>> {
     let transfers = &app.services.transfers;
     let transfer = transfers
         .find(TransferDirection::Download, canonical_id(&id)?)
         .await?
-        .ok_or_else(not_found)?;
-    transfers
+        .ok_or_else(ApiError::not_found)?;
+    if app.services.users.is_blacklisted(&transfer.username, None) {
+        return Err(ApiError::not_found());
+    }
+    let place_in_queue = transfers
         .download_position(&transfer)
         .await
-        .map(Json)
-        .map_err(|error| ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+        .map_err(|error| match error.downcast::<soulseek::Error>() {
+            Ok(error) => ApiError::from(error),
+            Err(error) => ApiError::Internal(error),
+        })?;
+    Ok(Json(QueuePosition { place_in_queue }))
 }
 
-/// Item of the plain `POST /transfers/downloads/{username}` body. slskd binds
-/// `Size` as a signed `long`, so negative values must deserialize.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlainDownloadRequest {
-    filename: String,
-    #[serde(default)]
-    size: i64,
-}
-
-/// The plain enqueue route only applies slskd's `[Required]` filename and
-/// path-traversal checks; the stricter shape checks are batch-only.
-fn validate_plain_files(files: &[PlainDownloadRequest]) -> ApiResult<()> {
-    if files.is_empty() {
-        return Err(bad_request("At least one file is required"));
-    }
-    if files.iter().any(|file| file.filename.trim().is_empty()) {
-        return Err(bad_request("At least one filename is empty or invalid"));
-    }
-    if files
-        .iter()
-        .any(|file| destination::traverses(&file.filename))
-    {
-        return Err(bad_request(
-            "One or more files in the request contain a dangerous path traversal segment",
-        ));
+fn validate_username(username: &str) -> ApiResult<()> {
+    if username.trim().is_empty() || username.encode_utf16().count() > 500 {
+        return Err(bad_request("A valid username is required"));
     }
     Ok(())
 }
 
-fn validate_files<T>(files: &[T], item: impl Fn(&T) -> (&str, Option<u64>)) -> ApiResult<()> {
+fn validate_files(files: &[DownloadFile]) -> ApiResult<()> {
     if files.is_empty() {
         return Err(bad_request("At least one file is required"));
     }
     let mut distinct = HashSet::with_capacity(files.len());
     for file in files {
-        let (filename, size) = item(file);
+        let filename = file.filename.as_str();
         if filename.trim().is_empty() || filename.ends_with(['/', '\\']) || filename.contains('\0')
         {
             return Err(bad_request("At least one filename is empty or invalid"));
@@ -301,17 +215,18 @@ fn validate_files<T>(files: &[T], item: impl Fn(&T) -> (&str, Option<u64>)) -> A
         if !distinct.insert(filename) {
             return Err(bad_request("Two or more files in the request are repeated"));
         }
-        if size.is_none_or(|size| size > i64::MAX as u64) {
-            return Err(bad_request("One or more file sizes are missing or invalid"));
+        if file.size > i64::MAX as u64 {
+            return Err(bad_request("One or more file sizes are invalid"));
         }
     }
     Ok(())
 }
 
-async fn check_peer(app: &AppState, username: &str) -> soulseek::Result<()> {
+/// Checks that the peer is reachable and not blacklisted, then connects to it.
+async fn prepare_peer(app: &AppState, username: &str) -> ApiResult<()> {
     let offline = || soulseek::Error::UserOffline(format!("User {username} appears to be offline"));
     if app.services.users.is_blacklisted(username, None) {
-        return Err(offline());
+        return Err(offline().into());
     }
     let endpoint = app.client.get_user_endpoint(username).await?;
     if app
@@ -319,194 +234,135 @@ async fn check_peer(app: &AppState, username: &str) -> soulseek::Result<()> {
         .users
         .is_blacklisted(username, Some(endpoint.ip()))
     {
-        return Err(offline());
+        return Err(offline().into());
     }
+    app.client
+        .connect_to_user(username, false, app.shutdown.child_token())
+        .await?;
     Ok(())
 }
 
-async fn connect_peer(app: &AppState, username: &str) -> Result<(), ApiError> {
-    app.client
-        .connect_to_user(username, false, app.shutdown.child_token())
-        .await
-        .map_err(|error| ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+/// 201 when every file was enqueued, 207 when some failed, 200 when none was enqueued.
+fn enqueue_status(enqueued: usize, failed: usize) -> StatusCode {
+    if failed == 0 {
+        StatusCode::CREATED
+    } else if enqueued == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    }
 }
 
-async fn enqueue_downloads(
+async fn enqueue(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    Path(username): Path<String>,
-    request: Result<Json<Option<Vec<Option<PlainDownloadRequest>>>>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<EnqueueDownloadsResponse>)> {
-    let files = body(request)?
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| bad_request("One or more files in the request are null"))?;
-    validate_plain_files(&files)?;
+    Json(request): Json<EnqueueDownloads>,
+) -> ApiResult<Response> {
+    validate_username(&request.username)?;
+    validate_files(&request.files)?;
     let transfers = &app.services.transfers;
     let _permit = transfers.request_permit().ok_or_else(throttled)?;
-    let internal = |message: String| ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, message);
-    check_peer(&app, &username)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
-    // Upstream's download service rejects repeats after the endpoint lookup,
-    // and the controller turns that into a 500 with the exception message.
-    let mut distinct = HashSet::with_capacity(files.len());
-    if !files
-        .iter()
-        .all(|file| distinct.insert(file.filename.as_str()))
-    {
-        return Err(internal(
-            "Two or more files in request are duplicated (Parameter 'files')".into(),
-        ));
-    }
-    connect_peer(&app, &username).await?;
-    let files = files
-        .into_iter()
-        .map(|file| QueueDownloadRequest {
-            filename: file.filename,
-            // slskd's `long Size` defaults to 0; anything non-positive is unknown.
-            size: file.size.max(0) as u64,
-        })
-        .collect();
-    let response = transfers
-        .enqueue_downloads(username, files, DownloadContext::default())
+    prepare_peer(&app, &request.username).await?;
+    let response: EnqueuedDownloads = transfers
+        .enqueue_downloads(request.username, request.files, DownloadContext::default())
         .await?;
-    Ok((StatusCode::CREATED, Json(response)))
+    let status = enqueue_status(response.enqueued.len(), response.failed.len());
+    Ok((status, Json(response)).into_response())
 }
 
-async fn enqueue_batch(
+async fn create_batch(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    request: Result<Json<EnqueueDownloadBatchRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<EnqueueDownloadBatchResponse>)> {
-    let request = body(request)?;
-    if request.username.trim().is_empty() || request.username.encode_utf16().count() > 500 {
-        return Err(bad_request("A valid username is required"));
-    }
-    validate_files(&request.files, |file| (&file.filename, file.size))?;
+    Json(request): Json<CreateBatch>,
+) -> ApiResult<Response> {
+    validate_username(&request.username)?;
+    validate_files(&request.files)?;
     if request
-        .options
         .destination
         .as_deref()
         .is_some_and(|dest| dest.trim().is_empty() || !destination::relative(dest))
     {
         return Err(bad_request(
-            "The destination must be a relative path without path traversal segments",
+            "destination must be a relative path without path traversal segments",
         ));
     }
     let batch = Batch {
-        id: optional_id(request.id)?.unwrap_or_else(|| Uuid::new_v4().to_string()),
-        search_id: optional_id(request.search_id)?,
+        id: optional_id(request.id, "id")?.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        search_id: optional_id(request.search_id, "search_id")?,
         username: request.username,
-        direction: TransferDirection::Download,
         created_at: Utc::now(),
-        transfers: None,
-        options: Some(BatchOptions {
-            destination: request.options.destination,
-            external_id: request.options.external_id,
-        }),
+        destination: request.destination,
+        external_id: request.external_id,
+        transfers: Vec::new(),
     };
     let service = &app.services.transfers;
     let _permit = service.request_permit().ok_or_else(throttled)?;
-    check_peer(&app, &batch.username).await.map_err(|error| {
-        if matches!(error, soulseek::Error::UserOffline(_)) {
-            ApiError::NotFound(error.to_string())
-        } else {
-            ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-        }
-    })?;
     service.ready().await?;
     if !store::create_batch(service.database(), batch.clone()).await? {
         return Err(ApiError::Conflict(format!(
-            "A batch with ID {} already exists",
+            "A batch with id {} already exists",
             batch.id
         )));
     }
-    connect_peer(&app, &batch.username).await?;
+    prepare_peer(&app, &batch.username).await?;
     let id = batch.id.clone();
     let username = batch.username.clone();
     let context = DownloadContext::new(&app, Some(batch)).await;
-    let files = request
-        .files
-        .into_iter()
-        .map(|file| QueueDownloadRequest {
-            filename: file.filename,
-            size: file.size.expect("validated size"),
-        })
-        .collect();
-    let response = service.enqueue_downloads(username, files, context).await?;
-    let status = if response.failed.is_empty() {
-        StatusCode::CREATED
-    } else if response.enqueued.is_empty() {
-        StatusCode::OK
-    } else {
-        StatusCode::MULTI_STATUS
-    };
-    let batch = service.batch(id).await?.ok_or_else(not_found)?;
+    let response = service
+        .enqueue_downloads(username, request.files, context)
+        .await?;
+    let status = enqueue_status(response.enqueued.len(), response.failed.len());
+    let batch = service.batch(id).await?.ok_or_else(ApiError::not_found)?;
     Ok((
         status,
-        Json(EnqueueDownloadBatchResponse {
+        Json(CreatedBatch {
             batch,
-            failures: response.failed,
+            failed: response.failed,
         }),
-    ))
+    )
+        .into_response())
+}
+
+async fn get_batch(
+    _: Authenticated,
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Batch>> {
+    app.services
+        .transfers
+        .batch(canonical_id(&id)?)
+        .await?
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfers::new_transfer;
 
     #[test]
-    fn transfer_routes_merge_and_keep_directory_group_order() {
+    fn enqueue_validation_and_status() {
         let _ = routes();
-        let rows = [
-            ("first", r"z\first"),
-            ("second", r"z\first"),
-            ("first", r"a\another"),
-            ("first", r"z\last"),
-        ]
-        .into_iter()
-        .map(|(user, filename)| {
-            new_transfer(TransferDirection::Download, user, filename.into(), 10, None)
-        })
-        .collect();
-        let users = grouped(rows);
-        assert_eq!(users[0].username, "first");
-        assert_eq!(users[0].directories[0].directory, "z");
-        assert_eq!(users[0].directories[0].file_count, 2);
-        assert_eq!(users[0].directories[1].directory, "a");
-        assert_eq!(users[1].username, "second");
-    }
-
-    #[test]
-    fn plain_enqueue_accepts_slskd_shapes_and_rejects_only_required_and_traversal() {
-        let files: Vec<PlainDownloadRequest> = serde_json::from_str(
-            r#"[{"filename":"Music\\a.flac","size":-5},{"filename":"Music\\dir\\"},
-                {"filename":"Music\\a.flac","size":3}]"#,
-        )
-        .unwrap();
-        assert_eq!(files[0].size, -5);
-        assert_eq!(files[1].size, 0);
-        // Repeats and trailing separators are not shape errors on this route.
-        assert!(validate_plain_files(&files).is_ok());
-
-        let reject = |json: &str| {
-            let files: Vec<PlainDownloadRequest> = serde_json::from_str(json).unwrap();
-            validate_plain_files(&files).unwrap_err()
-        };
-        assert!(matches!(reject("[]"), ApiError::BadRequest(_)));
-        assert!(matches!(
-            reject(r#"[{"filename":"  "}]"#),
-            ApiError::BadRequest(_)
-        ));
-        assert!(matches!(
-            reject(r#"[{"filename":"Music\\..\\secret"}]"#),
-            ApiError::BadRequest(m) if m.contains("traversal")
-        ));
-        // The batch route keeps its stricter validator.
-        let batch = [("a", Some(1)), ("a", Some(1))];
-        assert!(validate_files(&batch, |file| (file.0, file.1)).is_err());
+        let files = |json: &str| serde_json::from_str::<Vec<DownloadFile>>(json).unwrap();
+        assert!(validate_files(&files(r#"[{"filename":"Music\\a.flac","size":3}]"#)).is_ok());
+        for invalid in [
+            "[]",
+            r#"[{"filename":"  ","size":1}]"#,
+            r#"[{"filename":"Music\\dir\\","size":1}]"#,
+            r#"[{"filename":"Music\\..\\secret","size":1}]"#,
+            r#"[{"filename":"a","size":1},{"filename":"a","size":1}]"#,
+        ] {
+            assert!(
+                matches!(
+                    validate_files(&files(invalid)),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "{invalid}"
+            );
+        }
+        assert_eq!(enqueue_status(2, 0), StatusCode::CREATED);
+        assert_eq!(enqueue_status(1, 1), StatusCode::MULTI_STATUS);
+        assert_eq!(enqueue_status(0, 2), StatusCode::OK);
+        assert!(matches!(canonical_id("x"), Err(ApiError::NotFound(_))));
     }
 }

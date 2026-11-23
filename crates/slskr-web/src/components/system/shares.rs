@@ -2,14 +2,14 @@ use leptos::prelude::*;
 
 #[component]
 pub fn Shares() -> impl IntoView {
-    let shares = RwSignal::new(Vec::<slskr_api::shares::Share>::new());
+    let shares = RwSignal::new(Vec::<slskr_types::shares::Share>::new());
     let error = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
     let refresh = move || {
         busy.set(true);
         leptos::task::spawn_local(async move {
-            match crate::services::api::get::<slskr_api::shares::SharesByHost>("/shares").await {
-                Ok(result) => shares.set(result.into_values().flatten().collect()),
+            match crate::services::api::get::<Vec<slskr_types::shares::Share>>("/shares").await {
+                Ok(result) => shares.set(result),
                 Err(e) => error.set(e.to_string()),
             }
             busy.set(false);
@@ -18,7 +18,7 @@ pub fn Shares() -> impl IntoView {
     let scan = move || {
         busy.set(true);
         leptos::task::spawn_local(async move {
-            match crate::services::api::put_empty::<serde_json::Value>("/shares").await {
+            match crate::services::api::post_empty::<serde_json::Value>("/shares/scan").await {
                 Ok(_) => error.set("Share scan started".into()),
                 Err(e) => error.set(e.to_string()),
             }
@@ -28,7 +28,7 @@ pub fn Shares() -> impl IntoView {
     let cancel = move || {
         busy.set(true);
         leptos::task::spawn_local(async move {
-            match crate::services::api::delete::<serde_json::Value>("/shares").await {
+            match crate::services::api::delete::<serde_json::Value>("/shares/scan").await {
                 Ok(_) => error.set("Share scan cancelled".into()),
                 Err(e) => error.set(e.to_string()),
             }

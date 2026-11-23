@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use slskr_api::rooms::RoomInfo;
+use slskr_types::rooms::RoomInfo;
 use wasm_bindgen_futures::spawn_local;
 
 #[component]
@@ -12,7 +12,7 @@ pub fn RoomJoin(on_join: Callback<String>) -> impl IntoView {
     Effect::new(move |_| {
         if open.get() {
             spawn_local(async move {
-                match crate::services::api::get::<Vec<RoomInfo>>("/rooms/available").await {
+                match crate::services::api::get::<Vec<RoomInfo>>("/rooms").await {
                     Ok(value) => {
                         let _ = rooms.try_set(value);
                     }
@@ -29,7 +29,12 @@ pub fn RoomJoin(on_join: Callback<String>) -> impl IntoView {
             return;
         }
         spawn_local(async move {
-            match crate::services::api::post_text("/rooms/joined", &name).await {
+            match crate::services::api::post_text(
+                "/rooms/joined",
+                &slskr_types::rooms::JoinRoom { name: name.clone() },
+            )
+            .await
+            {
                 Ok(_) => {
                     if open.try_set(false).is_none() {
                         on_join.run(name);

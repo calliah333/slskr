@@ -5,7 +5,7 @@ use leptos_router::{
     components::A,
     hooks::{use_navigate, use_url},
 };
-use slskr_api::rooms::{RoomMessage, UserData};
+use slskr_types::rooms::{RoomMessage, RoomUser, Ticker};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -39,7 +39,7 @@ pub fn Rooms() -> impl IntoView {
     let active = RwSignal::new(room.unwrap_or_else(stored_room));
     let navigate = use_navigate();
     let messages = RwSignal::new(Vec::<RoomMessage>::new());
-    let users = RwSignal::new(Vec::<UserData>::new());
+    let users = RwSignal::new(Vec::<RoomUser>::new());
     let draft = RwSignal::new(String::new());
     let ticker = RwSignal::new(String::new());
     // The room whose ticker was last loaded; the ticker is fetched only on room change so
@@ -110,7 +110,7 @@ pub fn Rooms() -> impl IntoView {
                     Ok(value) => set_if_changed(messages, value),
                     Err(e) => problem = Some(e.to_string()),
                 }
-                let value = crate::services::api::get::<Vec<UserData>>(&format!(
+                let value = crate::services::api::get::<Vec<RoomUser>>(&format!(
                     "/rooms/joined/{encoded}/users"
                 ))
                 .await;
@@ -125,10 +125,11 @@ pub fn Rooms() -> impl IntoView {
                 if ticker_room.try_with_untracked(|room| room.as_deref() != Some(&selected))
                     == Some(true)
                 {
-                    let value = crate::services::api::get::<String>(&format!(
+                    let value = crate::services::api::get::<Ticker>(&format!(
                         "/rooms/joined/{encoded}/ticker"
                     ))
-                    .await;
+                    .await
+                    .map(|value| value.ticker);
                     if !still_active() {
                         finish();
                         return;
@@ -189,7 +190,8 @@ pub fn Rooms() -> impl IntoView {
                 "/rooms/joined/{}/messages",
                 crate::services::util::encode_uri_component(&room)
             );
-            if let Err(e) = crate::services::api::post_text(&path, &text).await {
+            let body = slskr_types::conversations::SendMessage { message: text };
+            if let Err(e) = crate::services::api::post_text(&path, &body).await {
                 let _ = error.try_set(Some(e.to_string()));
             }
             // Refresh only while the component (and its signals) is still alive.
@@ -210,7 +212,8 @@ pub fn Rooms() -> impl IntoView {
                 "/rooms/joined/{}/ticker",
                 crate::services::util::encode_uri_component(&room)
             );
-            if let Err(e) = crate::services::api::post_text(&path, &text).await {
+            let body = Ticker { ticker: text };
+            if let Err(e) = crate::services::api::put::<_, ()>(&path, &body).await {
                 let _ = error.try_set(Some(e.to_string()));
             }
         });
@@ -273,7 +276,7 @@ pub fn Rooms() -> impl IntoView {
                     <button type="button" on:click=leave_room>"Leave room"</button>
                     <div class="room-history">
                         <For each=move || messages.get() key=|message| format!("{}:{}:{}", message.timestamp, message.username, message.message) children=move |message| {
-                            let own = message.self_.unwrap_or(false);
+                            let own = message.is_self;
                             view! { <div class:room-message-self=own class="room-message">
                                 <time class="room-message-time">{message.timestamp.format("%Y-%m-%d %H:%M:%S").to_string()}</time>
                                 <span class="room-message-name">{message.username} ": "</span><span>{message.message}</span>

@@ -273,38 +273,6 @@ pub fn encode_uri_component(value: &str) -> String {
     out
 }
 
-/// Standard base64 with padding (`btoa` over raw bytes).
-pub fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Encodes a filesystem path for slskd's `/files` routes: URL-encoded base64 of its UTF-8 bytes.
-pub fn encode_path_base64(path: &str) -> String {
-    encode_uri_component(&base64_encode(path.as_bytes()))
-}
-
 /// Saves `data` as a file named `filename` through a temporary object-URL link.
 pub fn download_file(data: &[u8], filename: &str, mime: Option<&str>) -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
@@ -440,9 +408,5 @@ mod tests {
     #[test]
     fn encodes_paths() {
         assert_eq!(encode_uri_component("a b/ü"), "a%20b%2F%C3%BC");
-        assert_eq!(base64_encode(b"ab"), "YWI=");
-        assert_eq!(base64_encode(b"abc"), "YWJj");
-        assert_eq!(base64_encode(b"a"), "YQ==");
-        assert_eq!(encode_path_base64("??>"), "Pz8%2B");
     }
 }

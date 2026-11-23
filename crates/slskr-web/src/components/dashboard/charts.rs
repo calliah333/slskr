@@ -1,31 +1,38 @@
 use leptos::prelude::*;
-use slskr_api::telemetry::TransferHistogram;
+use slskr_types::{
+    telemetry::TransferHistogram,
+    transfers::{TransferDirection, TransferState},
+};
 
 #[derive(Clone, Debug)]
 pub struct Series {
-    pub key: &'static str,
+    pub key: TransferDirection,
     pub label: &'static str,
     pub color: &'static str,
 }
 
 fn value(
-    report: &slskr_api::telemetry::TransferSummaryReport,
-    direction: &str,
+    report: &slskr_types::telemetry::TransferSummaryReport,
+    direction: TransferDirection,
     errors: bool,
 ) -> f64 {
-    let Some(states) = report.get(direction) else {
+    let Some(states) = report.get(&direction) else {
         return 0.0;
     };
-    let amount: i64 = if errors {
-        ["Errored", "Cancelled", "TimedOut"]
-            .iter()
-            .filter_map(|state| states.get(*state))
-            .map(|summary| summary.count)
-            .sum()
+    let amount: u64 = if errors {
+        [
+            TransferState::Errored,
+            TransferState::Cancelled,
+            TransferState::TimedOut,
+        ]
+        .iter()
+        .filter_map(|state| states.get(state))
+        .map(|summary| summary.count)
+        .sum()
     } else {
         states.values().map(|summary| summary.total_bytes).sum()
     };
-    amount.max(0) as f64
+    amount as f64
 }
 
 #[component]
@@ -33,12 +40,12 @@ pub fn HistoryChart(histogram: TransferHistogram, errors: bool) -> impl IntoView
     let definitions = if errors {
         [
             Series {
-                key: "Upload",
+                key: TransferDirection::Upload,
                 label: "Upload errors",
                 color: "#db2828",
             },
             Series {
-                key: "Download",
+                key: TransferDirection::Download,
                 label: "Download errors",
                 color: "#f2711c",
             },
@@ -46,12 +53,12 @@ pub fn HistoryChart(histogram: TransferHistogram, errors: bool) -> impl IntoView
     } else {
         [
             Series {
-                key: "Upload",
+                key: TransferDirection::Upload,
                 label: "Uploaded",
                 color: "#21ba45",
             },
             Series {
-                key: "Download",
+                key: TransferDirection::Download,
                 label: "Downloaded",
                 color: "#2185d0",
             },

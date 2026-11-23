@@ -3,10 +3,6 @@
 pub mod conversations;
 pub mod rooms;
 
-use chrono::Utc;
-use slskr_api::events::{EventHeader, EventType};
-use uuid::Uuid;
-
 use crate::{
     app::{AppState, Core},
     events::EventService,
@@ -34,15 +30,6 @@ impl MessagingService {
     }
 }
 
-pub fn routes() -> axum::Router<AppState> {
+pub fn routes() -> crate::http::Routes {
     conversations::routes().merge(rooms::routes())
-}
-
-fn event_header(kind: EventType) -> EventHeader {
-    EventHeader {
-        id: Uuid::new_v4().to_string(),
-        timestamp: Utc::now(),
-        kind,
-        version: 1,
-    }
 }

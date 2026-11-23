@@ -1,8 +1,8 @@
 # slskr
 
 A Rust Soulseek client daemon with a browser UI. `soulseek` is a standalone Tokio
-library, `slskr` serves the daemon and the `/api/v0` API, and `slskr-web` builds the
-Leptos UI to WebAssembly. It connects to an existing Soulseek server; it does not
+library, `slskr` serves the daemon and its [HTTP API](docs/API.md) under `/api`, and
+`slskr-web` builds the Leptos UI to WebAssembly. It connects to an existing Soulseek server; it does not
 replace the central Soulseek server.
 
 ## Run on NixOS

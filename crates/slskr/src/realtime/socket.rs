@@ -1,4 +1,4 @@
-//! `GET {url_base}/api/events`: the WebSocket carrying [`slskr_api::realtime`] events.
+//! `GET {url_base}/api/events`: the WebSocket carrying [`slskr_types::realtime`] events.
 //!
 //! The upgrade is authenticated like any other route (session cookie or `X-API-Key`; a
 //! cookie presented with a foreign `Origin` is refused). Each connection runs as one task:
@@ -24,7 +24,7 @@ use futures::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use slskr_api::realtime::{
+use slskr_types::realtime::{
     CLOSE_TIMEOUT, CLOSE_TOO_SLOW, CLOSE_UNAUTHORIZED, Command, Event, MAX_CLIENT_MESSAGE, PATH,
     Topic,
 };
@@ -113,7 +113,7 @@ impl EventsEndpoint {
         }))
     }
 
-    /// Routes [`PATH`]; merge at the root of the (`url_base`-nested) endpoints.
+    /// Routes [`PATH`] to this endpoint (the daemon routes it with `bootstrap::api_routes`).
     pub fn router<S: Clone + Send + Sync + 'static>(&self) -> Router<S> {
         let endpoint = self.clone();
         Router::new().route(
@@ -122,7 +122,7 @@ impl EventsEndpoint {
         )
     }
 
-    async fn upgrade(self, request: Request) -> Response {
+    pub async fn upgrade(self, request: Request) -> Response {
         let (mut parts, _) = request.into_parts();
         let principal = match self.0.auth.authenticate_request(&parts) {
             Ok(principal) => principal,

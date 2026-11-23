@@ -8,22 +8,20 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::State,
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use base64::Engine;
-use slskr_api::users::{
-    BrowseResponse, BrowseStatus, Directory, DirectoryContentsRequest, Endpoint, Info, Statistics,
-    Status, UserPresence,
+use serde::Deserialize;
+use slskr_types::users::{
+    BrowseResponse, BrowseStatus, Directory, Endpoint, Info, Statistics, Status, UserPresence,
 };
 use tokio::{sync::broadcast, time::Instant};
 
 use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
-    http::{ApiError, ApiResult},
+    http::{ApiError, ApiResult, Json, Path, Query, Routes},
 };
 
 const DEFAULT: &str = "default";
@@ -278,11 +276,9 @@ impl UserService {
             .client
             .get_user_info(username, self.core.shutdown.child_token())
             .await?;
-        let has_picture = remote.has_picture();
         let value = Arc::new(Info {
             description: Some(remote.description),
             has_free_upload_slot: remote.has_free_upload_slot,
-            has_picture,
             picture: remote
                 .picture
                 .map(|picture| base64::engine::general_purpose::STANDARD.encode(picture)),
@@ -345,18 +341,18 @@ impl UserService {
                 self.core.shutdown.child_token(),
             )
             .await?;
-        let response = Arc::new(BrowseResponse::new(
-            remote
+        let response = Arc::new(BrowseResponse {
+            directories: remote
                 .directories
                 .into_iter()
                 .map(convert_directory)
                 .collect(),
-            remote
+            locked_directories: remote
                 .locked_directories
                 .into_iter()
                 .map(convert_directory)
                 .collect(),
-        ));
+        });
         let mut cache = self.cache.write().unwrap();
         if let Some(browse) = cache
             .browses
@@ -434,57 +430,40 @@ fn wildcard(pattern: &str, value: &str) -> bool {
     i == p.len()
 }
 pub(crate) fn convert_directory(directory: soulseek::Directory) -> Directory {
-    Directory::new(
-        directory.name,
-        directory.files.into_iter().map(convert_file).collect(),
-    )
+    Directory {
+        name: directory.name,
+        files: directory.files.into_iter().map(convert_file).collect(),
+    }
 }
 
-pub(crate) fn convert_file(file: soulseek::File) -> slskr_api::users::File {
-    use slskr_api::users::{File, FileAttribute, FileAttributeType as ApiType};
-    use soulseek::FileAttributeType as WireType;
-
-    let attributes = file
-        .attributes
-        .into_iter()
-        .filter_map(|attribute| {
-            let kind = match attribute.kind {
-                WireType::BitRate => ApiType::BitRate,
-                WireType::Duration => ApiType::Length,
-                WireType::VariableBitRate => ApiType::VariableBitRate,
-                WireType::SampleRate => ApiType::SampleRate,
-                WireType::BitDepth => ApiType::BitDepth,
-                WireType::Encoder | WireType::Unknown(_) => return None,
-            };
-            Some(FileAttribute {
-                kind,
-                value: attribute.value as i32,
-            })
-        })
-        .collect();
-    File::new(
-        i32::from(file.code),
-        file.filename,
-        file.size,
-        file.extension,
-        attributes,
-    )
+pub(crate) fn convert_file(file: soulseek::File) -> slskr_types::users::File {
+    slskr_types::users::File {
+        bit_rate: file.bit_rate(),
+        bit_depth: file.bit_depth(),
+        sample_rate: file.sample_rate(),
+        duration_ms: file.length().map(|seconds| u64::from(seconds) * 1000),
+        is_variable_bit_rate: file.is_variable_bit_rate(),
+        filename: file.filename,
+        size: file.size,
+        extension: file.extension,
+    }
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/users/{username}/browse", get(browse))
-        .route("/users/{username}/browse/status", get(browse_status))
-        .route("/users/{username}/info", get(info))
-        .route("/users/{username}/status", get(status))
-        .route("/users/{username}/statistics", get(statistics))
-        .route("/users/{username}/endpoint", get(endpoint))
-        .route("/users/{username}/directory", post(directory))
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/users/{username}/browse", browse)
+        .get("/api/users/{username}/browse/status", browse_status)
+        .get("/api/users/{username}/directory", directory)
+        .get("/api/users/{username}/endpoint", endpoint)
+        .get("/api/users/{username}/info", info)
+        .get("/api/users/{username}/statistics", statistics)
+        .get("/api/users/{username}/status", status)
 }
-/// Upstream hides blacklisted peers from network lookups.
+
+/// Blacklisted peers are hidden from network lookups.
 fn ensure_lookup(app: &AppState, username: &str) -> ApiResult<()> {
     if app.services.users.is_blacklisted(username, None) {
-        return Err(ApiError::NotFound(String::new()));
+        return Err(ApiError::not_found());
     }
     Ok(())
 }
@@ -508,7 +487,7 @@ async fn browse_status(
         .users
         .browse_status(&u)
         .map(Json)
-        .ok_or_else(|| ApiError::NotFound(String::new()))
+        .ok_or_else(ApiError::not_found)
 }
 
 async fn info(
@@ -550,24 +529,30 @@ async fn endpoint(
     )))
 }
 
+#[derive(Deserialize)]
+struct DirectoryQuery {
+    path: String,
+}
+
+/// The contents of one directory of a user's shares, asked of the peer.
 async fn directory(
     _: RequireReadWrite,
     State(s): State<AppState>,
     Path(u): Path<String>,
-    body: Result<Json<DirectoryContentsRequest>, JsonRejection>,
+    Query(query): Query<DirectoryQuery>,
 ) -> ApiResult<Json<Vec<Directory>>> {
-    let directory = match body {
-        Ok(Json(q)) if !q.directory.is_empty() => q.directory,
-        _ => return Err(ApiError::BadRequest(String::new())),
-    };
+    if query.path.is_empty() {
+        return Err(ApiError::BadRequest("path must not be empty".into()));
+    }
     ensure_lookup(&s, &u)?;
     let dirs = s
         .core
         .client
-        .get_directory_contents(&u, &directory, None, s.core.shutdown.child_token())
+        .get_directory_contents(&u, &query.path, None, s.core.shutdown.child_token())
         .await?;
     Ok(Json(dirs.into_iter().map(convert_directory).collect()))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,8 +602,7 @@ mod tests {
                 soulseek::FileAttribute::new(soulseek::FileAttributeType::Unknown(99), 0),
             ],
         });
-        assert_eq!(file.attribute_count, 2);
-        assert_eq!(file.length, Some(180));
+        assert_eq!(file.duration_ms, Some(180_000));
         assert_eq!(file.sample_rate, Some(48_000));
     }
 }

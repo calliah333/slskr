@@ -11,7 +11,7 @@ use leptos_router::{
     NavigateOptions,
     hooks::{use_navigate, use_url},
 };
-use slskr_api::users::{BrowseResponse, BrowseStatus};
+use slskr_types::users::{BrowseResponse, BrowseStatus};
 
 fn find_directory<'a>(nodes: &'a [TreeNode], name: &str) -> Option<&'a TreeNode> {
     for node in nodes {
@@ -95,12 +95,16 @@ pub fn Browse() -> impl IntoView {
                         detect_separator(response.directories.iter().map(|d| d.name.as_str()));
                     let summary = BrowseInfo {
                         directories: response.directories.len() as u32,
-                        files: response.directories.iter().map(|d| d.file_count).sum(),
+                        files: response
+                            .directories
+                            .iter()
+                            .map(|d| d.files.len() as u32)
+                            .sum(),
                         locked_directories: response.locked_directories.len() as u32,
                         locked_files: response
                             .locked_directories
                             .iter()
-                            .map(|d| d.file_count)
+                            .map(|d| d.files.len() as u32)
                             .sum(),
                         separator,
                     };

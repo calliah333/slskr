@@ -1,8 +1,10 @@
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use serde::{Serialize, de::DeserializeOwned};
-use slskr_api::search::{Search, SearchStates, SoulseekSearchResponse};
+use slskr_types::search::{Search, SearchResponse, SearchState};
 
+/// `searches.record` and `search_responses.response` hold the API JSON of [`Search`] and
+/// [`SearchResponse`].
 pub(super) const MIGRATIONS: &[&str] = &[
     "CREATE TABLE searches (id TEXT PRIMARY KEY, record TEXT NOT NULL, responses TEXT NOT NULL DEFAULT '[]');",
     "CREATE TABLE search_responses (
@@ -14,6 +16,52 @@ pub(super) const MIGRATIONS: &[&str] = &[
      INSERT INTO search_responses(search_id, response)
          SELECT searches.id, result.value FROM searches, json_each(searches.responses) AS result ORDER BY searches.rowid, result.key;
      ALTER TABLE searches DROP COLUMN responses;",
+    // From the slskd-shaped JSON (camelCase, flags strings) to the slskr API shape.
+    r#"UPDATE searches SET record = json_object(
+         'id', record ->> '$.id',
+         'query', record ->> '$.searchText',
+         'state', CASE
+             WHEN record ->> '$.state' LIKE '%Cancelled%' THEN 'cancelled'
+             WHEN record ->> '$.state' LIKE '%Errored%' THEN 'errored'
+             WHEN record ->> '$.state' LIKE '%ResponseLimitReached%' THEN 'response_limit_reached'
+             WHEN record ->> '$.state' LIKE '%FileLimitReached%' THEN 'file_limit_reached'
+             WHEN record ->> '$.state' LIKE '%TimedOut%' THEN 'timed_out'
+             WHEN record ->> '$.state' LIKE '%Completed%' THEN 'completed'
+             WHEN record ->> '$.state' LIKE '%InProgress%' THEN 'in_progress'
+             WHEN record ->> '$.state' LIKE '%Queued%' THEN 'queued'
+             ELSE 'requested' END,
+         'token', coalesce(record ->> '$.token', 0),
+         'started_at', record ->> '$.startedAt',
+         'ended_at', record ->> '$.endedAt',
+         'response_count', coalesce(record ->> '$.responseCount', 0),
+         'file_count', coalesce(record ->> '$.fileCount', 0),
+         'locked_file_count', coalesce(record ->> '$.lockedFileCount', 0));
+     UPDATE search_responses SET response = json_object(
+         'username', response ->> '$.username',
+         'token', coalesce(response ->> '$.token', 0),
+         'has_free_upload_slot', json(CASE WHEN response ->> '$.hasFreeUploadSlot' THEN 'true' ELSE 'false' END),
+         'upload_speed', coalesce(response ->> '$.uploadSpeed', 0),
+         'queue_length', coalesce(response ->> '$.queueLength', 0),
+         'files', (SELECT json_group_array(json_object(
+                 'filename', file.value ->> '$.filename',
+                 'size', coalesce(file.value ->> '$.size', 0),
+                 'extension', coalesce(file.value ->> '$.extension', ''),
+                 'bit_rate', file.value ->> '$.bitRate',
+                 'bit_depth', file.value ->> '$.bitDepth',
+                 'sample_rate', file.value ->> '$.sampleRate',
+                 'duration_ms', (file.value ->> '$.length') * 1000,
+                 'is_variable_bit_rate', json(CASE file.value ->> '$.isVariableBitRate' WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END)))
+             FROM json_each(response, '$.files') AS file),
+         'locked_files', (SELECT json_group_array(json_object(
+                 'filename', file.value ->> '$.filename',
+                 'size', coalesce(file.value ->> '$.size', 0),
+                 'extension', coalesce(file.value ->> '$.extension', ''),
+                 'bit_rate', file.value ->> '$.bitRate',
+                 'bit_depth', file.value ->> '$.bitDepth',
+                 'sample_rate', file.value ->> '$.sampleRate',
+                 'duration_ms', (file.value ->> '$.length') * 1000,
+                 'is_variable_bit_rate', json(CASE file.value ->> '$.isVariableBitRate' WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END)))
+             FROM json_each(response, '$.lockedFiles') AS file));"#,
 ];
 
 pub(super) fn load(db: &mut Connection) -> rusqlite::Result<Vec<Search>> {
@@ -26,10 +74,10 @@ pub(super) fn load(db: &mut Connection) -> rusqlite::Result<Vec<Search>> {
     };
     let now = Utc::now();
     for search in &mut searches {
-        if search.ended_at.is_none() || !search.state.contains(SearchStates::COMPLETED) {
+        if search.ended_at.is_none() || !search.state.is_complete() {
             // An unclean exit can interrupt a search, but its committed results are still available.
+            search.state = SearchState::TimedOut;
             search.ended_at = Some(now);
-            search.set_state(SearchStates::COMPLETED | SearchStates::TIMED_OUT);
             update(&transaction, search)?;
         }
     }
@@ -47,7 +95,7 @@ pub(super) fn insert(db: &Connection, search: &Search) -> rusqlite::Result<bool>
 pub(super) fn append(
     db: &mut Connection,
     id: &str,
-    response: &SoulseekSearchResponse,
+    response: &SearchResponse,
     [responses, files, locked_files]: [u32; 3],
 ) -> rusqlite::Result<()> {
     let transaction = db.transaction()?;
@@ -56,7 +104,7 @@ pub(super) fn append(
         params![id, encode(response)?],
     )?;
     transaction.execute(
-        "UPDATE searches SET record = json_set(record, '$.responseCount', ?2, '$.fileCount', ?3, '$.lockedFileCount', ?4)
+        "UPDATE searches SET record = json_set(record, '$.response_count', ?2, '$.file_count', ?3, '$.locked_file_count', ?4)
          WHERE id = ?1",
         params![id, responses, files, locked_files],
     )?;
@@ -71,37 +119,34 @@ pub(super) fn update(db: &Connection, search: &Search) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub(super) fn get(
+pub(super) fn get(db: &Connection, id: &str) -> rusqlite::Result<Option<Search>> {
+    db.query_row(
+        "SELECT record FROM searches WHERE id = ?1",
+        [id],
+        decode::<Search>,
+    )
+    .optional()
+}
+
+/// The responses of a search in arrival order; `None` when there is no such search.
+pub(super) fn responses(
     db: &Connection,
     id: &str,
-    include_responses: bool,
-) -> rusqlite::Result<Option<Search>> {
-    let Some(mut search) = db
-        .query_row(
-            "SELECT record FROM searches WHERE id = ?1",
-            [id],
-            decode::<Search>,
-        )
-        .optional()?
-    else {
+) -> rusqlite::Result<Option<Vec<SearchResponse>>> {
+    if get(db, id)?.is_none() {
         return Ok(None);
-    };
-    if include_responses {
-        let mut statement = db.prepare(
-            "SELECT response FROM search_responses WHERE search_id = ?1 ORDER BY sequence",
-        )?;
-        search.responses = Some(
-            statement
-                .query_map([id], decode)?
-                .collect::<rusqlite::Result<_>>()?,
-        );
     }
-    Ok(Some(search))
+    let mut statement =
+        db.prepare("SELECT response FROM search_responses WHERE search_id = ?1 ORDER BY sequence")?;
+    statement
+        .query_map([id], decode)?
+        .collect::<rusqlite::Result<_>>()
+        .map(Some)
 }
 
 pub(super) fn search_text(db: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
     db.query_row(
-        "SELECT json_extract(record, '$.searchText') FROM searches WHERE id = ?1",
+        "SELECT json_extract(record, '$.query') FROM searches WHERE id = ?1",
         [id],
         |row| row.get(0),
     )

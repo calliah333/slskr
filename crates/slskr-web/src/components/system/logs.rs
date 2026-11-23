@@ -9,7 +9,7 @@ pub fn Logs() -> impl IntoView {
 #[component]
 fn LiveLogs() -> impl IntoView {
     use crate::services::events::{Event, Topic, use_events};
-    let lines = RwSignal::new(Vec::<slskr_api::logs::LogRecord>::new());
+    let lines = RwSignal::new(Vec::<slskr_types::logs::LogRecord>::new());
     let error = RwSignal::new(String::new());
     use_events().on(Topic::Logs, move |event| match event {
         Event::LogBuffer(records) => {
@@ -34,14 +34,13 @@ fn LiveLogs() -> impl IntoView {
 
 #[component]
 fn LogHistory() -> impl IntoView {
-    let files = RwSignal::new(Vec::<slskr_api::files::FilesystemFile>::new());
+    let files = RwSignal::new(Vec::<slskr_types::logs::LogFile>::new());
     let selected = RwSignal::new(String::new());
     let contents = RwSignal::new(String::new());
     let error = RwSignal::new(String::new());
     Effect::new(move |_| {
         leptos::task::spawn_local(async move {
-            match crate::services::api::get::<Vec<slskr_api::files::FilesystemFile>>("/logs/files")
-                .await
+            match crate::services::api::get::<Vec<slskr_types::logs::LogFile>>("/logs/files").await
             {
                 Ok(names) => files.set(names),
                 Err(e) => error.set(e.to_string()),

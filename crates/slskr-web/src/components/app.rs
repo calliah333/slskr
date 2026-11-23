@@ -5,8 +5,9 @@ use leptos_router::{
     hooks::use_location,
     path,
 };
-use slskr_api::{
-    application::State, config::Config, telemetry::CurrentMetrics, transfers::TransferDirection,
+use slskr_types::{
+    application::State, config::Config, server::ConnectionState, telemetry::CurrentMetrics,
+    transfers::TransferDirection,
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 
@@ -99,7 +100,9 @@ async fn check_token() -> Result<bool, api::ApiError> {
 }
 
 async fn check_session() -> Result<Session, api::ApiError> {
-    let passthrough = !api::get::<bool>("/session/enabled").await?;
+    let passthrough = !api::get::<slskr_types::session::AuthInfo>("/auth")
+        .await?
+        .enabled;
     Ok(if check_token().await? {
         Session::Authenticated { passthrough }
     } else {
@@ -376,17 +379,20 @@ fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
 fn ConnectButton(state: RwSignal<State>) -> impl IntoView {
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
-    let connected = Memo::new(move |_| state.with(|state| state.server.is_connected));
+    let connected = Memo::new(move |_| state.with(|state| state.server.state.is_connected()));
     let status = Memo::new(move |_| {
         state.with(|state| {
-            if state.server.is_connected {
+            if state.server.state.is_connected() {
                 let icon = if state.pending_reconnect {
                     "yellow plug icon"
                 } else {
                     "green plug icon"
                 };
                 (icon, "Connected")
-            } else if state.server.is_connecting || state.server.is_logging_in {
+            } else if matches!(
+                state.server.state,
+                ConnectionState::Connecting | ConnectionState::LoggingIn
+            ) {
                 ("green sync alternate loading icon", "Connecting")
             } else if state.connection_watchdog.is_attempting_connection {
                 ("yellow clock icon", "Waiting to Reconnect")
@@ -402,13 +408,13 @@ fn ConnectButton(state: RwSignal<State>) -> impl IntoView {
         let connected = connected.get_untracked();
         spawn_local_scoped_with_cancellation(async move {
             let result = if connected {
-                api::delete_with::<_, serde_json::Value>(
-                    "/server",
-                    "client disconnected from web UI",
+                api::post::<_, serde_json::Value>(
+                    "/server/disconnect",
+                    &serde_json::json!({"message": "client disconnected from web UI"}),
                 )
                 .await
             } else {
-                api::put_empty::<serde_json::Value>("/server").await
+                api::post_empty::<serde_json::Value>("/server/connect").await
             };
             if let Err(err) = result {
                 error.set(Some(err.to_string()));

@@ -61,7 +61,7 @@ async fn daemon_http_smoke() {
     let mut daemon = Daemon(child);
     let base = format!("http://127.0.0.1:{port}");
     // The session cookie's path is the url_base, so use the prefixed API.
-    let api = format!("{base}/client/api/v0");
+    let api = format!("{base}/client/api");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .cookie_store(true)
@@ -97,15 +97,16 @@ async fn daemon_http_smoke() {
         .await
         .unwrap();
     assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let denied: Value = denied.json().await.unwrap();
+    assert_eq!(denied, serde_json::json!({"error": "Unauthorized"}));
 
     let login = client
         .post(format!("{api}/session"))
         .json(&serde_json::json!({"username": "smoke", "password": "secret"}))
         .send()
         .await
-        .unwrap()
-        .error_for_status()
         .unwrap();
+    assert_eq!(login.status(), reqwest::StatusCode::CREATED);
     let cookie = login.headers()["set-cookie"].to_str().unwrap().to_owned();
     assert!(cookie.starts_with("slskr_session="), "{cookie}");
     for attribute in [
@@ -120,7 +121,7 @@ async fn daemon_http_smoke() {
     let login: Value = login.json().await.unwrap();
     assert_eq!(
         login,
-        serde_json::json!({"username": "smoke", "role": "Administrator"})
+        serde_json::json!({"username": "smoke", "role": "admin"})
     );
     let session: Value = client
         .get(format!("{api}/session"))
@@ -190,7 +191,7 @@ async fn daemon_http_smoke() {
         }
     };
     assert_eq!(snapshot["type"], "state");
-    assert!(snapshot["data"]["shares"].get("scanProgress").is_some());
+    assert!(snapshot["data"]["shares"].get("scan_progress").is_some());
     events.close(None).await.unwrap();
 
     let authorized = client
@@ -201,11 +202,12 @@ async fn daemon_http_smoke() {
         .error_for_status()
         .unwrap();
     let state: Value = authorized.json().await.unwrap();
-    assert!(state["shares"].get("scanProgress").is_some());
-    assert!(state.get("distributedNetwork").is_some());
+    assert!(state["shares"].get("scan_progress").is_some());
+    assert!(state.get("distributed_network").is_some());
+    assert_eq!(state["server"]["state"], "disconnected");
 
     let options: Value = client
-        .get(format!("{api}/options"))
+        .get(format!("{api}/config"))
         .send()
         .await
         .unwrap()
@@ -276,12 +278,14 @@ async fn daemon_http_smoke() {
         .await
         .unwrap();
     assert_eq!(pinned.status(), reqwest::StatusCode::CONFLICT);
-    assert!(pinned.text().await.unwrap().contains("web.listen"));
+    let pinned: Value = pinned.json().await.unwrap();
+    assert!(pinned["error"].as_str().unwrap().contains("web.listen"));
     let invalid = patch(serde_json::json!({"uploads": {"slots": 0}}))
         .await
         .unwrap();
     assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert!(invalid.text().await.unwrap().contains("uploads.slots"));
+    let invalid: Value = invalid.json().await.unwrap();
+    assert!(invalid["error"].as_str().unwrap().contains("uploads.slots"));
     let reset = client
         .delete(format!("{api}/settings/uploads.slots"))
         .send()
@@ -292,15 +296,17 @@ async fn daemon_http_smoke() {
     let reset: Value = reset.json().await.unwrap();
     assert_eq!(reset["values"]["uploads"]["slots"], 20);
     assert_eq!(reset["pending_restart"], false);
-    // The raw configuration file endpoints are gone.
-    for path in ["/options/toml", "/options/toml/location"] {
+    // Removed endpoints and the old versioned prefix answer JSON 404s.
+    for path in ["/options", "/v0/application", "/application/loopback"] {
         let gone = client.get(format!("{api}{path}")).send().await.unwrap();
         assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        let gone: Value = gone.json().await.unwrap();
+        assert!(gone["error"].is_string(), "{path}");
     }
 
     // API keys: created once, used with X-API-Key, refused after deletion.
     let created = client
-        .post(format!("{api}/settings/api-keys"))
+        .post(format!("{api}/api-keys"))
         .json(&serde_json::json!({"name": "smoke-key", "role": "readwrite"}))
         .send()
         .await
@@ -341,7 +347,7 @@ async fn daemon_http_smoke() {
     );
     assert!(!listed.to_string().contains(&key));
     let deleted = client
-        .delete(format!("{api}/settings/api-keys/smoke-key"))
+        .delete(format!("{api}/api-keys/smoke-key"))
         .send()
         .await
         .unwrap();
@@ -353,13 +359,98 @@ async fn daemon_http_smoke() {
 
     // Deleting a missing download is a 404; deletion is confined to the downloads root.
     let deletion = client
-        .delete(format!("{api}/files/downloads/files/c2FtcGxlLnR4dA%3D%3D"))
+        .delete(format!("{api}/files/downloads?path=sample.txt"))
         .send()
         .await
         .unwrap();
     assert_eq!(deletion.status(), reqwest::StatusCode::NOT_FOUND);
+    for path in ["..%2Fslskr.toml", "", "%2E%2E"] {
+        let refused = client
+            .delete(format!("{api}/files/downloads?path={path}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            matches!(refused.status().as_u16(), 400 | 403),
+            "{path}: {}",
+            refused.status()
+        );
+    }
+    let listing: Value = client
+        .get(format!("{api}/files/downloads"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listing["path"], "");
+    assert!(listing["files"].is_array());
 
-    let scan = client.put(format!("{api}/shares")).send().await.unwrap();
+    // Requests the daemon cannot serve while disconnected, and malformed bodies.
+    let search = client
+        .post(format!("{api}/searches"))
+        .json(&serde_json::json!({"query": "smoke test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(search.status(), reqwest::StatusCode::CONFLICT);
+    let search: Value = search.json().await.unwrap();
+    assert!(search["error"].as_str().unwrap().contains("logged in"));
+    let malformed = client
+        .post(format!("{api}/searches"))
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+    let malformed: Value = malformed.json().await.unwrap();
+    assert!(malformed["error"].is_string());
+    let wrong_shape = client
+        .post(format!("{api}/searches"))
+        .json(&serde_json::json!({"query": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_shape.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let not_allowed = client.put(format!("{api}/searches")).send().await.unwrap();
+    assert_eq!(
+        not_allowed.status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
+    );
+    let not_allowed: Value = not_allowed.json().await.unwrap();
+    assert!(not_allowed["error"].is_string());
+    let unknown_transfer = client
+        .get(format!(
+            "{api}/transfers/downloads/00000000-0000-0000-0000-000000000000"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_transfer.status(), reqwest::StatusCode::NOT_FOUND);
+    let downloads: Value = client
+        .get(format!("{api}/transfers/downloads"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(downloads, serde_json::json!([]));
+
+    let scan = client
+        .post(format!("{api}/shares/scan"))
+        .send()
+        .await
+        .unwrap();
     // The startup scan may still be running.
     assert!(
         scan.status().is_success() || scan.status() == reqwest::StatusCode::CONFLICT,
@@ -368,8 +459,17 @@ async fn daemon_http_smoke() {
     );
     let contents = timeout(Duration::from_secs(30), async {
         loop {
+            let shares: Value = client
+                .get(format!("{api}/shares"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let id = shares[0]["id"].as_str().unwrap();
             let response = client
-                .get(format!("{api}/shares/contents"))
+                .get(format!("{api}/shares/{id}/contents"))
                 .send()
                 .await
                 .unwrap();
@@ -412,10 +512,12 @@ async fn daemon_http_smoke() {
         .await
         .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing: Value = missing.json().await.unwrap();
+    assert_eq!(missing, serde_json::json!({"error": "Not Found"}));
 
     // A page on another site cannot use the cookie to change state.
     let forged = client
-        .put(format!("{api}/shares"))
+        .post(format!("{api}/shares/scan"))
         .header("origin", "http://evil.example")
         .send()
         .await
@@ -430,12 +532,12 @@ async fn daemon_http_smoke() {
         .unwrap();
     assert_eq!(forged.status(), reqwest::StatusCode::FORBIDDEN);
     let same_origin = client
-        .post(format!("{api}/application/loopback"))
+        .post(format!("{api}/server/disconnect"))
         .header("origin", &base)
         .send()
         .await
         .unwrap();
-    assert_eq!(same_origin.status(), reqwest::StatusCode::OK);
+    assert_eq!(same_origin.status(), reqwest::StatusCode::NO_CONTENT);
 
     let logout = client
         .delete(format!("{api}/session"))

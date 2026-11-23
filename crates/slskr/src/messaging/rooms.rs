@@ -6,16 +6,14 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
 };
 use chrono::Utc;
-use slskr_api::{
-    events::{Event, EventType, RoomMessageReceivedEvent},
-    rooms::{Room, RoomInfo, RoomMessage, UserData},
+use slskr_types::{
+    events::EventData,
+    rooms::{AddMember, JoinRoom, Room, RoomInfo, RoomMessage, RoomUser, Ticker},
     users::UserPresence,
 };
 use soulseek::{Event as ClientEvent, RoomData, RoomList, RoomTicker, SoulseekClient};
@@ -24,11 +22,10 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::event_header;
 use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
-    http::{ApiError, ApiResult},
+    http::{ApiError, ApiResult, Json, Path, Routes},
 };
 
 const MESSAGE_LIMIT: usize = 25;
@@ -134,7 +131,7 @@ impl JoinedRoom {
         }
     }
 
-    fn users(&self, username: Option<&str>) -> Vec<UserData> {
+    fn users(&self, username: Option<&str>) -> Vec<RoomUser> {
         self.data
             .users
             .iter()
@@ -146,11 +143,11 @@ impl JoinedRoom {
         Room {
             name: self.data.name.clone(),
             is_private: self.data.is_private,
-            operator_count: self
-                .data
-                .is_private
-                .then_some(self.data.operators.len() as u32),
-            operators: self.data.is_private.then(|| self.data.operators.clone()),
+            operators: if self.data.is_private {
+                self.data.operators.clone()
+            } else {
+                Vec::new()
+            },
             owner: self.data.owner.clone(),
             users: self.users(username),
             messages: self.messages.iter().cloned().collect(),
@@ -168,10 +165,10 @@ impl JoinedRoom {
     }
 }
 
-fn user_response(user: &soulseek::UserData, username: Option<&str>) -> UserData {
-    UserData {
+fn user_response(user: &soulseek::UserData, username: Option<&str>) -> RoomUser {
+    RoomUser {
         username: user.username.clone(),
-        self_: (username == Some(user.username.as_str())).then_some(true),
+        is_self: username == Some(user.username.as_str()),
         average_speed: user.average_speed,
         country_code: user.country_code.clone(),
         directory_count: user.directory_count,
@@ -259,7 +256,7 @@ enum Update {
 }
 
 impl Update {
-    fn apply(self, room: &mut JoinedRoom) -> Option<serde_json::Value> {
+    fn apply(self, room: &mut JoinedRoom) -> Option<RoomMessage> {
         match self {
             Self::UserJoined(user) => {
                 if let Some(existing) = room
@@ -277,13 +274,7 @@ impl Update {
                 room.data.users.retain(|user| user.username != username);
             }
             Self::Message(message) => {
-                let event_message = serde_json::json!({
-                    "timestamp": message.timestamp,
-                    "username": message.username,
-                    "message": message.message,
-                    "roomName": message.room_name,
-                    "direction": "Out",
-                });
+                let event_message = message.clone();
                 if room.messages.len() == MESSAGE_LIMIT {
                     room.messages.pop_front();
                 }
@@ -361,10 +352,8 @@ impl Session {
                 if self.service.with_room(&name, |_| ()).is_ok() {
                     let _ = reply.send(Ok(None));
                 } else if !self.logged_in {
-                    Action::Join(Some(reply)).fail(ApiError::Status(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Not logged in to Soulseek".into(),
-                    ));
+                    Action::Join(Some(reply))
+                        .fail(ApiError::Conflict("Not logged in to Soulseek".into()));
                 } else {
                     self.begin(name, Action::Join(Some(reply)));
                 }
@@ -521,16 +510,16 @@ impl Session {
                     .is_blacklisted(&message.username, None)
                 {
                     let timestamp = Utc::now();
-                    let self_ = self.is_self(&message.username).then_some(true);
+                    let is_self = self.is_self(&message.username);
                     let room = message.room;
                     self.update(
                         &room,
                         Update::Message(RoomMessage {
                             timestamp,
-                            self_,
+                            is_self,
                             username: message.username,
                             message: message.message,
-                            room_name: room.clone(),
+                            room: room.clone(),
                         }),
                     );
                 }
@@ -586,14 +575,11 @@ impl Session {
         }
     }
 
-    fn raise_message(&self, message: serde_json::Value) {
+    fn raise_message(&self, message: RoomMessage) {
         self.app
             .services
             .events
-            .raise(Event::RoomMessageReceived(RoomMessageReceivedEvent {
-                header: event_header(EventType::RoomMessageReceived),
-                message,
-            }));
+            .raise(EventData::RoomMessageReceived(message));
     }
 
     fn is_self(&self, username: &str) -> bool {
@@ -681,21 +667,19 @@ impl Session {
     }
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/rooms/available", get(available))
-        .route("/rooms/joined", get(joined).post(join))
-        .route("/rooms/joined/{room}", get(room).delete(leave))
-        .route("/rooms/joined/{room}/users", get(users))
-        .route(
-            "/rooms/joined/{room}/messages",
-            get(messages).post(send_message),
-        )
-        .route("/rooms/joined/{room}/ticker", get(ticker).post(set_ticker))
-        .route(
-            "/rooms/joined/{room}/members",
-            axum::routing::post(add_member),
-        )
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/rooms", available)
+        .get("/api/rooms/joined", joined)
+        .post("/api/rooms/joined", join)
+        .get("/api/rooms/joined/{room}", room)
+        .delete("/api/rooms/joined/{room}", leave)
+        .get("/api/rooms/joined/{room}/users", users)
+        .post("/api/rooms/joined/{room}/members", add_member)
+        .get("/api/rooms/joined/{room}/messages", messages)
+        .post("/api/rooms/joined/{room}/messages", send_message)
+        .get("/api/rooms/joined/{room}/ticker", ticker)
+        .put("/api/rooms/joined/{room}/ticker", set_ticker)
 }
 
 async fn available(
@@ -709,23 +693,27 @@ async fn joined(_: Authenticated, State(app): State<AppState>) -> ApiResult<Json
     Ok(Json(app.services.messaging.rooms.names()))
 }
 
+fn room_response(app: &AppState, name: &str) -> ApiResult<Room> {
+    let username = app.client.username();
+    app.services
+        .messaging
+        .rooms
+        .with_room(name, |room| room.response(username.as_deref()))
+}
+
 async fn room(
     _: Authenticated,
     State(app): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Room>> {
-    let username = app.client.username();
-    app.services
-        .messaging
-        .rooms
-        .with_room(&name, |room| Json(room.response(username.as_deref())))
+    room_response(&app, &name).map(Json)
 }
 
 async fn users(
     _: Authenticated,
     State(app): State<AppState>,
     Path(name): Path<String>,
-) -> ApiResult<Json<Vec<UserData>>> {
+) -> ApiResult<Json<Vec<RoomUser>>> {
     let username = app.client.username();
     app.services
         .messaging
@@ -748,38 +736,39 @@ async fn ticker(
     _: Authenticated,
     State(app): State<AppState>,
     Path(name): Path<String>,
-) -> ApiResult<Json<String>> {
+) -> ApiResult<Json<Ticker>> {
     let username = app.client.username();
     app.services.messaging.rooms.with_room(&name, |room| {
-        Json(
-            username
+        Json(Ticker {
+            ticker: username
                 .as_ref()
                 .and_then(|username| room.tickers.get(username))
                 .cloned()
                 .unwrap_or_default(),
-        )
+        })
     })
 }
 
+/// Joins a room: 201 with the room, or 200 with it when already joined.
 async fn join(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    Json(name): Json<String>,
+    Json(JoinRoom { name }): Json<JoinRoom>,
 ) -> ApiResult<Response> {
     if name.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "The room name must not be blank".into(),
         ));
     }
-    let room = app
+    let joined = app
         .services
         .messaging
         .rooms
-        .request(|reply| Command::Join(name, reply))
+        .request(|reply| Command::Join(name.clone(), reply))
         .await?;
-    Ok(match room {
+    Ok(match joined {
         Some(room) => (StatusCode::CREATED, Json(room)).into_response(),
-        None => StatusCode::OK.into_response(),
+        None => Json(room_response(&app, &name)?).into_response(),
     })
 }
 
@@ -794,40 +783,42 @@ async fn leave(
         .rooms
         .request(|reply| Command::Leave(name, reply))
         .await?;
-    Ok(if left {
-        StatusCode::NO_CONTENT
+    if left {
+        Ok(StatusCode::NO_CONTENT)
     } else {
-        StatusCode::NOT_FOUND
-    })
+        Err(ApiError::not_found())
+    }
 }
 
 async fn send_message(
     _: RequireReadWrite,
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Json(message): Json<String>,
+    Json(request): Json<slskr_types::conversations::SendMessage>,
 ) -> ApiResult<StatusCode> {
     app.services.messaging.rooms.with_room(&name, |_| ())?;
-    app.client.send_room_message(&name, &message).await?;
-    Ok(StatusCode::CREATED)
+    app.client
+        .send_room_message(&name, &request.message)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn set_ticker(
     _: RequireReadWrite,
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Json(message): Json<String>,
+    Json(request): Json<Ticker>,
 ) -> ApiResult<StatusCode> {
     app.services.messaging.rooms.with_room(&name, |_| ())?;
-    app.client.set_room_ticker(&name, &message).await?;
-    Ok(StatusCode::CREATED)
+    app.client.set_room_ticker(&name, &request.ticker).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn add_member(
     _: RequireReadWrite,
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Json(username): Json<String>,
+    Json(AddMember { username }): Json<AddMember>,
 ) -> ApiResult<StatusCode> {
     let self_username = app.client.username();
     let allowed = app.services.messaging.rooms.with_room(&name, |room| {
@@ -841,7 +832,7 @@ async fn add_member(
         ));
     }
     app.client.add_private_room_member(&name, &username).await?;
-    Ok(StatusCode::CREATED)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -892,19 +883,19 @@ mod tests {
         let now = Utc::now();
         for i in 0..=MESSAGE_LIMIT {
             Update::Message(RoomMessage {
-                room_name: "private".into(),
+                room: "private".into(),
                 username: "owner".into(),
                 timestamp: now,
                 message: i.to_string(),
-                self_: Some(true),
+                is_self: true,
             })
             .apply(&mut room);
         }
         let response = room.response(Some("owner"));
-        assert_eq!(response.operator_count, Some(1));
+        assert_eq!(response.operators.len(), 1);
         assert_eq!(response.users.len(), 2);
-        assert_eq!(response.users[0].self_, Some(true));
-        assert_eq!(response.users[1].self_, None);
+        assert!(response.users[0].is_self);
+        assert!(!response.users[1].is_self);
         assert_eq!(response.messages.len(), MESSAGE_LIMIT);
         assert_eq!(response.messages[0].message, "1");
     }

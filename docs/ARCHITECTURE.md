@@ -1,10 +1,11 @@
 # slskr architecture
 
-slskr is a Soulseek client daemon with a web UI, functionally equivalent to
-[slskd](https://github.com/slskd/slskd). The Soulseek network library is a Rust
-port of [Soulseek.NET](https://github.com/jpdillingham/Soulseek.NET) behaviour
-(wire-compatible, not file-by-file). Reference sources are cloned (read-only,
-git-ignored) under `ref/Soulseek.NET` and `ref/slskd`.
+slskr is a Soulseek client daemon with a web UI. It began as a port of
+[slskd](https://github.com/slskd/slskd) and keeps its features, but its HTTP API, live
+events and configuration are its own. The Soulseek network library is a Rust port of
+[Soulseek.NET](https://github.com/jpdillingham/Soulseek.NET) behaviour (wire-compatible
+with real Soulseek clients and servers, not file-by-file). Reference sources are cloned
+(read-only, git-ignored) under `ref/Soulseek.NET` and `ref/slskd`.
 
 Toolchain: `nix develop` (flake.nix) provides stable Rust (edition 2024) with the
 `wasm32-unknown-unknown` target, `trunk`, `wasm-bindgen-cli` 0.2.130.
@@ -14,7 +15,7 @@ Toolchain: `nix develop` (flake.nix) provides stable Rust (edition 2024) with th
 | crate | kind | purpose |
 |---|---|---|
 | `crates/soulseek` | lib | async (tokio) Soulseek network client |
-| `crates/slskr-api` | lib | serde DTOs of the HTTP API and live events; shared by daemon and UI |
+| `crates/slskr-types` | lib | serde types of the HTTP API and live events; shared by daemon and UI |
 | `crates/slskr` | bin `slskr` (+ lib) | the daemon: axum HTTP API, live events WebSocket, services, sqlite |
 | `crates/slskr-web` | bin (wasm) | Leptos 0.8 CSR port of the slskd React UI, built with trunk |
 
@@ -117,20 +118,22 @@ a peer connection manager keyed by `(username, ConnectionType)`, a distributed
 network manager, and a `Waiter` keyed by message kind + discriminator
 (`WaitKey`) that resolves oneshot channels when matching responses arrive.
 
-## slskr-api crate
+## slskr-types crate
 
-Mirrors slskd JSON exactly (camelCase fields, enum string formats, slskd's flags
-enums serialised as comma-separated strings, e.g. `"Completed, Succeeded"`).
-Modules: `application` (State, version), `config` (the merged configuration, snake_case),
-`settings` (`/settings` view: values, pinned keys, secrets set, API keys), `session`,
-`server`, `logs`, `events`, `telemetry`, `search`, `transfers`, `users`,
-`conversations`, `rooms`, `shares`, `files`, `realtime` (live event protocol). No I/O,
-compiles to wasm.
+The request and response types of the HTTP API and the live events. JSON is `snake_case`
+(fields and enum values), timestamps are RFC 3339 UTC, durations integer milliseconds in
+`*_ms` fields, and absent values `null`; see [API.md](API.md#conventions). States are
+plain enums (`TransferState`, `SearchState`, `ConnectionState`); the daemon converts the
+`soulseek` crate's bit flags at its boundary. Modules: `application` (State, version),
+`config` (the merged configuration, as in `slskr.toml`), `settings` (`/api/settings` view:
+values, pinned keys, secrets set, API keys), `error` (`{"error"}` body), `session`,
+`server`, `logs`, `events`, `telemetry`, `search`, `transfers`, `users`, `conversations`,
+`rooms`, `shares`, `files`, `realtime` (live event protocol). No I/O, compiles to wasm.
 
 ## Realtime
 
 One plain WebSocket at `{url_base}/api/events` carries every live update as JSON text
-frames of `slskr_api::realtime::Event` (`{"type": "...", "data": ...}`). The client
+frames of `slskr_types::realtime::Event` (`{"type": "...", "data": ...}`). The client
 subscribes to topics (`state`, `settings`, `searches`, `logs` for administrators,
 `metrics`); each subscription first delivers that topic's snapshot, then changes. Services
 publish to an internal `EventBus`; the socket fans it out per connection. The upgrade is
@@ -145,17 +148,19 @@ snapshots), and returns to the sign-in form on close code 4401.
 
 ## HTTP API
 
-`/api/v0/...` exactly as slskd (`ref/slskd/src/slskd/**/API/**Controller.cs`).
+`{url_base}/api/...`, listed route by route in [API.md](API.md) (a test keeps that list and
+the router in step). Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 Auth: server-side sessions behind an `HttpOnly`, `SameSite=Strict` cookie (`slskr_session`,
-set by `POST /api/v0/session`, cleared by `DELETE`), API keys (`X-API-Key`), or disabled
+set by `POST /api/session`, cleared by `DELETE`), API keys (`X-API-Key`), or disabled
 auth (passthrough). Browsers send the cookie on same-origin fetches and the events WebSocket
 upgrades; see [daemon internals](DAEMON.md#authentication).
 
 ## Web UI
 
-`crates/slskr-web` reproduces `ref/slskd/src/web/src` component-for-component in
-Leptos. Styling: the compiled semantic-ui + slskd CSS is vendored as
-`assets/static/css/slskd.css` (+ fonts/flags in `assets/static/media`), so UI
-components must emit the same DOM/class names as semantic-ui-react.
+`crates/slskr-web` is a Leptos UI derived from slskd's React UI (`ref/slskd/src/web/src`),
+calling the API through `services/api.rs` with the `slskr-types` types. Styling: the
+compiled semantic-ui + slskd CSS is vendored as `assets/static/css/slskd.css` (+ fonts/flags
+in `assets/static/media`), so UI components must emit the same DOM/class names as
+semantic-ui-react.
 `src/ui/` holds semantic-ui-react equivalents; `src/services/` ports `src/lib/*.js`;
 `src/components/` ports `src/components/**`.

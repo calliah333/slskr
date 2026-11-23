@@ -66,7 +66,9 @@ fn SystemInfo() -> impl IntoView {
         restarting.set(true);
         let message = message;
         leptos::task::spawn_local(async move {
-            match crate::services::api::put_empty::<serde_json::Value>("/application").await {
+            match crate::services::api::post_empty::<serde_json::Value>("/application/restart")
+                .await
+            {
                 Ok(_) => message.set("Restart requested".into()),
                 Err(e) => message.set(e.to_string()),
             }
@@ -77,7 +79,9 @@ fn SystemInfo() -> impl IntoView {
         shutdown.set(true);
         let message = message;
         leptos::task::spawn_local(async move {
-            match crate::services::api::delete::<serde_json::Value>("/application").await {
+            match crate::services::api::post_empty::<serde_json::Value>("/application/shutdown")
+                .await
+            {
                 Ok(_) => message.set("Shutdown requested".into()),
                 Err(e) => message.set(e.to_string()),
             }
@@ -92,7 +96,7 @@ fn SystemData() -> impl IntoView {
     let status = RwSignal::new(String::new());
     let clear = move |direction: &'static str| {
         let status = status;
-        let path = format!("/transfers/{direction}s/all/completed");
+        let path = format!("/transfers/{direction}s/completed");
         leptos::task::spawn_local(async move {
             match crate::services::api::delete::<serde_json::Value>(&path).await {
                 Ok(_) => status.set(format!("Completed {direction}s cleared")),
@@ -105,14 +109,14 @@ fn SystemData() -> impl IntoView {
 
 #[component]
 fn SystemEvents() -> impl IntoView {
-    let events = RwSignal::new(Vec::<slskr_api::events::EventRecord>::new());
+    let events = RwSignal::new(Vec::<slskr_types::events::Event>::new());
     let error = RwSignal::new(String::new());
     let page = RwSignal::new(0usize);
     Effect::new(move |_| {
         let page = page.get();
         leptos::task::spawn_local(async move {
-            match crate::services::api::get::<Vec<slskr_api::events::EventRecord>>(&format!(
-                "/events?offset={}&limit=10",
+            match crate::services::api::get::<Vec<slskr_types::events::Event>>(&format!(
+                "/events/history?offset={}&limit=10",
                 page * 10
             ))
             .await
@@ -122,5 +126,5 @@ fn SystemEvents() -> impl IntoView {
             }
         });
     });
-    view! { <div class="header-buttons"><button class="ui button" on:click=move |_: web_sys::MouseEvent| page.update(|p| *p = p.saturating_sub(1))>"Previous"</button><span>{move || format!("Page {}", page.get() + 1)}</span><button class="ui button" on:click=move |_: web_sys::MouseEvent| page.update(|p| *p += 1)>"Next"</button></div><p role="alert">{move || error.get()}</p><ul class="ui divided list">{move || events.get().into_iter().map(|e| view! { <li class="item"><strong>{format!("{:?}", e.kind)}</strong>{" "}{e.timestamp.to_string()}<pre>{e.data.unwrap_or_default()}</pre></li> }).collect_view()}</ul> }
+    view! { <div class="header-buttons"><button class="ui button" on:click=move |_: web_sys::MouseEvent| page.update(|p| *p = p.saturating_sub(1))>"Previous"</button><span>{move || format!("Page {}", page.get() + 1)}</span><button class="ui button" on:click=move |_: web_sys::MouseEvent| page.update(|p| *p += 1)>"Next"</button></div><p role="alert">{move || error.get()}</p><ul class="ui divided list">{move || events.get().into_iter().map(|e| view! { <li class="item"><strong>{format!("{:?}", e.kind)}</strong>{" "}{e.timestamp.to_string()}<pre>{e.data.to_string()}</pre></li> }).collect_view()}</ul> }
 }

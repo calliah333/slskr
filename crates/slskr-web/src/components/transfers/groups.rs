@@ -1,11 +1,11 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
-use slskr_api::transfers::{Transfer, TransferDirection, TransferStates as State, UserResponse};
+use slskr_types::transfers::{QueuePosition, Transfer, TransferDirection, TransferState as State};
 
 use crate::services::{api, util};
 
-use super::{Change, Operation, transfer_url};
+use super::{Change, Operation, UserResponse, transfer_url};
 
 type Groups = RwSignal<Vec<UserResponse>>;
 type Selection = RwSignal<BTreeSet<String>>;
@@ -216,10 +216,9 @@ fn TransferRow(
                 .unwrap_or_default()
         })
     });
-    let state =
-        Memo::new(move |_| file.with(|file| file.as_ref().map_or(State::NONE, |file| file.state)));
-    let active = Memo::new(move |_| state.get().contains(State::IN_PROGRESS));
-    let queued = Memo::new(move |_| state.get().contains(State::QUEUED));
+    let state = Memo::new(move |_| file.with(|file| file.as_ref().map(|file| file.state)));
+    let active = Memo::new(move |_| state.get() == Some(State::InProgress));
+    let queued = Memo::new(move |_| state.get().is_some_and(State::is_queued));
     let can_retry = move || {
         file.with(|file| {
             file.as_ref()
@@ -239,16 +238,13 @@ fn TransferRow(
         let Some(file) = file.get_untracked() else {
             return;
         };
-        if is_download && !file.removed && file.state.contains(State::QUEUED) {
+        if is_download && !file.removed && file.state.is_queued() {
             refreshing.set(true);
             error.set(None);
             spawn_local_scoped_with_cancellation(async move {
-                let url = format!(
-                    "{}/position",
-                    transfer_url(direction, &file.username, &file.id)
-                );
-                match api::get::<i64>(&url).await {
-                    Ok(place) => position.set(Some(place)),
+                let url = format!("{}/position", transfer_url(direction, &file.id));
+                match api::get::<QueuePosition>(&url).await {
+                    Ok(place) => position.set(Some(i64::from(place.place_in_queue))),
                     Err(err) => error.set(Some(err.to_string())),
                 }
                 refreshing.set(false);
@@ -275,8 +271,8 @@ fn TransferRow(
                         on:click=click>
                         {move || interactive().then(|| view! { <i class=if queued.get() { "refresh icon" } else { "redo icon" } aria-hidden="true"></i> })}
                         {move || file.with(|file| file.as_ref().map(|file| {
-                            let mut label = file.state.to_string();
-                            let position = if file.state.contains(State::QUEUED) { file.place_in_queue.map(i64::from).or_else(|| position.get()) } else { None };
+                            let mut label = file.state.label().to_owned();
+                            let position = if file.state.is_queued() { file.place_in_queue.map(i64::from).or_else(|| position.get()) } else { None };
                             if let Some(position) = position.filter(|&position| position > 0) { label.push_str(&format!(" (#{position})")); }
                             if file.attempts > 1 { label.push_str(&format!(" (Retry #{})", file.attempts)); }
                             label
@@ -317,13 +313,13 @@ fn state_button(file: Option<&Transfer>) -> &'static str {
         return "ui fluid mini button";
     };
     let state = file.state;
-    if state.contains(State::COMPLETED) {
-        if state.contains(State::SUCCEEDED) {
+    if state.is_complete() {
+        if state == State::Succeeded {
             "ui fluid mini green button"
         } else {
             "ui fluid mini red button"
         }
-    } else if state.contains(State::INITIALIZING) {
+    } else if state == State::Initializing {
         "ui fluid mini teal button"
     } else if file.attempts > 1 {
         "ui fluid mini yellow button"
@@ -348,10 +344,10 @@ fn transfer_details(file: &Transfer) -> impl IntoView + use<> {
     let date = |value: Option<chrono::DateTime<chrono::Utc>>| {
         value.map_or_else(|| "—".into(), |date| util::format_date(&date.to_rfc3339()))
     };
-    let time = |value: Option<Duration>| {
+    let time = |value: Option<u64>| {
         value.map_or_else(
             || "—".into(),
-            |time| util::format_seconds(time.as_secs_f64()),
+            |ms| util::format_seconds(Duration::from_millis(ms).as_secs_f64()),
         )
     };
     let fields = [
@@ -360,7 +356,7 @@ fn transfer_details(file: &Transfer) -> impl IntoView + use<> {
         ("Direction", format!("{:?}", file.direction)),
         ("Filename", file.filename.clone()),
         ("Size", util::format_bytes(file.size as f64)),
-        ("State", file.state.to_string()),
+        ("State", file.state.label().to_owned()),
         ("Requested At", date(Some(file.requested_at))),
         ("Enqueued At", date(file.enqueued_at)),
         ("Started At", date(file.started_at)),
@@ -377,14 +373,14 @@ fn transfer_details(file: &Transfer) -> impl IntoView + use<> {
             "Bytes Remaining",
             util::format_bytes(file.bytes_remaining as f64),
         ),
-        ("Elapsed Time", time(file.elapsed_time)),
+        ("Elapsed Time", time(file.elapsed_ms)),
         ("Percent Complete", format!("{:.2}%", file.percent_complete)),
-        ("Remaining Time", time(file.remaining_time)),
+        ("Remaining Time", time(file.remaining_ms)),
         ("Attempts", file.attempts.to_string()),
         ("Next Attempt At", date(file.next_attempt_at)),
         (
             "Exception",
-            file.exception.clone().unwrap_or_else(|| "—".into()),
+            file.error.clone().unwrap_or_else(|| "—".into()),
         ),
     ];
     view! {

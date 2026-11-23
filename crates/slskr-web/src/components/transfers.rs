@@ -4,15 +4,62 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gloo_net::http::Method;
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
-use slskr_api::transfers::{
-    EnqueueDownloadsResponse, QueueDownloadRequest, Transfer, TransferDirection,
-    TransferStates as State, UserResponse,
+use slskr_types::transfers::{
+    DownloadFile, EnqueueDownloads, EnqueuedDownloads, Transfer, TransferDirection,
+    TransferState as State,
 };
 
 use crate::{
     components::app::AppContext,
     services::{api, util},
 };
+
+/// One user's transfers, grouped by remote directory.
+#[derive(Clone, Debug, PartialEq)]
+struct UserResponse {
+    username: String,
+    directories: Vec<DirectoryResponse>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DirectoryResponse {
+    directory: String,
+    files: Vec<Transfer>,
+}
+
+/// Groups transfers by user, then by remote directory, in first-seen order.
+fn grouped(transfers: Vec<Transfer>) -> Vec<UserResponse> {
+    let mut users = Vec::<UserResponse>::new();
+    for file in transfers {
+        let directory = file
+            .filename
+            .rsplit_once(['\\', '/'])
+            .map_or("", |(directory, _)| directory)
+            .to_owned();
+        let user = match users.iter().position(|user| user.username == file.username) {
+            Some(index) => &mut users[index],
+            None => {
+                users.push(UserResponse {
+                    username: file.username.clone(),
+                    directories: Vec::new(),
+                });
+                users.last_mut().expect("added user")
+            }
+        };
+        match user
+            .directories
+            .iter_mut()
+            .find(|group| group.directory == directory)
+        {
+            Some(group) => group.files.push(file),
+            None => user.directories.push(DirectoryResponse {
+                directory,
+                files: vec![file],
+            }),
+        }
+    }
+    users
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
@@ -34,19 +81,10 @@ impl Operation {
         if file.removed {
             return false;
         }
-        let completed = file.state.contains(State::COMPLETED);
+        let completed = file.state.is_complete();
         match self {
-            Self::Retry => {
-                file.direction == TransferDirection::Download
-                    && completed
-                    && !file.state.contains(State::SUCCEEDED)
-            }
-            Self::Cancel => {
-                !completed
-                    && file.state.intersects(
-                        State::REQUESTED | State::QUEUED | State::INITIALIZING | State::IN_PROGRESS,
-                    )
-            }
+            Self::Retry => file.direction == TransferDirection::Download && file.state.is_failed(),
+            Self::Cancel => !completed,
             Self::Remove => completed,
         }
     }
@@ -55,14 +93,13 @@ impl Operation {
 type Change = Callback<(Operation, Vec<Transfer>)>;
 
 fn collection(direction: TransferDirection) -> String {
-    format!("/transfers/{}s", direction.as_route())
+    format!("/transfers/{}", direction.collection())
 }
 
-fn transfer_url(direction: TransferDirection, username: &str, id: &str) -> String {
+fn transfer_url(direction: TransferDirection, id: &str) -> String {
     format!(
-        "{}/{}/{}",
+        "{}/{}",
         collection(direction),
-        util::encode_uri_component(username),
         util::encode_uri_component(id)
     )
 }
@@ -70,18 +107,18 @@ fn transfer_url(direction: TransferDirection, username: &str, id: &str) -> Strin
 #[component]
 pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     let state = expect_context::<AppContext>().state;
-    let connected = Signal::derive(move || state.with(|state| state.server.is_connected));
+    let connected = Signal::derive(move || state.with(|state| state.server.state.is_connected()));
     let users = RwSignal::new(Vec::<UserResponse>::new());
     let loading = RwSignal::new(true);
     let load_error = RwSignal::new(None::<String>);
     let action_error = RwSignal::new(None::<String>);
     let history = RwSignal::new(false);
     let working = RwSignal::new(None::<Operation>);
-    let label = direction.as_route();
+    let label = direction.as_str();
 
     spawn_local_scoped_with_cancellation(async move {
         let active_url = collection(direction);
-        let history_url = format!("{active_url}?includeRemoved=true");
+        let history_url = format!("{active_url}?include_removed=true");
         loop {
             let include_removed = history.get_untracked();
             let url = if include_removed {
@@ -89,7 +126,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             } else {
                 &active_url
             };
-            let snapshot = api::get::<Vec<UserResponse>>(url).await;
+            let snapshot = api::get::<Vec<Transfer>>(url).await.map(grouped);
             if history.get_untracked() == include_removed {
                 match snapshot {
                     Ok(mut snapshot) => {
@@ -194,11 +231,11 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
 
 fn matches_option(state: State, option: &str) -> bool {
     match option {
-        "Errored" => state.intersects(State::TIMED_OUT | State::ERRORED | State::REJECTED),
-        "Succeeded" => state.contains(State::SUCCEEDED),
-        "Cancelled" => state.contains(State::CANCELLED),
-        "Queued" => state.contains(State::QUEUED),
-        "In Progress" => state.contains(State::IN_PROGRESS),
+        "Errored" => matches!(state, State::TimedOut | State::Errored | State::Rejected),
+        "Succeeded" => state == State::Succeeded,
+        "Cancelled" => state == State::Cancelled,
+        "Queued" => state.is_queued(),
+        "In Progress" => state == State::InProgress,
         _ => true,
     }
 }
@@ -271,21 +308,20 @@ async fn retry(files: Vec<Transfer>) -> BTreeSet<String> {
     }
     let mut errors = BTreeSet::new();
     for (username, files) in requests {
-        let url = format!(
-            "/transfers/downloads/{}",
-            util::encode_uri_component(&username)
-        );
-        let body = files
-            .into_iter()
-            .map(|(filename, size)| QueueDownloadRequest { filename, size })
-            .collect::<Vec<_>>();
-        match api::post::<_, EnqueueDownloadsResponse>(&url, &body).await {
+        let body = EnqueueDownloads {
+            username: username.clone(),
+            files: files
+                .into_iter()
+                .map(|(filename, size)| DownloadFile { filename, size })
+                .collect(),
+        };
+        match api::post::<_, EnqueuedDownloads>("/transfers/downloads", &body).await {
             Ok(response) => {
                 for failure in response.failed {
-                    errors.insert(if failure.message.is_empty() {
+                    errors.insert(if failure.error.is_empty() {
                         format!("Could not requeue a download from {username}")
                     } else {
-                        failure.message
+                        failure.error
                     });
                 }
             }
@@ -303,13 +339,14 @@ async fn change_transfers(
     files: Vec<Transfer>,
 ) -> BTreeSet<String> {
     let mut errors = BTreeSet::new();
-    let remove = operation == Operation::Remove;
     for file in files {
-        let url = format!(
-            "{}?remove={remove}",
-            transfer_url(direction, &file.username, &file.id)
-        );
-        if let Err(error) = api::request_text(Method::DELETE, &url, None).await {
+        let url = transfer_url(direction, &file.id);
+        let result = if operation == Operation::Remove {
+            api::request_text(Method::DELETE, &url, None).await
+        } else {
+            api::request_text(Method::POST, &format!("{url}/cancel"), None).await
+        };
+        if let Err(error) = result {
             errors.insert(error.to_string());
         }
     }

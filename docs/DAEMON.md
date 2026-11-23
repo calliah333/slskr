@@ -1,41 +1,41 @@
 # slskr daemon internals (`crates/slskr`)
 
-Module ownership and the contracts between modules. Every module mirrors the
-corresponding slskd area under `ref/slskd/src/slskd/<Area>`.
+Module ownership and the contracts between modules. The HTTP routes themselves are listed
+in [API.md](API.md).
 
 ```
 src/main.rs           CLI entry (clap), calls slskr::run()
 src/lib.rs            module declarations, pub async fn run(cli) (bootstrap)
 src/app.rs            AppState / Core / Services / Paths (contract), Snapshots for the events socket
-src/bootstrap.rs      CLI (--data-dir, --config, --no-connect), App::build + run(): load config, build core + services, bind HTTP, mount /api/events
-src/config.rs         ConfigStore: layers (settings.json, slskr.toml, SLSKR_*, CLI) -> slskr_api::config::Config, pinned keys, settings API, validation, file watch
+src/bootstrap.rs      CLI (--data-dir, --config, --no-connect), App::build + run(): load config, build core + services, api_routes() (every route), bind HTTP
+src/config.rs         ConfigStore: layers (settings.json, slskr.toml, SLSKR_*, CLI) -> slskr_types::config::Config, pinned keys, settings API, validation, file watch
 src/config/store.rs   settings.json: sparse settings tree, web password hash, API key digests (lenient load)
 src/state.rs          StateStore: application State, coalesced "state" events
 src/db.rs             Database: sqlite wrapper with migrations
-src/http.rs           ApiError, router assembly helpers, static file serving + SPA fallback, urlBase
-src/core_api.rs       /application, /session, /server, /options, /debug controllers
+src/http.rs           ApiError, Json/Path/Query extractors, json_errors middleware, Routes builder, static files + SPA fallback, urlBase
+src/core_api.rs       /application, /auth, /session, /server, /config, /settings, /api-keys routes
 src/auth/             Auth (sessions, API keys, Origin checks, extractors); session.rs: SessionStore, sessions.db
 src/resolvers.rs      impl soulseek::Resolvers by delegating to services
-src/logging.rs        tracing setup, LogBuffer (ring buffer, "log" events), /logs controller, file logs
+src/logging.rs        tracing setup, LogBuffer (ring buffer, "log" events), /logs routes, file logs
 src/realtime/         EventBus (internal publish/subscribe) + socket.rs: the /api/events WebSocket
-src/events/           EventService (raise/list/subscribe) + /events controller, events.db
-src/users.rs           UserService (peer info/browse cache, group and blacklist policy) + `/users` controller
-src/shares.rs          ShareService (atomic scan snapshots, persisted cache, search/browse/resolve) + `/shares` controller
-src/files/            FileService + /files controller (downloads/incomplete dirs)
-src/telemetry/        TelemetryService ("metrics" events, prometheus) + /telemetry controllers (reports from transfers.db)
-src/transfers/        TransferService (downloads, uploads, upload queue, governor) + /transfers controller, transfers.db
-src/search/           SearchService + /searches controller + "search_*" events, search.db
-src/messaging/        MessagingService (conversations, rooms) + /conversations, /rooms controllers, messaging.db
+src/events.rs         EventService (raise/list/subscribe) + /events/history route, events.db
+src/users.rs          UserService (peer info/browse cache, group and blacklist policy) + /users routes
+src/shares.rs         ShareService (atomic scan snapshots, persisted cache, search/browse/resolve) + /shares routes
+src/files.rs          FileService + /files routes (downloads/incomplete dirs)
+src/telemetry/        TelemetryService ("metrics" events, prometheus) + /metrics and /reports routes (reports from transfers.db)
+src/transfers/        TransferService (downloads, uploads, upload queue, governor) + /transfers and /batches routes, transfers.db
+src/search/           SearchService + /searches routes + "search_*" events, search.db
+src/messaging/        MessagingService (conversations, rooms) + /conversations, /rooms routes, messaging.db
 ```
 
 ## Shared contracts
 
 ### `config::ConfigStore` (Clone)
 ```rust
-pub fn get(&self) -> Arc<Config>;                      // slskr_api::config::Config, current
+pub fn get(&self) -> Arc<Config>;                      // slskr_types::config::Config, current
 pub fn startup(&self) -> &Config;                      // as loaded at process start
 pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Arc<Config>>;
-pub async fn settings(&self) -> slskr_api::settings::Settings;            // GET /settings
+pub async fn settings(&self) -> slskr_types::settings::Settings;            // GET /settings
 pub async fn patch(&self, patch: serde_json::Value) -> Result<Settings, SettingsError>;
 pub async fn reset(&self, dotted_key: &str) -> Result<Settings, SettingsError>;
 pub async fn create_api_key(&self, CreateApiKey) -> Result<CreatedApiKey, SettingsError>;
@@ -75,7 +75,7 @@ taken in plain text and stored as an argon2id hash (`Config.web.password_hash`, 
 the key. `soulseek.password` and `metrics.password` are stored as given. API keys created
 through the API keep only their SHA-256 (`Config.web.managed_api_keys`); the key is
 returned once. Secrets are never returned: `Settings.values` leaves out
-`slskr_api::config::SECRET_KEYS` that are set (listed in `Settings.secrets_set`) and
+`slskr_types::config::SECRET_KEYS` that are set (listed in `Settings.secrets_set`) and
 `web.api_keys` (listed without keys in `Settings.api_keys`).
 
 `config::restart_required(startup, current)` drives `State.pending_restart` and
@@ -101,7 +101,7 @@ incomplete/         default downloads.incomplete_directory
 
 ### `state::StateStore` (Clone)
 ```rust
-pub fn get(&self) -> State;                            // slskr_api::application::State
+pub fn get(&self) -> State;                            // slskr_types::application::State
 pub fn update(&self, f: impl FnOnce(&mut State));      // mutate; watchers notified only on a real change
 pub fn spawn_publisher(&self, bus: EventBus, shutdown: CancellationToken); // "state" events, at most 4/s, latest always sent
 pub fn subscribe(&self) -> tokio::sync::watch::Receiver<State>;
@@ -115,19 +115,25 @@ pub async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
 Migrations: ordered SQL strings; applied ones tracked via `PRAGMA user_version`.
 Timestamps stored as TEXT RFC 3339 UTC; flags as INTEGER; GUIDs as TEXT.
 
-### `http::ApiError`
+### Errors (`http.rs`)
 `enum ApiError { BadRequest(String), Unauthorized, Forbidden(String), NotFound(String), Conflict(String), Internal(anyhow::Error), Status(StatusCode, String) }`
-implementing `IntoResponse` like ASP.NET results (`BadRequest("msg")` -> 400 with JSON string body;
-`NotFound()` -> 404 empty body when the message is empty) and `From<anyhow::Error>`, `From<soulseek::Error>`
-(UserOffline -> 404, Timeout -> 504? see slskd controllers for each endpoint's mapping).
-`pub type ApiResult<T> = Result<T, ApiError>;`
+(`pub type ApiResult<T> = Result<T, ApiError>`) answers `{"error": "<message>"}`
+(`slskr_types::error::ErrorBody`); an empty message becomes the status reason, and
+`Internal` is logged and answered with a generic message. `From<soulseek::Error>` maps
+offline or unknown users and transfers to 404, timeouts to 504, a refused room to 403 and
+duplicates to 409. Handlers take `http::{Json, Path, Query}` instead of the axum
+extractors: their rejections become `ApiError`s with axum's status (400 malformed, 415
+missing JSON content type, 422 wrong shape, 413 too large). `http::optional_json` reads an
+optional body. The `http::json_errors` middleware wraps every `/api` route and rewrites any
+other non-JSON 4xx/5xx (unknown route, 405, body limits, upgrade failures) into the same
+shape, keeping a short plain-text body as the message. Auth rejections are JSON too.
 
 ### Authentication
-`POST /api/v0/session` with `{username, password}` checks the web credentials (a plaintext
+`POST /api/session` with `{username, password}` checks the web credentials (a plaintext
 `web.password` from the file or environment in constant time, otherwise the argon2id hash
 of a password set from the UI, on a blocking thread; API keys are compared by SHA-256 in
-constant time). A failure answers 401 after a 500 ms async delay; success returns the
-`Session` (`{username, role}`) with `Set-Cookie: slskr_session=<token>; HttpOnly; SameSite=Strict;
+constant time). A failure answers 401 after a 500 ms async delay; success answers 201 with the
+`Session` (`{username, role}`) and `Set-Cookie: slskr_session=<token>; HttpOnly; SameSite=Strict;
 Path=<url_base>; Max-Age=<web.session_ttl>`, plus `Secure` when `X-Forwarded-Proto: https`
 (TLS is a reverse proxy's job). `GET` returns the caller's `Session` (cookie, API key, or the
 `Anonymous` administrator when `web.auth = false`) or 401; `DELETE` deletes the session and
@@ -151,15 +157,20 @@ requests skip it; with `web.auth = false` cross-site requests are refused too.
 ### Auth in handlers
 `crate::auth::{Authenticated, RequireReadWrite, RequireAdmin, RequireAdminSession}` extractors
 (require `Auth: FromRef<AppState>`, implemented in http.rs) reject with 401 or 403.
-`RequireAdminSession` refuses API keys (shutdown, restart, `/settings`). The events socket
+`RequireAdminSession` refuses API keys (shutdown, restart, `/settings`, `/api-keys`). The events socket
 authenticates its upgrade with `Auth::authenticate_request` and re-checks the same
 credentials on every ping.
 
 ### Routes
-Each service module exposes `pub fn routes() -> axum::Router<AppState>` with paths relative to
-`/api/v0` (e.g. `"/searches/{id}"`, axum 0.8 `{param}` syntax). `bootstrap.rs` merges them.
-The events socket is mounted at `/api/events` by bootstrap (beside `/api/v0`, also under
-`web.url_base`).
+Each service module exposes `pub fn routes() -> http::Routes`, built with
+`Routes::new().get("/api/searches/{id}", handler)` (full paths, axum 0.8 `{param}` syntax).
+`Routes` records every `(method, path)` it registers; `bootstrap::api_routes()` merges the
+modules and adds the events socket (`GET /api/events`), and a test compares that table
+with [API.md](API.md), so a route can not be added without documenting it. `bootstrap`
+adds catch-all JSON 404s for `/api` and `/api/{*rest}`, layers `json_errors` over them,
+merges `/health` and the Prometheus path, and nests the whole set under `web.url_base`
+(keeping the root reachable for proxies that strip the prefix). The static router never
+answers `{url_base}/api/...` with `index.html`.
 
 ### Service construction (in `bootstrap.rs`, this order)
 ```rust
@@ -179,8 +190,8 @@ subscriptions, timers, options watchers) on every service in the same order.
 ### Cross-service methods
 ```rust
 // events
-EventService::raise(&self, event: slskr_api::events::Event);       // persist + notify subscribers
-EventService::subscribe(&self) -> tokio::sync::broadcast::Receiver<slskr_api::events::Event>;
+EventService::raise(&self, data: slskr_types::events::EventData);   // record (events.db) + notify subscribers
+EventService::subscribe(&self) -> tokio::sync::broadcast::Receiver<slskr_types::events::Event>;
 // users
 UserService::group(&self, username: &str) -> String;                 // "privileged" | "default" | "leechers" | "blacklisted" | user-defined
 UserService::is_blacklisted(&self, username: &str, ip: Option<IpAddr>) -> bool;
@@ -198,17 +209,16 @@ TransferService::upload_info(&self) -> (u32 /*slots*/, u32 /*queue length*/, boo
 TransferService::upload_info_for(&self, username: &str) -> (u32, u32, bool); // user group forecast
 TransferService::database(&self) -> &Database;                       // transfers.db, read by telemetry
 ```
-Users routes: `GET /users/{username}/browse`, `/browse/status`, `/info`, `/status`,
-`/statistics`, `/endpoint`; `POST /users/{username}/directory` accepts
-`DirectoryContentsRequest`. Reads require `Authenticated`; directory requests require
-`RequireReadWrite`. The service caches observed peer info/status/statistics and completed
+Users routes (`/api/users/{username}/...`): `browse`, `browse/status`, `directory?path=`,
+`endpoint`, `info`, `statistics`, `status`. Requests that contact the peer require
+`RequireReadWrite`; cached reads (`browse/status`, `statistics`) require `Authenticated`. The service caches observed peer info/status/statistics and completed
 browses; status/metadata requests populate the caches used by the fast group lookup.
 Group precedence: blacklist, privileged, configured user-defined membership, leecher
 thresholds, then default. Blacklist matching supports case-insensitive names, `*`/`?`
 patterns, and configured IP ranges.
 
-Shares routes: `GET /shares`, `/shares/{id}`, `/shares/contents`, and
-`/shares/{id}/contents`. `PUT /shares` starts a scan and `DELETE /shares` cancels it;
+Shares routes: `GET /api/shares`, `/api/shares/{id}` and `/api/shares/{id}/contents`.
+`POST /api/shares/scan` starts a scan (202) and `DELETE /api/shares/scan` cancels it;
 both require read/write access. `ShareService::scan(&self, cancel: CancellationToken)`
 walks configured non-excluded roots without following symlinks,
 builds a replacement snapshot off-lock, persists `db/shares-cache.json` by rename,
@@ -231,12 +241,19 @@ CREATE TABLE transfers (
 CREATE INDEX ix_transfers_username ON transfers(username);
 CREATE INDEX ix_transfers_state ON transfers(state);
 ```
-`state` uses slskd `TransferStates` bit values (same as `soulseek::TransferState`).
+`state` stores the `soulseek::TransferState` bit values (`state & 16` is "completed");
+`transfers::store::{state_from_bits, state_to_bits}` convert them to and from the API's
+`TransferState` enum, and `state_description` holds the enum name for humans.
+`exception` holds the failure as `Kind: message`; the API calls it `error`.
+
+`search.db` keeps each `Search` and `SearchResponse` as its API JSON, and `events.db`
+each event's type and data; their migrations converted records written in the older
+slskd-shaped JSON.
 
 ## Live events (`src/realtime/`)
 
 Services publish to one `EventBus` (`Core.bus`, a tokio broadcast channel). `publish`
-serializes an `slskr_api::realtime::Event` once and stamps it with a sequence number;
+serializes an `slskr_types::realtime::Event` once and stamps it with a sequence number;
 `wants(topic)` / `publish_with(topic, || event)` skip building events nobody is subscribed
 to. Publishers change their data first and publish second, so a snapshot taken after
 reading `bus.seq()` includes every event up to that number (the log buffer publishes and
@@ -245,7 +262,7 @@ snapshots under its own lock to make this exact).
 | Topic | Snapshot on subscribe | Then | Publisher |
 |---|---|---|---|
 | `state` | `state` (`State`) | `state`, coalesced to at most one per 250 ms, the latest always sent | `StateStore::spawn_publisher` |
-| `settings` | `settings` (redacted `Config`, as `GET /options`) | `settings` on every configuration change | `AppState::watch_options` |
+| `settings` | `settings` (redacted `Config`, as `GET /api/config`) | `settings` on every configuration change | `AppState::watch_options` |
 | `searches` | `search_list` (`Vec<Search>`, no responses) | `search_created`, `search_updated`, `search_deleted {id}`, `search_responses {search_id, responses}` | `SearchService`; progress (response batch, then counts) at most every 500 ms per search; state changes and the final state at once |
 | `logs` (administrators) | `log_buffer` (`Vec<LogRecord>`) | `log` per record | `LogBuffer` |
 | `metrics` | `metrics` (`CurrentMetrics`) | `metrics` every second | `TelemetryService` |

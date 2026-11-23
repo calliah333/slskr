@@ -19,7 +19,7 @@ use axum::extract::{ConnectInfo, FromRef, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::warn;
 
@@ -295,17 +295,22 @@ impl Principal {
         }
     }
 
-    /// The `GET /session` representation.
-    pub fn session(&self) -> slskr_api::session::Session {
-        slskr_api::session::Session {
+    /// The `GET /api/session` representation.
+    pub fn session(&self) -> slskr_types::session::Session {
+        use slskr_types::session::Role as ApiRole;
+        slskr_types::session::Session {
             username: self.name.clone(),
-            role: self.role.as_str().to_owned(),
+            role: match self.role {
+                Role::ReadOnly => ApiRole::ReadOnly,
+                Role::ReadWrite => ApiRole::ReadWrite,
+                Role::Administrator => ApiRole::Admin,
+            },
         }
     }
 }
 
 /// Authorization failure: 401 (not authenticated) or 403 (role too low, or a cross-site
-/// request carrying the session cookie). Both have empty bodies.
+/// request carrying the session cookie), answered with a JSON error body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     #[error("unauthorized")]
@@ -325,7 +330,7 @@ impl AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        self.status().into_response()
+        crate::http::error_response(self.status(), "")
     }
 }
 
@@ -357,17 +362,24 @@ pub enum LoginError {
     Internal(#[from] anyhow::Error),
 }
 
+impl From<LoginError> for crate::http::ApiError {
+    fn from(error: LoginError) -> Self {
+        use crate::http::ApiError;
+        match error {
+            LoginError::BadRequest(message) => ApiError::BadRequest(message.into()),
+            LoginError::Misconfigured => {
+                ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            }
+            LoginError::Unauthorized => ApiError::Unauthorized,
+            LoginError::CrossSite => ApiError::Forbidden("Cross-site request refused".into()),
+            LoginError::Internal(error) => ApiError::Internal(error),
+        }
+    }
+}
+
 impl IntoResponse for LoginError {
     fn into_response(self) -> Response {
-        match self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, Json(message)).into_response(),
-            Self::Misconfigured => {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(self.to_string())).into_response()
-            }
-            Self::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
-            Self::CrossSite => StatusCode::FORBIDDEN.into_response(),
-            Self::Internal(error) => crate::http::ApiError::Internal(error).into_response(),
-        }
+        crate::http::ApiError::from(self).into_response()
     }
 }
 
@@ -589,7 +601,7 @@ impl Auth {
         }
     }
 
-    /// True when authentication is enabled (`GET /session/enabled`).
+    /// True when authentication is enabled (`GET /api/auth`).
     pub fn enabled(&self) -> bool {
         !self.inner.disabled
     }

@@ -1,5 +1,5 @@
 use leptos::{html, prelude::*};
-use slskr_api::conversations::{MessageDirection, PrivateMessage};
+use slskr_types::conversations::{MessageDirection, PrivateMessage};
 
 #[component]
 pub fn ConversationView(#[prop(into)] messages: Signal<Vec<PrivateMessage>>) -> impl IntoView {

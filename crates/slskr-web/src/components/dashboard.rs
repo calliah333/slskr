@@ -5,9 +5,12 @@ use chrono::{Duration, Utc};
 use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_navigate;
-use slskr_api::telemetry::{
-    TransferDirectorySummary, TransferExceptionDetail, TransferExceptionSummary, TransferHistogram,
-    TransferLeaderboard, TransferSummaryReport,
+use slskr_types::{
+    telemetry::{
+        TransferDirectorySummary, TransferErrorDetail, TransferErrorSummary, TransferHistogram,
+        TransferLeaderboard, TransferSummaryReport,
+    },
+    transfers::{TransferDirection, TransferState},
 };
 use wasm_bindgen_futures::spawn_local;
 
@@ -68,21 +71,21 @@ struct DashboardData {
     uploads: TransferLeaderboard,
     downloads: TransferLeaderboard,
     directories: Vec<TransferDirectorySummary>,
-    upload_pareto: Vec<TransferExceptionSummary>,
-    download_pareto: Vec<TransferExceptionSummary>,
-    upload_errors: Vec<TransferExceptionDetail>,
-    download_errors: Vec<TransferExceptionDetail>,
+    upload_pareto: Vec<TransferErrorSummary>,
+    download_pareto: Vec<TransferErrorSummary>,
+    upload_errors: Vec<TransferErrorDetail>,
+    download_errors: Vec<TransferErrorDetail>,
 }
 
-fn bytes(report: &TransferSummaryReport, direction: &str) -> i64 {
+fn bytes(report: &TransferSummaryReport, direction: TransferDirection) -> u64 {
     report
-        .get(direction)
+        .get(&direction)
         .map(|states| states.values().map(|summary| summary.total_bytes).sum())
         .unwrap_or_default()
 }
-fn count(report: &TransferSummaryReport, direction: &str) -> i64 {
+fn count(report: &TransferSummaryReport, direction: TransferDirection) -> u64 {
     report
-        .get(direction)
+        .get(&direction)
         .map(|states| states.values().map(|summary| summary.count).sum())
         .unwrap_or_default()
 }
@@ -94,7 +97,7 @@ fn directory_label(path: Option<&str>) -> String {
         .collect::<Vec<_>>();
     parts[parts.len().saturating_sub(2)..].join("/")
 }
-fn pretty_bytes(bytes: i64) -> String {
+fn pretty_bytes(bytes: u64) -> String {
     util::format_bytes(bytes as f64)
 }
 
@@ -142,13 +145,13 @@ pub fn Dashboard() -> impl IntoView {
             ) = futures_all(
                 reports::summary(&start_text, &end_text),
                 reports::histogram(&start_text, &end_text, selected.buckets),
-                reports::leaderboard(&start_text, &end_text, "Upload", "Count"),
-                reports::leaderboard(&start_text, &end_text, "Download", "Count"),
+                reports::leaderboard(&start_text, &end_text, "upload", "count"),
+                reports::leaderboard(&start_text, &end_text, "download", "count"),
                 reports::directories(&start_text, &end_text),
-                reports::error_types(&start_text, &end_text, "Upload"),
-                reports::error_types(&start_text, &end_text, "Download"),
-                reports::errors(&start_text, &end_text, "Upload"),
-                reports::errors(&start_text, &end_text, "Download"),
+                reports::error_types(&start_text, &end_text, "upload"),
+                reports::error_types(&start_text, &end_text, "download"),
+                reports::errors(&start_text, &end_text, "upload"),
+                reports::errors(&start_text, &end_text, "download"),
             )
             .await;
             // Period changed or page unmounted while loading: drop the stale result.
@@ -204,21 +207,12 @@ pub fn Dashboard() -> impl IntoView {
         );
         let navigate = navigate.clone();
         spawn_local(async move {
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct NewSearch<'a> {
-                id: &'a str,
-                search_text: &'a str,
-            }
-            match api::post::<_, serde_json::Value>(
-                "/searches",
-                &NewSearch {
-                    id: &id,
-                    search_text: &phrase,
-                },
-            )
-            .await
-            {
+            let request = slskr_types::search::SearchRequest {
+                id: Some(id.clone()),
+                query: phrase,
+                ..Default::default()
+            };
+            match api::post::<_, serde_json::Value>("/searches", &request).await {
                 Ok(_) => {
                     text.set(String::new());
                     creating.set(false);
@@ -263,16 +257,16 @@ pub fn Dashboard() -> impl IntoView {
                 </div>
                 {move || if loading.get() { view! { <p role="status">"Loading reports…"</p> }.into_any() } else {
                     let current = data.get();
-                    let down = bytes(&current.summary, "Download");
-                    let up = bytes(&current.summary, "Upload");
-                    let peer_count = current.summary.get("Upload").and_then(|d| d.get("Succeeded")).map(|x| x.distinct_users).unwrap_or_default()
-                        + current.summary.get("Download").and_then(|d| d.get("Succeeded")).map(|x| x.distinct_users).unwrap_or_default();
+                    let down = bytes(&current.summary, TransferDirection::Download);
+                    let up = bytes(&current.summary, TransferDirection::Upload);
+                    let peer_count = current.summary.get(&TransferDirection::Upload).and_then(|d| d.get(&TransferState::Succeeded)).map(|x| x.distinct_users).unwrap_or_default()
+                        + current.summary.get(&TransferDirection::Download).and_then(|d| d.get(&TransferState::Succeeded)).map(|x| x.distinct_users).unwrap_or_default();
                     let ratio = if down > 0 { format!("{:.2}", up as f64 / down as f64) } else { "—".into() };
                     view! { <>
                         {move || load_error.get().map(|error| view! { <p class="ui warning message" role="status">{error}</p> })}
                         <div class="ui four small statistics">
-                            <div class="blue statistic"><div class="value">{pretty_bytes(down)}</div><div class="label">"Downloaded · "{count(&current.summary,"Download").to_string()}{" files"}</div></div>
-                            <div class="green statistic"><div class="value">{pretty_bytes(up)}</div><div class="label">"Uploaded · "{count(&current.summary,"Upload").to_string()}{" files"}</div></div>
+                            <div class="blue statistic"><div class="value">{pretty_bytes(down)}</div><div class="label">"Downloaded · "{count(&current.summary, TransferDirection::Download).to_string()}{" files"}</div></div>
+                            <div class="green statistic"><div class="value">{pretty_bytes(up)}</div><div class="label">"Uploaded · "{count(&current.summary, TransferDirection::Upload).to_string()}{" files"}</div></div>
                             <div class="statistic"><div class="value">{ratio}</div><div class="label">"Share ratio (↑/↓)"</div></div>
                             <div class="statistic"><div class="value">{peer_count}</div><div class="label">"Distinct peers"</div></div>
                         </div>
@@ -369,7 +363,7 @@ fn errors_view(
         {move || {
             let rows = match pareto_direction.get().as_str() { "Upload" => data.upload_pareto.clone(), "Download" => data.download_pareto.clone(), _ => { let mut both=data.upload_pareto.clone(); both.extend(data.download_pareto.clone()); both.sort_by(|a,b| b.count.cmp(&a.count)); both.truncate(10); both } };
             view! { <table class="ui compact unstackable table"><thead><tr><th>"Exception"</th><th>"Count"</th><th>"Distinct users"</th></tr></thead><tbody>
-                {if rows.is_empty() { view! { <tr><td colspan="3">"No data to display"</td></tr> }.into_any() } else { rows.into_iter().map(|row| { let exception=row.exception.unwrap_or_default(); view! { <tr><td title=exception>{util::truncate(&exception,80)}</td><td>{row.count}</td><td>{row.distinct_users}</td></tr> } }).collect_view().into_any()}}
+                {if rows.is_empty() { view! { <tr><td colspan="3">"No data to display"</td></tr> }.into_any() } else { rows.into_iter().map(|row| { let exception=row.error.unwrap_or_default(); view! { <tr><td title=exception>{util::truncate(&exception,80)}</td><td>{row.count}</td><td>{row.distinct_users}</td></tr> } }).collect_view().into_any()}}
             </tbody></table> }
         }}
         <h4>"Recent errors"</h4>
@@ -378,11 +372,11 @@ fn errors_view(
             let rows = match recent_direction.get().as_str() { "Upload" => data.upload_errors.clone(), "Download" => data.download_errors.clone(), _ => { let mut both=data.upload_errors.clone(); both.extend(data.download_errors.clone()); both.sort_by(|a,b| b.ended_at.cmp(&a.ended_at)); both.truncate(10); both } };
             view! { <table class="ui compact unstackable table"><thead><tr><th>"Time"</th><th>"Direction"</th><th>"Username"</th><th>"Filename"</th><th>"Exception"</th></tr></thead><tbody>
                 {if rows.is_empty() { view! { <tr><td colspan="5">"No data to display"</td></tr> }.into_any() } else { rows.into_iter().map(|row| {
-                    let filename = row.filename.unwrap_or_default();
-                    let exception = row.exception.unwrap_or_default();
+                    let filename = row.filename;
+                    let exception = row.error.unwrap_or_default();
                     let ended_at = row.ended_at.map_or_else(|| "—".to_owned(), |time| time.to_rfc3339());
                     let basename = util::get_file_name(&filename).to_owned();
-                    view! { <tr><td>{ended_at}</td><td>{row.direction}</td><td>{row.username.unwrap_or_default()}</td><td title=filename>{basename}</td><td title=exception>{util::truncate(&exception,80)}</td></tr> }
+                    view! { <tr><td>{ended_at}</td><td>{format!("{:?}", row.direction)}</td><td>{row.username}</td><td title=filename>{basename}</td><td title=exception>{util::truncate(&exception,80)}</td></tr> }
                 }).collect_view().into_any()}}
             </tbody></table> }
         }}

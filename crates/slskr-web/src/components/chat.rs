@@ -4,7 +4,7 @@ use leptos_router::{
     NavigateOptions,
     hooks::{use_navigate, use_url},
 };
-use slskr_api::conversations::{Conversation, PrivateMessage};
+use slskr_types::conversations::{Conversation, PrivateMessage};
 use wasm_bindgen_futures::spawn_local;
 
 mod conversation;
@@ -117,10 +117,11 @@ pub fn Chat() -> impl IntoView {
         draft.set(String::new());
         spawn_local(async move {
             let path = format!(
-                "/conversations/{}",
+                "/conversations/{}/messages",
                 crate::services::util::encode_uri_component(&username)
             );
-            match crate::services::api::post_text(&path, &text).await {
+            let body = slskr_types::conversations::SendMessage { message: text };
+            match crate::services::api::post_text(&path, &body).await {
                 Ok(_) => {
                     let _ = recipient.try_set(String::new());
                     // `try_set` returns `None` once the value was stored (component still alive).
@@ -174,12 +175,12 @@ pub fn Chat() -> impl IntoView {
         <section class="chat">
             <nav class="conversation-menu">
                 <For each=move || conversations.get() key=|item| (
-                    item.username.clone(), item.un_acknowledged_message_count, item.has_un_acknowledged_messages
+                    item.username.clone(), item.unacknowledged_count
                 ) children=move |item| {
                     let name = item.username.clone();
                     let username = item.username.clone();
-                    let unread = item.un_acknowledged_message_count;
-                    let has_unread = item.has_un_acknowledged_messages;
+                    let unread = item.unacknowledged_count;
+                    let has_unread = unread > 0;
                     view! { <button class:menu-active=move || active.get() == name class="menu-item" on:click=move |_| select(username.clone())>
                         {item.username} <Show when=move || has_unread><span class="label red">{unread}</span></Show>
                     </button> }
@@ -232,10 +233,9 @@ async fn load_conversations(
         );
         let unread = value
             .iter()
-            .any(|c| c.username == selected && c.has_un_acknowledged_messages);
+            .any(|c| c.username == selected && c.unacknowledged_count > 0);
         if unread
-            && let Err(e) =
-                crate::services::api::request_text(gloo_net::http::Method::PUT, &path, None).await
+            && let Err(e) = crate::services::api::post_empty::<()>(&format!("{path}/ack")).await
         {
             problem = Some(e.to_string());
         }

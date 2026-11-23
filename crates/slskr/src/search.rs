@@ -8,17 +8,11 @@ use std::{
     time::Duration,
 };
 
-use axum::{
-    Json, Router,
-    extract::{Path, Query, State, rejection::JsonRejection},
-    http::StatusCode,
-    routing::get,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
-use serde::Deserialize;
-use slskr_api::{
+use slskr_types::{
     realtime::{Event, Topic},
-    search::{self as dto, Search, SearchRequest, SearchStates},
+    search::{Search, SearchRequest, SearchResponse, SearchState},
 };
 use tokio::{
     sync::{Semaphore, mpsc},
@@ -31,7 +25,7 @@ use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
     db::Database,
-    http::{ApiError, ApiResult},
+    http::{ApiError, ApiResult, Json, Path, Routes},
     realtime::EventBus,
     users::convert_file,
 };
@@ -199,22 +193,21 @@ impl SearchService {
         let state = self.0.client.state();
         if !state.is_logged_in() {
             return Err(ApiError::Conflict(format!(
-                "The server connection must be connected and logged in to perform a search (currently: {state})"
+                "The server connection must be logged in to perform a search (currently: {})",
+                crate::app::connection_state(state).as_str()
             )));
         }
 
         let search = Search {
+            id: id.to_string(),
+            query: query.search_text.clone(),
+            state: SearchState::Requested,
+            token: self.0.client.get_next_token(),
             started_at: Utc::now(),
             ended_at: None,
-            file_count: 0,
-            id: id.to_string(),
-            is_complete: false,
-            locked_file_count: 0,
             response_count: 0,
-            responses: None,
-            search_text: query.search_text.clone(),
-            state: SearchStates::REQUESTED,
-            token: self.0.client.get_next_token(),
+            file_count: 0,
+            locked_file_count: 0,
         };
         let service = self.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -261,7 +254,7 @@ impl SearchService {
                 .state
                 .intersects(soulseek::SearchState::REQUESTED | soulseek::SearchState::COMPLETED)
             {
-                let _ = state_tx.send(SearchStates::from_bits(search.state.bits()));
+                let _ = state_tx.send(search_state(search.state));
             }
         }));
         let (response_tx, mut responses) = mpsc::unbounded_channel();
@@ -310,11 +303,11 @@ impl SearchService {
         };
         let (result, ()) = tokio::join!(search, collect);
         let state = match result {
-            Ok(search) => SearchStates::from_bits(search.state.bits()),
-            Err(soulseek::Error::Cancelled) => SearchStates::COMPLETED | SearchStates::CANCELLED,
+            Ok(search) => search_state(search.state),
+            Err(soulseek::Error::Cancelled) => SearchState::Cancelled,
             Err(error) => {
                 tracing::debug!(%error, search_id = %active.id, "search failed");
-                SearchStates::COMPLETED | SearchStates::ERRORED
+                SearchState::Errored
             }
         };
         if let Err(error) = self.change_state(&active, state).await {
@@ -322,7 +315,7 @@ impl SearchService {
         }
     }
 
-    async fn change_state(&self, active: &ActiveSearch, state: SearchStates) -> anyhow::Result<()> {
+    async fn change_state(&self, active: &ActiveSearch, state: SearchState) -> anyhow::Result<()> {
         let inner = self.0.clone();
         let active = active.clone();
         self.0
@@ -335,17 +328,14 @@ impl SearchService {
                 else {
                     return Ok(());
                 };
-                search.set_state(state);
-                if search.is_complete {
-                    search.ended_at = Some(Utc::now());
-                }
+                search.set_state(state, Utc::now());
                 store::update(db, &search)?;
                 {
                     let mut searches = inner.searches();
                     let entry = searches
                         .get_mut(active.id.as_ref())
                         .expect("search mutations are serialized by the database");
-                    if search.is_complete {
+                    if search.state.is_complete() {
                         entry.cancel = None;
                     }
                     entry.search = search.clone();
@@ -360,7 +350,7 @@ impl SearchService {
         &self,
         active: &ActiveSearch,
         response: soulseek::SearchResponse,
-    ) -> anyhow::Result<Option<dto::SoulseekSearchResponse>> {
+    ) -> anyhow::Result<Option<SearchResponse>> {
         let inner = self.0.clone();
         let active = active.clone();
         self.0
@@ -405,7 +395,7 @@ impl SearchService {
     async fn publish_progress(
         &self,
         active: &ActiveSearch,
-        responses: Vec<dto::SoulseekSearchResponse>,
+        responses: Vec<SearchResponse>,
     ) -> anyhow::Result<()> {
         if !self.0.bus.wants(Topic::Searches) {
             return Ok(());
@@ -443,18 +433,27 @@ impl SearchService {
         self.0.db.call(move |db| store::search_text(db, &id)).await
     }
 
-    async fn get(&self, id: &str, include_responses: bool) -> ApiResult<Search> {
+    async fn get(&self, id: &str) -> ApiResult<Search> {
         let id = id.to_owned();
         self.0
             .db
-            .call(move |db| store::get(db, &id, include_responses))
+            .call(move |db| store::get(db, &id))
             .await?
-            .ok_or_else(not_found)
+            .ok_or_else(ApiError::not_found)
+    }
+
+    async fn responses(&self, id: &str) -> ApiResult<Vec<SearchResponse>> {
+        let id = id.to_owned();
+        self.0
+            .db
+            .call(move |db| store::responses(db, &id))
+            .await?
+            .ok_or_else(ApiError::not_found)
     }
 
     fn cancel(&self, id: &str) -> ApiResult<()> {
         let searches = self.0.searches();
-        let entry = searches.get(id).ok_or_else(not_found)?;
+        let entry = searches.get(id).ok_or_else(ApiError::not_found)?;
         if let Some(cancel) = &entry.cancel {
             cancel.cancel();
         }
@@ -479,7 +478,11 @@ impl SearchService {
                 Ok(true)
             })
             .await?;
-        if removed { Ok(()) } else { Err(not_found()) }
+        if removed {
+            Ok(())
+        } else {
+            Err(ApiError::not_found())
+        }
     }
 }
 
@@ -492,24 +495,21 @@ impl Inner {
     }
 }
 
-fn not_found() -> ApiError {
-    ApiError::NotFound(String::new())
-}
-
 fn validate(
     request: SearchRequest,
 ) -> ApiResult<(Uuid, soulseek::SearchQuery, soulseek::SearchOptions)> {
     let id = match request.id {
-        Some(id) => Uuid::parse_str(&id)
-            .map_err(|_| ApiError::BadRequest("Search ID must be a UUID".into()))?,
+        Some(id) => {
+            Uuid::parse_str(&id).map_err(|_| ApiError::BadRequest("id must be a UUID".into()))?
+        }
         None => Uuid::new_v4(),
     };
-    if request.search_text.trim().is_empty() {
+    if request.query.trim().is_empty() {
         return Err(ApiError::BadRequest(
-            "Search text must not be empty or consist only of whitespace".into(),
+            "query must not be empty or consist only of whitespace".into(),
         ));
     }
-    let query = soulseek::SearchQuery::from(request.search_text.as_str());
+    let query = soulseek::SearchQuery::from(request.query.as_str());
     if !query
         .terms
         .iter()
@@ -521,21 +521,21 @@ fn validate(
         ));
     }
     for (name, value, minimum) in [
-        ("SearchTimeout", request.search_timeout, 5),
-        ("ResponseLimit", request.response_limit, 0),
-        ("FileLimit", request.file_limit, 0),
+        ("timeout_ms", request.timeout_ms, 5),
+        ("response_limit", request.response_limit, 0),
+        ("file_limit", request.file_limit, 0),
         (
-            "MinimumResponseFileCount",
+            "minimum_response_file_count",
             request.minimum_response_file_count,
             0,
         ),
         (
-            "MinimumPeerUploadSpeed",
+            "minimum_peer_upload_speed",
             request.minimum_peer_upload_speed,
             0,
         ),
         (
-            "MaximumPeerQueueLength",
+            "maximum_peer_queue_length",
             request.maximum_peer_queue_length,
             0,
         ),
@@ -549,7 +549,7 @@ fn validate(
     }
 
     let mut options = soulseek::SearchOptions::default();
-    if let Some(value) = request.search_timeout {
+    if let Some(value) = request.timeout_ms {
         options.search_timeout = Duration::from_millis(u64::from(value));
     }
     if let Some(value) = request.response_limit {
@@ -577,121 +577,116 @@ fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-fn map_response(response: soulseek::SearchResponse) -> dto::SoulseekSearchResponse {
-    dto::SoulseekSearchResponse {
-        file_count: count(response.files.len()),
-        files: response.files.into_iter().map(convert_file).collect(),
+fn map_response(response: soulseek::SearchResponse) -> SearchResponse {
+    SearchResponse {
+        username: response.username,
+        token: response.token,
         has_free_upload_slot: response.has_free_upload_slot,
-        locked_file_count: count(response.locked_files.len()),
+        upload_speed: response.upload_speed,
+        // Soulseek sends queue depth as a 32-bit value on the wire.
+        queue_length: u32::try_from(response.queue_length).unwrap_or(u32::MAX),
+        files: response.files.into_iter().map(convert_file).collect(),
         locked_files: response
             .locked_files
             .into_iter()
             .map(convert_file)
             .collect(),
-        // Soulseek sends queue depth as a 32-bit value on the wire.
-        queue_length: u32::try_from(response.queue_length).unwrap_or(u32::MAX),
-        token: response.token,
-        upload_speed: response.upload_speed,
-        username: response.username,
     }
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/searches", get(list).post(create))
-        .route("/searches/{id}", get(get_one).put(cancel).delete(remove))
-        .route("/searches/{id}/responses", get(responses))
+/// The API state of the client's search state flags.
+fn search_state(state: soulseek::SearchState) -> SearchState {
+    use soulseek::SearchState as Wire;
+    if state.contains(Wire::COMPLETED) {
+        [
+            (Wire::CANCELLED, SearchState::Cancelled),
+            (Wire::ERRORED, SearchState::Errored),
+            (
+                Wire::RESPONSE_LIMIT_REACHED,
+                SearchState::ResponseLimitReached,
+            ),
+            (Wire::FILE_LIMIT_REACHED, SearchState::FileLimitReached),
+            (Wire::TIMED_OUT, SearchState::TimedOut),
+        ]
+        .into_iter()
+        .find(|(flag, _)| state.contains(*flag))
+        .map_or(SearchState::Completed, |(_, state)| state)
+    } else if state.contains(Wire::IN_PROGRESS) {
+        SearchState::InProgress
+    } else if state.contains(Wire::QUEUED) {
+        SearchState::Queued
+    } else {
+        SearchState::Requested
+    }
 }
 
-/// HTTP payloads carry `responses: []` when responses were not loaded, matching
-/// upstream's `WithoutResponses()` projection.
-fn without_responses(mut search: Search) -> Search {
-    search.responses.get_or_insert_with(Vec::new);
-    search
+/// Search ids are UUIDs; anything else names no search.
+fn search_id(id: &str) -> ApiResult<Uuid> {
+    Uuid::parse_str(id).map_err(|_| ApiError::not_found())
 }
 
-async fn list(_: Authenticated, State(state): State<AppState>) -> ApiResult<Json<Vec<Search>>> {
-    Ok(Json(
-        state
-            .services
-            .search
-            .0
-            .list()
-            .into_iter()
-            .map(without_responses)
-            .collect(),
-    ))
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/searches", list)
+        .post("/api/searches", create)
+        .get("/api/searches/{id}", get_one)
+        .delete("/api/searches/{id}", remove)
+        .post("/api/searches/{id}/cancel", cancel)
+        .get("/api/searches/{id}/responses", responses)
+}
+
+async fn list(_: Authenticated, State(state): State<AppState>) -> Json<Vec<Search>> {
+    Json(state.services.search.0.list())
 }
 
 async fn create(
     _: RequireReadWrite,
     State(state): State<AppState>,
-    body: Result<Json<SearchRequest>, JsonRejection>,
-) -> ApiResult<Json<Search>> {
-    let service = &state.services.search;
-    let Json(body) = body.map_err(|error| {
-        let status = error.status();
-        let status = if status == StatusCode::UNPROCESSABLE_ENTITY {
-            StatusCode::BAD_REQUEST
-        } else {
-            status
-        };
-        ApiError::Status(status, error.body_text())
-    })?;
-    Ok(Json(without_responses(service.create(body).await?)))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Include {
-    #[serde(default)]
-    include_responses: bool,
+    Json(request): Json<SearchRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let search = state.services.search.create(request).await?;
+    Ok((StatusCode::CREATED, Json(search)))
 }
 
 async fn get_one(
     _: Authenticated,
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Query(query): Query<Include>,
+    Path(id): Path<String>,
 ) -> ApiResult<Json<Search>> {
-    let search = state
-        .services
-        .search
-        .get(&id.to_string(), query.include_responses)
-        .await?;
-    Ok(Json(without_responses(search)))
+    let id = search_id(&id)?;
+    state.services.search.get(&id.to_string()).await.map(Json)
 }
 
 async fn responses(
     _: Authenticated,
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Vec<dto::SearchResponse>>> {
-    Ok(Json(
-        state
-            .services
-            .search
-            .get(&id.to_string(), true)
-            .await?
-            .responses
-            .unwrap_or_default(),
-    ))
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<SearchResponse>>> {
+    let id = search_id(&id)?;
+    state
+        .services
+        .search
+        .responses(&id.to_string())
+        .await
+        .map(Json)
 }
 
 async fn cancel(
     _: RequireReadWrite,
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    let id = search_id(&id)?;
     state.services.search.cancel(&id.to_string())?;
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn remove(
     _: RequireReadWrite,
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    let id = search_id(&id)?;
     state.services.search.remove(id.to_string()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -704,7 +699,7 @@ mod tests {
     #[test]
     fn request_uses_reference_defaults_and_millisecond_overrides() {
         let (_, _, defaults) = validate(SearchRequest {
-            search_text: "example".into(),
+            query: "example".into(),
             ..Default::default()
         })
         .unwrap();
@@ -718,8 +713,8 @@ mod tests {
 
         let (id, query, overrides) = validate(SearchRequest {
             id: Some("ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB".into()),
-            search_text: "example -exclude -exclude".into(),
-            search_timeout: Some(5),
+            query: "example -exclude -exclude".into(),
+            timeout_ms: Some(5),
             response_limit: Some(9),
             file_limit: Some(0),
             filter_responses: Some(false),
@@ -744,19 +739,19 @@ mod tests {
         for text in ["", " \t ", "-words", "i x -words"] {
             assert!(matches!(
                 validate(SearchRequest {
-                    search_text: text.into(),
+                    query: text.into(),
                     ..Default::default()
                 }),
                 Err(ApiError::BadRequest(_))
             ));
         }
         let valid = SearchRequest {
-            search_text: "example".into(),
+            query: "example".into(),
             ..Default::default()
         };
         for request in [
             SearchRequest {
-                search_timeout: Some(4),
+                timeout_ms: Some(4),
                 ..valid.clone()
             },
             SearchRequest {
@@ -775,16 +770,14 @@ mod tests {
     fn sample_search(id: &str, token: u32) -> Search {
         Search {
             id: id.into(),
+            query: "example".into(),
+            state: SearchState::Requested,
             token,
-            search_text: "example".into(),
-            state: SearchStates::REQUESTED,
             started_at: Utc::now(),
             ended_at: None,
-            is_complete: false,
             response_count: 0,
             file_count: 0,
             locked_file_count: 0,
-            responses: None,
         }
     }
 
@@ -862,13 +855,10 @@ mod tests {
         assert!(service.0.list().is_empty());
         assert!(service.search_text(&id).await.unwrap().is_none());
         service
-            .change_state(&first, SearchStates::COMPLETED | SearchStates::CANCELLED)
+            .change_state(&first, SearchState::Cancelled)
             .await
             .unwrap();
-        assert!(matches!(
-            service.get(&id, false).await,
-            Err(ApiError::NotFound(_))
-        ));
+        assert!(matches!(service.get(&id).await, Err(ApiError::NotFound(_))));
 
         let second = insert_active(&service, sample).await;
         assert!(
@@ -879,16 +869,16 @@ mod tests {
                 .is_some()
         );
         service
-            .change_state(&first, SearchStates::COMPLETED | SearchStates::CANCELLED)
+            .change_state(&first, SearchState::Cancelled)
             .await
             .unwrap();
         assert_eq!(
-            service.get(&id, false).await.unwrap().state,
-            SearchStates::REQUESTED
+            service.get(&id).await.unwrap().state,
+            SearchState::Requested
         );
 
         service
-            .change_state(&second, SearchStates::IN_PROGRESS)
+            .change_state(&second, SearchState::InProgress)
             .await
             .unwrap();
         assert!(
@@ -898,11 +888,11 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let terminal = SearchStates::COMPLETED | SearchStates::RESPONSE_LIMIT_REACHED;
+        let terminal = SearchState::ResponseLimitReached;
         service.change_state(&second, terminal).await.unwrap();
-        let search = service.get(&id, true).await.unwrap();
+        let search = service.get(&id).await.unwrap();
         assert_eq!(search.state, terminal);
-        assert!(search.is_complete);
+        assert!(search.state.is_complete());
         assert!(search.ended_at.is_some());
         assert_eq!(
             (
@@ -912,14 +902,13 @@ mod tests {
             ),
             (1, 1, 1)
         );
-        let responses = search.responses.unwrap();
+        let responses = service.responses(&id).await.unwrap();
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].files[0].filename, "music.flac");
         assert_eq!(responses[0].locked_files[0].filename, "locked.flac");
         let overview = &service.0.list()[0];
         assert_eq!(overview.state, terminal);
         assert_eq!(overview.response_count, 1);
-        assert!(overview.responses.is_none());
         service.cancel(&id).unwrap();
     }
 
@@ -937,7 +926,7 @@ mod tests {
                 .is_some()
         );
         service
-            .change_state(&current, SearchStates::COMPLETED | SearchStates::TIMED_OUT)
+            .change_state(&current, SearchState::TimedOut)
             .await
             .unwrap();
         let inner = service.0.clone();
@@ -948,7 +937,7 @@ mod tests {
             .call(move |db| {
                 let mut searches = inner.searches();
                 let entry = searches.get_mut(id.as_ref()).unwrap();
-                entry.search.set_state(SearchStates::COMPLETED);
+                entry.search.state = SearchState::Completed;
                 entry.search.ended_at = Some(Utc::now() - chrono::TimeDelta::minutes(10));
                 entry.cancel = None;
                 store::update(db, &entry.search)
@@ -958,10 +947,10 @@ mod tests {
 
         service.prune(Duration::from_secs(5 * 60)).await.unwrap();
         assert_eq!(service.0.list().len(), 2);
-        assert!(service.get(&current.id, false).await.unwrap().is_complete);
-        assert!(!service.get(&active.id, false).await.unwrap().is_complete);
+        assert!(service.get(&current.id).await.unwrap().state.is_complete());
+        assert!(!service.get(&active.id).await.unwrap().state.is_complete());
         assert!(matches!(
-            service.get(&expired.id, false).await,
+            service.get(&expired.id).await,
             Err(ApiError::NotFound(_))
         ));
         let response_rows: i64 = service
@@ -978,26 +967,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_response_order_and_recovers_an_interrupted_search() {
+    async fn migrates_legacy_records_and_recovers_an_interrupted_search() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("search.db");
         let db = Database::open(&path, &store::MIGRATIONS[..1]).unwrap();
         let id = Uuid::new_v4().to_string();
-        let mut search = sample_search(&id, 123);
-        search.response_count = 2;
-        search.file_count = 2;
-        search.locked_file_count = 2;
-        let first = map_response(one_response(search.token));
-        let second = dto::SoulseekSearchResponse {
-            username: "other".into(),
-            ..first.clone()
+        // Records as written before the API used snake_case.
+        let record = serde_json::json!({
+            "id": id, "searchText": "example", "state": "InProgress", "token": 123,
+            "startedAt": "2024-05-01T12:00:00Z", "isComplete": false,
+            "responseCount": 2, "fileCount": 2, "lockedFileCount": 2, "responses": null
+        })
+        .to_string();
+        let file = |name: &str| {
+            serde_json::json!({
+                "code": 1, "filename": name, "size": 5, "extension": "flac",
+                "attributeCount": 1, "attributes": [{"type": "Length", "value": 200}],
+                "length": 200, "isVariableBitRate": false
+            })
         };
-        let legacy = serde_json::to_string(&[first, second]).unwrap();
-        let record = serde_json::to_string(&search).unwrap();
+        let legacy = serde_json::json!([
+            {"username": "peer", "token": 123, "hasFreeUploadSlot": true, "uploadSpeed": 9,
+             "queueLength": 3, "fileCount": 1, "files": [file("music.flac")],
+             "lockedFileCount": 1, "lockedFiles": [file("locked.flac")]},
+            {"username": "other", "token": 123, "hasFreeUploadSlot": false, "uploadSpeed": 0,
+             "queueLength": 0, "fileCount": 0, "files": [], "lockedFileCount": 0, "lockedFiles": []}
+        ])
+        .to_string();
+        let row_id = id.clone();
         db.call(move |db| {
             db.execute(
                 "INSERT INTO searches VALUES (?1, ?2, ?3)",
-                rusqlite::params![search.id, record, legacy],
+                rusqlite::params![row_id, record, legacy],
             )
         })
         .await
@@ -1006,20 +1007,31 @@ mod tests {
 
         let db = Database::open(&path, store::MIGRATIONS).unwrap();
         let loaded = db.call(store::load).await.unwrap();
-        assert_eq!(
-            loaded[0].state,
-            SearchStates::COMPLETED | SearchStates::TIMED_OUT
-        );
+        assert_eq!(loaded[0].state, SearchState::TimedOut);
+        assert_eq!(loaded[0].query, "example");
         assert_eq!(loaded[0].response_count, 2);
         assert!(loaded[0].ended_at.is_some());
-        assert!(loaded[0].responses.is_none());
-        let search = db
-            .call(move |db| store::get(db, &id, true))
+        let text_id = id.clone();
+        assert_eq!(
+            db.call(move |db| store::search_text(db, &text_id))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("example")
+        );
+        let responses = db
+            .call(move |db| store::responses(db, &id))
             .await
             .unwrap()
             .unwrap();
-        let responses = search.responses.unwrap();
         assert_eq!(responses[0].username, "peer");
+        assert!(responses[0].has_free_upload_slot);
+        assert_eq!(responses[0].queue_length, 3);
+        assert_eq!(responses[0].files[0].duration_ms, Some(200_000));
+        assert_eq!(responses[0].files[0].is_variable_bit_rate, Some(false));
+        assert_eq!(responses[0].locked_files[0].filename, "locked.flac");
         assert_eq!(responses[1].username, "other");
+        assert!(!responses[1].has_free_upload_slot);
+        assert!(responses[1].files.is_empty());
     }
 }

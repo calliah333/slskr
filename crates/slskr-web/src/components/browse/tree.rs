@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
-use slskr_api::users::Directory;
+use slskr_types::users::Directory;
 
 #[derive(Clone)]
 pub struct TreeNode {
@@ -93,7 +93,7 @@ pub fn DirectoryTree(
                 } = node;
                 let path = directory.name;
                 let label = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned();
-                let file_count = directory.file_count;
+                let file_count = directory.files.len();
                 let child_rows =
                     (!children.is_empty()).then(|| rows(children, selected, on_select, depth + 1));
                 let active_path = path.clone();

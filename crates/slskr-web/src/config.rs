@@ -25,7 +25,7 @@ fn read_url_base() -> String {
         .unwrap_or_default()
 }
 
-/// The URL base the UI is served under (e.g. `""` or `"/slskd"`).
+/// The URL base the UI is served under (e.g. `""` or `"/slskr"`).
 pub fn url_base() -> String {
     URL_BASE.with(|cell| cell.get_or_init(read_url_base).clone())
 }
@@ -35,12 +35,12 @@ pub fn root_url() -> String {
     url_base()
 }
 
-/// Base URL of the HTTP API (`{url_base}/api/v0`).
+/// Base URL of the HTTP API (`{url_base}/api`).
 pub fn api_base_url() -> String {
-    format!("{}/api/v0", root_url())
+    format!("{}/api", root_url())
 }
 
 /// Path of the live updates WebSocket (`{url_base}/api/events`).
 pub fn events_path() -> String {
-    format!("{}{}", root_url(), slskr_api::realtime::PATH)
+    format!("{}{}", root_url(), slskr_types::realtime::PATH)
 }

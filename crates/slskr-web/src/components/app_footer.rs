@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use slskr_api::{
+use slskr_types::{
     application::State,
     telemetry::{CurrentMetrics, DirectionMetrics},
 };
@@ -19,7 +19,7 @@ pub(super) fn AppFooter(
     state: RwSignal<State>,
     metrics: RwSignal<CurrentMetrics>,
 ) -> impl IntoView {
-    let connected = Memo::new(move |_| state.with(|s| s.server.is_connected));
+    let connected = Memo::new(move |_| state.with(|s| s.server.state.is_connected()));
     let username = Memo::new(move |_| state.with(|s| s.user.username.clone()));
     let version = Memo::new(move |_| state.with(|s| s.version.current.clone()));
 

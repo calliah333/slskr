@@ -1,31 +1,26 @@
 //! Transfer reports backed by the transfers database.
 
+use crate::http::{ApiError, ApiResult, Json, Path, Query, Routes};
 use crate::{app::AppState, auth::Authenticated, db::Database};
-use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    routing::get,
-};
+use axum::extract::State;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::Row;
 use serde::Deserialize;
-use slskr_api::telemetry::{
-    LeaderboardSortBy, SortOrder, TransferDirectorySummary, TransferExceptionDetail,
-    TransferExceptionSummary, TransferHistogram, TransferLeaderboard, TransferSummary,
+use slskr_types::telemetry::{
+    LeaderboardSortBy, SortOrder, TransferDirectorySummary, TransferErrorDetail,
+    TransferErrorSummary, TransferHistogram, TransferLeaderboard, TransferSummary,
     TransferSummaryByState, TransferSummaryReport, UserDirectionTransferStatistics,
     UserDirectionTransferSummary, UserTransferReport,
 };
-use slskr_api::transfers::TransferStates;
+use slskr_types::transfers::{TransferDirection, TransferState};
 
 const COMPLETED_STATES: &str = "16, 48, 80, 144, 272, 528, 1040";
 // Reference genesis (2020-12-30 06:22 UTC) and DateTime's year 1–9999 bounds.
 const GENESIS: DateTime<Utc> = utc(1_609_309_320, 0);
 const MIN_TIME: DateTime<Utc> = utc(-62_135_596_800, 0);
 const MAX_TIME: DateTime<Utc> = utc(253_402_300_799, 999_999_999);
-/// Upper bound on histogram buckets. Upstream caps `buckets` at 1000 but leaves
-/// `interval` unbounded; a small interval over a huge window would otherwise
-/// allocate one map entry per interval.
+/// Upper bound on histogram buckets, a guard for the bucket width computed from
+/// `buckets` (at most 1000) and the window.
 const MAX_HISTOGRAM_BUCKETS: i64 = 10_000;
 
 /// First bucket start, snapped to the Unix epoch like the SQL bucket formula.
@@ -67,10 +62,29 @@ fn datetime(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<DateTime<Utc
         .transpose()
 }
 
-fn summary_state(bits: u32) -> String {
-    TransferStates::from_bits(bits)
-        .difference(TransferStates::COMPLETED)
-        .to_string()
+fn summary_state(bits: u32) -> TransferState {
+    crate::transfers::state_from_bits(bits)
+}
+
+/// The `transfers.direction` column value.
+fn db_direction(direction: TransferDirection) -> &'static str {
+    match direction {
+        TransferDirection::Download => "Download",
+        TransferDirection::Upload => "Upload",
+    }
+}
+
+fn api_direction(direction: &str) -> TransferDirection {
+    if direction == "Upload" {
+        TransferDirection::Upload
+    } else {
+        TransferDirection::Download
+    }
+}
+
+/// Whole milliseconds of an average in seconds.
+fn ms(seconds: Option<f64>) -> u64 {
+    (seconds.unwrap_or_default().max(0.0) * 1000.0).round() as u64
 }
 
 #[derive(Clone)]
@@ -115,13 +129,13 @@ impl ReportsService {
             let mut rows = stmt.query(rusqlite::params![start, end, direction, username])?;
             let mut report = empty_summary();
             while let Some(row) = rows.next()? {
-                let direction: String = row.get(0)?;
+                let direction = api_direction(&row.get::<_, String>(0)?);
                 let state = summary_state(row.get(1)?);
                 let record = TransferSummary {
                     total_bytes: row.get(2)?, count: row.get(3)?, distinct_users: row.get(4)?,
                     average_speed: row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
-                    average_wait: row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
-                    average_duration: row.get::<_, Option<f64>>(7)?.unwrap_or_default(),
+                    average_wait_ms: ms(row.get(6)?),
+                    average_duration_ms: ms(row.get(7)?),
                     ..Default::default()
                 };
                 report.entry(direction).or_default().insert(state, record);
@@ -173,11 +187,11 @@ impl ReportsService {
                 else {
                     continue;
                 };
-                summary.entry(row.get(1)?).or_default().insert(summary_state(row.get(2)?), TransferSummary {
+                summary.entry(api_direction(&row.get::<_, String>(1)?)).or_default().insert(summary_state(row.get(2)?), TransferSummary {
                     total_bytes: row.get(3)?, count: row.get(4)?, distinct_users: row.get(5)?,
                     average_speed: row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
-                    average_wait: row.get::<_, Option<f64>>(7)?.unwrap_or_default(),
-                    average_duration: row.get::<_, Option<f64>>(8)?.unwrap_or_default(),
+                    average_wait_ms: ms(row.get(7)?),
+                    average_duration_ms: ms(row.get(8)?),
                     ..Default::default()
                 });
             }
@@ -202,7 +216,7 @@ impl ReportsService {
             LeaderboardSortBy::TotalBytes => "total_bytes",
             LeaderboardSortBy::AverageSpeed => "average_speed",
         };
-        let ordering = if order == SortOrder::ASC {
+        let ordering = if order == SortOrder::Asc {
             "ASC"
         } else {
             "DESC"
@@ -218,12 +232,12 @@ impl ReportsService {
             let mut stmt = db.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params![dir, start, end, limit, offset])?;
             let mut out = Vec::new();
-            while let Some(row) = rows.next()? { out.push(TransferSummary { username: row.get(0)?, total_bytes: row.get(1)?, count: row.get(2)?, average_speed: row.get::<_, Option<f64>>(3)?.unwrap_or_default(), average_wait: row.get::<_, Option<f64>>(4)?.unwrap_or_default(), average_duration: row.get::<_, Option<f64>>(5)?.unwrap_or_default(), ..Default::default() }); }
+            while let Some(row) = rows.next()? { out.push(TransferSummary { username: row.get(0)?, total_bytes: row.get(1)?, count: row.get(2)?, average_speed: row.get::<_, Option<f64>>(3)?.unwrap_or_default(), average_wait_ms: ms(row.get(4)?), average_duration_ms: ms(row.get(5)?), ..Default::default() }); }
             Ok(out)
         }).await
     }
 
-    pub async fn exceptions(
+    pub async fn errors(
         &self,
         direction: &str,
         start: DateTime<Utc>,
@@ -232,7 +246,7 @@ impl ReportsService {
         order: SortOrder,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<Vec<TransferExceptionDetail>> {
+    ) -> anyhow::Result<Vec<TransferErrorDetail>> {
         let (direction, start, end, username) = (
             direction.to_owned(),
             timestamp(start),
@@ -240,24 +254,24 @@ impl ReportsService {
             username.map(str::to_owned),
         );
         self.database.call(move |db| {
-            let sql = format!("SELECT id, username, direction, filename, size, state, requested_at, enqueued_at, started_at, ended_at, bytes_transferred, average_speed, CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) ORDER BY ended_at {} LIMIT ?5 OFFSET ?6", if order == SortOrder::ASC { "ASC" } else { "DESC" });
+            let sql = format!("SELECT id, username, direction, filename, size, state, requested_at, enqueued_at, started_at, ended_at, bytes_transferred, average_speed, CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) ORDER BY ended_at {} LIMIT ?5 OFFSET ?6", if order == SortOrder::Asc { "ASC" } else { "DESC" });
             let mut stmt = db.prepare(&sql)?;
             let mut rows = stmt.query(rusqlite::params![direction, start, end, username, limit, offset])?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
-                out.push(TransferExceptionDetail {
-                    id: row.get(0)?, username: row.get(1)?, direction: row.get(2)?, filename: row.get(3)?,
-                    size: row.get(4)?, state: TransferStates::from_bits(row.get(5)?).to_string(),
+                out.push(TransferErrorDetail {
+                    id: row.get(0)?, username: row.get(1)?, direction: api_direction(&row.get::<_, String>(2)?), filename: row.get(3)?,
+                    size: row.get(4)?, state: summary_state(row.get(5)?),
                     requested_at: datetime(row, 6)?.ok_or(rusqlite::Error::InvalidQuery)?,
                     enqueued_at: datetime(row, 7)?, started_at: datetime(row, 8)?, ended_at: datetime(row, 9)?,
-                    bytes_transferred: row.get(10)?, average_speed: row.get(11)?, exception: row.get(12)?,
+                    bytes_transferred: row.get(10)?, average_speed: row.get(11)?, error: row.get(12)?,
                 });
             }
             Ok(out)
         }).await
     }
 
-    pub async fn exception_pareto(
+    pub async fn error_pareto(
         &self,
         direction: &str,
         start: DateTime<Utc>,
@@ -265,7 +279,7 @@ impl ReportsService {
         username: Option<&str>,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<Vec<TransferExceptionSummary>> {
+    ) -> anyhow::Result<Vec<TransferErrorSummary>> {
         let (direction, start, end, username) = (
             direction.to_owned(),
             timestamp(start),
@@ -276,7 +290,7 @@ impl ReportsService {
             let mut stmt = db.prepare("SELECT CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END, COUNT(*), COUNT(DISTINCT username) FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) GROUP BY 1 ORDER BY COUNT(*) DESC, 1 LIMIT ?5 OFFSET ?6")?;
             let mut rows = stmt.query(rusqlite::params![direction, start, end, username, limit, offset])?;
             let mut out = Vec::new();
-            while let Some(r) = rows.next()? { out.push(TransferExceptionSummary { exception: r.get(0)?, count: r.get(1)?, distinct_users: r.get(2)? }); }
+            while let Some(r) = rows.next()? { out.push(TransferErrorSummary { error: r.get(0)?, count: r.get(1)?, distinct_users: r.get(2)? }); }
             Ok(out)
         }).await
     }
@@ -289,22 +303,32 @@ impl ReportsService {
     ) -> anyhow::Result<UserTransferReport> {
         let mut result = UserTransferReport::new();
         let mut summary = self.summary(start, end, None, Some(username)).await?;
-        for direction in ["Upload", "Download"] {
-            let by_state = summary.remove(direction).unwrap_or_default();
+        for direction in [TransferDirection::Upload, TransferDirection::Download] {
+            let by_state = summary.remove(&direction).unwrap_or_default();
             let total = by_state
                 .values()
-                .fold(0_i64, |sum, item| sum.saturating_add(item.count));
-            let successful = by_state.get("Succeeded").map_or(0, |item| item.count);
-            let errored = ["Errored", "TimedOut", "Rejected", "Aborted"]
-                .iter()
-                .filter_map(|state| by_state.get(*state))
-                .fold(0_i64, |sum, item| sum.saturating_add(item.count));
-            let cancelled = by_state.get("Cancelled").map_or(0, |item| item.count);
-            let exceptions = self
-                .exception_pareto(direction, start, end, Some(username), 25, 0)
+                .fold(0_u64, |sum, item| sum.saturating_add(item.count));
+            let count = |state| {
+                by_state
+                    .get(&state)
+                    .map_or(0, |item: &TransferSummary| item.count)
+            };
+            let successful = count(TransferState::Succeeded);
+            let errored = [
+                TransferState::Errored,
+                TransferState::TimedOut,
+                TransferState::Rejected,
+                TransferState::Aborted,
+            ]
+            .into_iter()
+            .map(count)
+            .fold(0_u64, u64::saturating_add);
+            let cancelled = count(TransferState::Cancelled);
+            let errors = self
+                .error_pareto(db_direction(direction), start, end, Some(username), 25, 0)
                 .await?;
             result.insert(
-                direction.to_owned(),
+                direction,
                 UserDirectionTransferSummary {
                     summary: by_state,
                     statistics: UserDirectionTransferStatistics {
@@ -313,7 +337,7 @@ impl ReportsService {
                         errored,
                         cancelled,
                     },
-                    exceptions,
+                    errors,
                 },
             );
         }
@@ -344,27 +368,25 @@ impl ReportsService {
 }
 
 fn empty_summary() -> TransferSummaryReport {
-    ["Download", "Upload"]
+    [TransferDirection::Download, TransferDirection::Upload]
         .into_iter()
-        .map(|d| (d.to_owned(), TransferSummaryByState::new()))
+        .map(|d| (d, TransferSummaryByState::new()))
         .collect()
 }
 
-type ReportError = (StatusCode, Json<String>);
-
+/// Query parameters shared by the report routes; each route uses some of them.
 #[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default)]
 struct Window {
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
-    direction: Option<String>,
+    direction: Option<TransferDirection>,
     username: Option<String>,
-    limit: Option<i32>,
-    offset: Option<i32>,
-    sort_by: Option<String>,
-    sort_order: Option<String>,
-    buckets: Option<i32>,
-    interval: Option<i32>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    sort_by: Option<LeaderboardSortBy>,
+    sort_order: Option<SortOrder>,
+    buckets: Option<u32>,
 }
 
 impl Window {
@@ -372,44 +394,27 @@ impl Window {
         &self,
         default_start: DateTime<Utc>,
         default_end: DateTime<Utc>,
-    ) -> Result<(DateTime<Utc>, DateTime<Utc>), ReportError> {
+    ) -> ApiResult<(DateTime<Utc>, DateTime<Utc>)> {
         let start = self.start.unwrap_or(default_start);
         let end = self.end.unwrap_or(default_end);
         if start >= end {
-            return Err(bad_request("End time must be later than start time"));
+            return Err(bad_request("end must be later than start"));
         }
         Ok((start, end))
     }
 
-    fn recent_bounds(&self) -> Result<(DateTime<Utc>, DateTime<Utc>), ReportError> {
+    fn recent_bounds(&self) -> ApiResult<(DateTime<Utc>, DateTime<Utc>)> {
         let now = Utc::now();
         self.bounds(now - Duration::days(7), now)
     }
 
-    fn direction(&self) -> Result<Option<&'static str>, ReportError> {
-        let Some(value) = self
-            .direction
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(None);
-        };
-        let numeric = value.parse::<i32>();
-        if value.eq_ignore_ascii_case("Download") || numeric == Ok(0) {
-            Ok(Some("Download"))
-        } else if value.eq_ignore_ascii_case("Upload") || numeric == Ok(1) {
-            Ok(Some("Upload"))
-        } else {
-            Err(bad_request(
-                "Invalid direction; expected one of: Download, Upload",
-            ))
-        }
+    fn direction(&self) -> Option<&'static str> {
+        self.direction.map(db_direction)
     }
 
-    fn required_direction(&self) -> Result<&'static str, ReportError> {
-        self.direction()?
-            .ok_or_else(|| bad_request("Direction is required"))
+    fn required_direction(&self) -> ApiResult<&'static str> {
+        self.direction()
+            .ok_or_else(|| bad_request("direction is required (download or upload)"))
     }
 
     fn username(&self) -> Option<&str> {
@@ -418,251 +423,186 @@ impl Window {
             .filter(|value| !value.trim().is_empty())
     }
 
-    fn sort_by(&self) -> Result<LeaderboardSortBy, ReportError> {
-        let Some(value) = self
-            .sort_by
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(LeaderboardSortBy::Count);
-        };
-        match value.parse::<i32>() {
-            Ok(0) => Ok(LeaderboardSortBy::Count),
-            Ok(1) => Ok(LeaderboardSortBy::TotalBytes),
-            Ok(2) => Ok(LeaderboardSortBy::AverageSpeed),
-            _ => LeaderboardSortBy::parse(value).ok_or_else(|| {
-                bad_request("Invalid sortBy; expected one of: Count, TotalBytes, AverageSpeed")
-            }),
-        }
-    }
-
-    fn sort_order(&self) -> Result<SortOrder, ReportError> {
-        let Some(value) = self
-            .sort_order
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(SortOrder::DESC);
-        };
-        match value.parse::<i32>() {
-            Ok(0) => Ok(SortOrder::ASC),
-            Ok(1) => Ok(SortOrder::DESC),
-            _ => SortOrder::parse(value)
-                .ok_or_else(|| bad_request("Invalid sortOrder; expected one of: ASC, DESC")),
-        }
-    }
-
-    fn paging(&self) -> Result<(i64, i64), ReportError> {
+    fn paging(&self) -> ApiResult<(i64, i64)> {
         let limit = self.limit.unwrap_or(25);
-        let offset = self.offset.unwrap_or(0);
-        if limit <= 0 {
-            return Err(bad_request("Limit must be greater than zero"));
+        if limit == 0 {
+            return Err(bad_request("limit must be greater than zero"));
         }
-        if offset < 0 {
-            return Err(bad_request("Offset must be greater than or equal to zero"));
-        }
-        Ok((limit.into(), offset.into()))
+        Ok((limit.into(), self.offset.unwrap_or(0).into()))
     }
 
-    fn histogram_size(&self) -> Result<HistogramSize, ReportError> {
-        match (self.interval, self.buckets) {
-            (Some(_), Some(_)) => Err(bad_request("Specify either interval or buckets, not both")),
-            (Some(minutes), None) if minutes <= 1 => {
-                Err(bad_request("Interval must be greater than 1"))
-            }
-            (Some(minutes), None) => Ok(HistogramSize::Seconds(i64::from(minutes) * 60)),
-            (None, Some(buckets)) if !(1..=1000).contains(&buckets) => Err(bad_request(
-                "Buckets must be between 1 and 1000, if specified",
-            )),
-            (None, buckets) => Ok(HistogramSize::Buckets(i64::from(buckets.unwrap_or(100)))),
+    /// Bucket width in seconds.
+    fn histogram_seconds(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> ApiResult<i64> {
+        let buckets = self.buckets.unwrap_or(100);
+        if !(1..=1000).contains(&buckets) {
+            return Err(bad_request("buckets must be between 1 and 1000"));
         }
+        Ok((end.signed_duration_since(start).num_seconds() / i64::from(buckets)).max(1))
     }
 }
 
-enum HistogramSize {
-    Seconds(i64),
-    Buckets(i64),
-}
-
-impl HistogramSize {
-    fn seconds(self, start: DateTime<Utc>, end: DateTime<Utc>) -> i64 {
-        match self {
-            Self::Seconds(seconds) => seconds,
-            Self::Buckets(count) => (end.signed_duration_since(start).num_seconds() / count).max(1),
-        }
-    }
-}
-
-fn bad_request(message: &str) -> ReportError {
-    (StatusCode::BAD_REQUEST, Json(message.to_owned()))
-}
-
-fn fail(error: impl std::fmt::Display) -> ReportError {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(error.to_string()))
+fn bad_request(message: &str) -> ApiError {
+    ApiError::BadRequest(message.to_owned())
 }
 
 async fn summary(
     _: Authenticated,
     State(state): State<AppState>,
     Query(q): Query<Window>,
-) -> Result<Json<TransferSummaryReport>, ReportError> {
+) -> ApiResult<Json<TransferSummaryReport>> {
     let (start, end) = q.recent_bounds()?;
-    let direction = q.direction()?;
-    state
-        .services
-        .telemetry
-        .reports
-        .summary(start, end, direction, q.username())
-        .await
-        .map(Json)
-        .map_err(fail)
+    Ok(Json(
+        state
+            .services
+            .telemetry
+            .reports
+            .summary(start, end, q.direction(), q.username())
+            .await?,
+    ))
 }
 
 async fn histogram(
     _: Authenticated,
     State(state): State<AppState>,
     Query(q): Query<Window>,
-) -> Result<Json<TransferHistogram>, ReportError> {
+) -> ApiResult<Json<TransferHistogram>> {
     let (mut start, end) = q.recent_bounds()?;
     if end < GENESIS {
-        return Err(bad_request(
-            "End time impossibly early (earlier than slskd genesis time 2020-12-30 06:22 UTC)",
-        ));
+        return Err(bad_request("end is earlier than 2020-12-30 06:22 UTC"));
     }
-    let size = q.histogram_size()?;
-    let direction = q.direction()?;
     let reports = &state.services.telemetry.reports;
     if start < GENESIS {
-        start = reports
-            .oldest_requested()
-            .await
-            .map_err(fail)?
-            .unwrap_or(GENESIS);
+        start = reports.oldest_requested().await?.unwrap_or(GENESIS);
     }
-    let seconds = size.seconds(start, end);
+    let seconds = q.histogram_seconds(start, end)?;
     if histogram_bucket_count(start, end, seconds) > MAX_HISTOGRAM_BUCKETS {
         return Err(bad_request(&format!(
-            "Histogram would exceed {MAX_HISTOGRAM_BUCKETS} buckets; use a larger interval or a shorter window"
+            "Histogram would exceed {MAX_HISTOGRAM_BUCKETS} buckets; use fewer buckets or a shorter window"
         )));
     }
-    reports
-        .histogram(start, end, seconds, direction, q.username())
-        .await
-        .map(Json)
-        .map_err(fail)
+    Ok(Json(
+        reports
+            .histogram(start, end, seconds, q.direction(), q.username())
+            .await?,
+    ))
 }
 
 async fn leaderboard(
     _: Authenticated,
     State(state): State<AppState>,
     Query(q): Query<Window>,
-) -> Result<Json<TransferLeaderboard>, ReportError> {
+) -> ApiResult<Json<TransferLeaderboard>> {
     let direction = q.required_direction()?;
     let (start, end) = q.bounds(GENESIS, Utc::now())?;
-    let sort = q.sort_by()?;
-    let order = q.sort_order()?;
     let (limit, offset) = q.paging()?;
-    state
-        .services
-        .telemetry
-        .reports
-        .leaderboard(direction, start, end, sort, order, limit, offset)
-        .await
-        .map(Json)
-        .map_err(fail)
+    Ok(Json(
+        state
+            .services
+            .telemetry
+            .reports
+            .leaderboard(
+                direction,
+                start,
+                end,
+                q.sort_by.unwrap_or_default(),
+                q.sort_order.unwrap_or_default(),
+                limit,
+                offset,
+            )
+            .await?,
+    ))
 }
 
-async fn exceptions(
+async fn errors(
     _: Authenticated,
     State(state): State<AppState>,
     Query(q): Query<Window>,
-) -> Result<Json<Vec<TransferExceptionDetail>>, ReportError> {
+) -> ApiResult<Json<Vec<TransferErrorDetail>>> {
     let direction = q.required_direction()?;
     let (start, end) = q.bounds(MIN_TIME, MAX_TIME)?;
-    let order = q.sort_order()?;
     let (limit, offset) = q.paging()?;
-    state
-        .services
-        .telemetry
-        .reports
-        .exceptions(direction, start, end, q.username(), order, limit, offset)
-        .await
-        .map(Json)
-        .map_err(fail)
+    Ok(Json(
+        state
+            .services
+            .telemetry
+            .reports
+            .errors(
+                direction,
+                start,
+                end,
+                q.username(),
+                q.sort_order.unwrap_or_default(),
+                limit,
+                offset,
+            )
+            .await?,
+    ))
 }
 
 async fn pareto(
     _: Authenticated,
     State(state): State<AppState>,
     Query(q): Query<Window>,
-) -> Result<Json<Vec<TransferExceptionSummary>>, ReportError> {
+) -> ApiResult<Json<Vec<TransferErrorSummary>>> {
     let direction = q.required_direction()?;
     let (start, end) = q.bounds(MIN_TIME, MAX_TIME)?;
     let (limit, offset) = q.paging()?;
-    state
-        .services
-        .telemetry
-        .reports
-        .exception_pareto(direction, start, end, q.username(), limit, offset)
-        .await
-        .map(Json)
-        .map_err(fail)
+    Ok(Json(
+        state
+            .services
+            .telemetry
+            .reports
+            .error_pareto(direction, start, end, q.username(), limit, offset)
+            .await?,
+    ))
 }
 
 async fn user_report(
     _: Authenticated,
-    Path(username): Path<String>,
     State(state): State<AppState>,
+    Path(username): Path<String>,
     Query(q): Query<Window>,
-) -> Result<Json<UserTransferReport>, ReportError> {
+) -> ApiResult<Json<UserTransferReport>> {
     if username.trim().is_empty() {
-        return Err(bad_request("Username is required"));
+        return Err(bad_request("username is required"));
     }
     let (start, end) = q.bounds(GENESIS, Utc::now())?;
-    state
-        .services
-        .telemetry
-        .reports
-        .user_report(&username, start, end)
-        .await
-        .map(Json)
-        .map_err(fail)
+    Ok(Json(
+        state
+            .services
+            .telemetry
+            .reports
+            .user_report(&username, start, end)
+            .await?,
+    ))
 }
 
 async fn directories(
     _: Authenticated,
     State(state): State<AppState>,
     Query(q): Query<Window>,
-) -> Result<Json<Vec<TransferDirectorySummary>>, ReportError> {
+) -> ApiResult<Json<Vec<TransferDirectorySummary>>> {
     let (start, end) = q.bounds(GENESIS, MAX_TIME)?;
     let (limit, offset) = q.paging()?;
-    state
-        .services
-        .telemetry
-        .reports
-        .directories(start, end, q.username(), limit, offset)
-        .await
-        .map(Json)
-        .map_err(fail)
+    Ok(Json(
+        state
+            .services
+            .telemetry
+            .reports
+            .directories(start, end, q.username(), limit, offset)
+            .await?,
+    ))
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/telemetry/reports/transfers/summary", get(summary))
-        .route("/telemetry/reports/transfers/histogram", get(histogram))
-        .route("/telemetry/reports/transfers/leaderboard", get(leaderboard))
-        .route("/telemetry/reports/transfers/exceptions", get(exceptions))
-        .route(
-            "/telemetry/reports/transfers/exceptions/pareto",
-            get(pareto),
-        )
-        .route("/telemetry/reports/transfers/directories", get(directories))
-        .route(
-            "/telemetry/reports/transfers/users/{username}",
-            get(user_report),
-        )
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/reports/transfers/summary", summary)
+        .get("/api/reports/transfers/histogram", histogram)
+        .get("/api/reports/transfers/leaderboard", leaderboard)
+        .get("/api/reports/transfers/errors", errors)
+        .get("/api/reports/transfers/errors/pareto", pareto)
+        .get("/api/reports/transfers/directories", directories)
+        .get("/api/reports/transfers/users/{username}", user_report)
 }
 
 #[cfg(test)]
@@ -673,28 +613,38 @@ mod tests {
     const END: DateTime<Utc> = utc(1_767_225_720, 250_000_000);
 
     #[test]
-    fn dashboard_queries_bind_camel_case_and_use_minutes() {
-        let uri = "/?direction=dOwNlOaD&sortBy=TotalBytes&sortOrder=ASC&interval=2"
+    fn queries_use_snake_case_names_and_values() {
+        let uri = "/?direction=download&sort_by=total_bytes&sort_order=asc&buckets=2"
             .parse()
             .unwrap();
-        let Query(query) = Query::<Window>::try_from_uri(&uri).unwrap();
+        let axum::extract::Query(query) =
+            axum::extract::Query::<Window>::try_from_uri(&uri).unwrap();
         assert_eq!(query.required_direction().unwrap(), "Download");
-        assert_eq!(query.sort_by().unwrap(), LeaderboardSortBy::TotalBytes);
-        assert_eq!(query.sort_order().unwrap(), SortOrder::ASC);
-        assert_eq!(query.histogram_size().unwrap().seconds(START, END), 120);
+        assert_eq!(query.sort_by, Some(LeaderboardSortBy::TotalBytes));
+        assert_eq!(query.sort_order, Some(SortOrder::Asc));
+        assert_eq!(query.histogram_seconds(START, END).unwrap(), 60);
 
-        let uri = "/?direction=neither&sortOrder=asc&interval=2&buckets=1"
-            .parse()
-            .unwrap();
-        let Query(query) = Query::<Window>::try_from_uri(&uri).unwrap();
-        assert!(query.direction().is_err());
-        assert!(query.sort_order().is_err());
-        assert!(query.histogram_size().is_err());
+        for invalid in [
+            "/?direction=Download",
+            "/?sort_order=ASC",
+            "/?sortBy=count&limit=x",
+        ] {
+            let uri = invalid.parse().unwrap();
+            assert!(
+                axum::extract::Query::<Window>::try_from_uri(&uri).is_err(),
+                "{invalid}"
+            );
+        }
         let query = Window {
             buckets: Some(5),
             ..Window::default()
         };
-        assert_eq!(query.histogram_size().unwrap().seconds(START, END), 24);
+        assert_eq!(query.histogram_seconds(START, END).unwrap(), 24);
+        let query = Window {
+            buckets: Some(1001),
+            ..Window::default()
+        };
+        assert!(query.histogram_seconds(START, END).is_err());
     }
 
     #[tokio::test]
@@ -704,26 +654,20 @@ mod tests {
             histogram_bucket_count(START, START + Duration::minutes(4), 120),
             2
         );
-        // interval=2 (minutes) up to year 9999 would be billions of buckets.
-        let uri = "/?interval=2&start=2021-01-01T00:00:00Z&end=9999-12-31T00:00:00Z"
-            .parse()
-            .unwrap();
-        let Query(query) = Query::<Window>::try_from_uri(&uri).unwrap();
-        let (start, end) = query.recent_bounds().unwrap();
-        let seconds = query.histogram_size().unwrap().seconds(start, end);
-        assert!(histogram_bucket_count(start, end, seconds) > MAX_HISTOGRAM_BUCKETS);
+        let end = utc(253_402_214_400, 0);
+        assert!(histogram_bucket_count(GENESIS, end, 120) > MAX_HISTOGRAM_BUCKETS);
         assert!(
             fixture()
-                .histogram(start, end, seconds, None, None)
+                .histogram(GENESIS, end, 120, None, None)
                 .await
                 .is_err()
         );
-        // The buckets path stays within the cap even across the widest window.
+        // Bucket counts stay within the cap even across the widest window.
         let query = Window {
             buckets: Some(1000),
             ..Window::default()
         };
-        let seconds = query.histogram_size().unwrap().seconds(MIN_TIME, MAX_TIME);
+        let seconds = query.histogram_seconds(MIN_TIME, MAX_TIME).unwrap();
         assert!(histogram_bucket_count(MIN_TIME, MAX_TIME, seconds) <= MAX_HISTOGRAM_BUCKETS);
     }
 
@@ -761,7 +705,7 @@ mod tests {
             .summary(START, END, Some("Download"), None)
             .await
             .unwrap();
-        let succeeded = &summary["Download"]["Succeeded"];
+        let succeeded = &summary[&TransferDirection::Download][&TransferState::Succeeded];
         assert_eq!(
             (
                 succeeded.count,
@@ -771,9 +715,12 @@ mod tests {
             (2, 720, 2)
         );
         assert_eq!(succeeded.average_speed, 9.0);
-        assert_eq!(succeeded.average_wait, 1.0);
-        assert_eq!(summary["Download"]["Errored"].count, 1);
-        assert!(summary["Upload"].is_empty());
+        assert_eq!(succeeded.average_wait_ms, 1000);
+        assert_eq!(
+            summary[&TransferDirection::Download][&TransferState::Errored].count,
+            1
+        );
+        assert!(summary[&TransferDirection::Upload].is_empty());
 
         let histogram = reports
             .histogram(START, END, 120, Some("Download"), None)
@@ -781,8 +728,11 @@ mod tests {
             .unwrap();
         assert_eq!(histogram.len(), 2);
         let final_bucket = &histogram[&(START + Duration::minutes(2))];
-        assert_eq!(final_bucket["Download"]["Succeeded"].average_speed, 300.0);
-        assert!(final_bucket["Upload"].is_empty());
+        assert_eq!(
+            final_bucket[&TransferDirection::Download][&TransferState::Succeeded].average_speed,
+            300.0
+        );
+        assert!(final_bucket[&TransferDirection::Upload].is_empty());
     }
 
     #[tokio::test]
@@ -794,7 +744,7 @@ mod tests {
                 START,
                 END,
                 LeaderboardSortBy::TotalBytes,
-                SortOrder::DESC,
+                SortOrder::Desc,
                 1,
                 0,
             )
@@ -807,7 +757,7 @@ mod tests {
                 START,
                 END,
                 LeaderboardSortBy::AverageSpeed,
-                SortOrder::DESC,
+                SortOrder::Desc,
                 1,
                 0,
             )
@@ -816,22 +766,24 @@ mod tests {
         assert_eq!(top[0].username.as_deref(), Some("alice"));
 
         let details = reports
-            .exceptions("Download", MIN_TIME, MAX_TIME, None, SortOrder::DESC, 25, 0)
+            .errors("Download", MIN_TIME, MAX_TIME, None, SortOrder::Desc, 25, 0)
             .await
             .unwrap();
         assert_eq!(details.len(), 1);
-        assert_eq!(details[0].state, "Completed, Errored");
-        assert_eq!(details[0].exception.as_deref(), Some("refused"));
+        assert_eq!(details[0].state, TransferState::Errored);
+        assert_eq!(details[0].error.as_deref(), Some("refused"));
         assert_eq!(details[0].requested_at, START);
         let user = reports.user_report("alice", START, END).await.unwrap();
-        assert_eq!(user["Download"].statistics.total, 2);
-        assert_eq!(user["Download"].statistics.successful, 1);
-        assert_eq!(user["Download"].statistics.errored, 1);
+        assert_eq!(user[&TransferDirection::Download].statistics.total, 2);
+        assert_eq!(user[&TransferDirection::Download].statistics.successful, 1);
+        assert_eq!(user[&TransferDirection::Download].statistics.errored, 1);
         assert_eq!(
-            user["Download"].exceptions[0].exception.as_deref(),
+            user[&TransferDirection::Download].errors[0]
+                .error
+                .as_deref(),
             Some("refused")
         );
-        assert_eq!(user["Upload"].statistics.successful, 1);
+        assert_eq!(user[&TransferDirection::Upload].statistics.successful, 1);
 
         let dirs = reports.directories(START, END, None, 25, 0).await.unwrap();
         assert_eq!(dirs.len(), 1);

@@ -1,17 +1,17 @@
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use leptos_router::{components::A, hooks::use_params_map};
-use slskr_api::files::FilesystemDirectory;
+use slskr_types::files::FilesystemDirectory;
 
 use crate::{
     config,
-    services::{api, util::encode_path_base64},
+    services::{api, util::encode_uri_component},
 };
 
-fn endpoint(root: &str, kind: &str, path: &str) -> String {
+fn endpoint(root: &str, path: &str) -> String {
     if path.is_empty() {
-        format!("/files/{root}/{kind}")
+        format!("/files/{root}")
     } else {
-        format!("/files/{root}/{kind}/{}", encode_path_base64(path))
+        format!("/files/{root}?path={}", encode_uri_component(path))
     }
 }
 
@@ -61,13 +61,13 @@ fn Directory(root: &'static str) -> impl IntoView {
         listing.set(None);
         error.set(String::new());
         spawn_local_scoped_with_cancellation(async move {
-            match api::get::<FilesystemDirectory>(&endpoint(root, "directories", &path)).await {
+            match api::get::<FilesystemDirectory>(&endpoint(root, &path)).await {
                 Ok(data) => listing.set(Some((path, data))),
                 Err(err) => error.set(err.to_string()),
             }
         });
     });
-    let delete = move |kind, path: &str| {
+    let delete = move |path: &str| {
         if deleting.get_untracked() {
             return;
         }
@@ -79,7 +79,7 @@ fn Directory(root: &'static str) -> impl IntoView {
         if !confirmed {
             return;
         }
-        let url = endpoint(root, kind, path);
+        let url = endpoint(root, path);
         deleting.set(true);
         error.set(String::new());
         leptos::task::spawn_local(async move {
@@ -101,22 +101,22 @@ fn Directory(root: &'static str) -> impl IntoView {
             view! {
                 <h3 class="ui header">{format!("/{root}/{current_path}")}</h3>
                 <ul class="ui divided list">
-                    {dir.directories.unwrap_or_default().into_iter().map(|child| {
+                    {dir.directories.into_iter().map(|child| {
                         let child_path = child_path(&current_path, &child.name);
                         let target = child_path.clone();
                         view! {
                             <li class="item">
                                 <button type="button" class="ui basic button" on:click=move |_| path.set(target.clone())>{format!("📁 {}", child.name)}</button>
-                                <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete("directories", &child_path)>"Delete directory"</button>
+                                <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete(&child_path)>"Delete directory"</button>
                             </li>
                         }
                     }).collect_view()}
-                    {dir.files.unwrap_or_default().into_iter().map(|file| {
+                    {dir.files.into_iter().map(|file| {
                         let target = child_path(&current_path, &file.name);
                         view! {
                             <li class="item">
-                                {file.name}{" — "}{file.length}{" bytes"}
-                                <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete("files", &target)>"Delete file"</button>
+                                {file.name}{" — "}{file.size}{" bytes"}
+                                <button type="button" class="ui negative basic button" disabled=deleting on:click=move |_| delete(&target)>"Delete file"</button>
                             </li>
                         }
                     }).collect_view()}

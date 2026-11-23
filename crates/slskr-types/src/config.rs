@@ -1,4 +1,4 @@
-//! The slskr configuration (`slskr.toml`, `settings.json`, `GET /api/v0/options`,
+//! The slskr configuration (`slskr.toml`, `settings.json`, `GET /api/config`,
 //! the `settings` event).
 //!
 //! Keys are snake_case in TOML and JSON alike. Every section is `#[serde(default)]`, so a

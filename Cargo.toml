@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/soulseek", "crates/slskr-api", "crates/slskr", "crates/slskr-web"]
-default-members = ["crates/soulseek", "crates/slskr-api", "crates/slskr"]
+members = ["crates/soulseek", "crates/slskr-types", "crates/slskr", "crates/slskr-web"]
+default-members = ["crates/soulseek", "crates/slskr-types", "crates/slskr"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,7 +11,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 soulseek = { path = "crates/soulseek" }
-slskr-api = { path = "crates/slskr-api" }
+slskr-types = { path = "crates/slskr-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }

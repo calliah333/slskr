@@ -2667,7 +2667,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "slskr-api",
+ "slskr-types",
  "soulseek",
  "tempfile",
  "thiserror 2.0.21",
@@ -2684,7 +2684,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "slskr-api"
+name = "slskr-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -2706,7 +2706,7 @@ dependencies = [
  "leptos_router",
  "serde",
  "serde_json",
- "slskr-api",
+ "slskr-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

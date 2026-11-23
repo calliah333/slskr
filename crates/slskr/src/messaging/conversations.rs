@@ -1,27 +1,21 @@
 //! Persistent private conversations and message delivery acknowledgements.
 
-use axum::{
-    Json, Router,
-    extract::{Path as RoutePath, Query, State},
-    http::StatusCode,
-    routing::{get, put},
-};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use serde::Deserialize;
-use slskr_api::{
-    conversations::{Conversation, MessageDirection, PrivateMessage},
-    events::{Event, EventType, PrivateMessageReceivedEvent},
+use slskr_types::{
+    conversations::{Conversation, MessageDirection, PrivateMessage, SendMessage},
+    events::EventData,
 };
 use tokio::sync::broadcast::error::RecvError;
 
-use super::event_header;
 use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
     db::Database,
     events::EventService,
-    http::{ApiError, ApiResult},
+    http::{ApiError, ApiResult, Json, Path, Query, Routes},
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -98,7 +92,7 @@ impl ConversationService {
                 direction: MessageDirection::In,
                 message: message.message,
                 is_acknowledged: false,
-                was_replayed: message.replayed,
+                is_replayed: message.replayed,
             };
             let tx = db.transaction()?;
             activate(&tx, &record.username)?;
@@ -107,16 +101,13 @@ impl ConversationService {
                  VALUES (?1,?2,?3,'In',?4,0,?5)
                  ON CONFLICT(username,id,timestamp) DO UPDATE
                  SET is_acknowledged=0, was_replayed=excluded.was_replayed, revision=revision+1",
-                params![record.username, record.id, record.timestamp.to_rfc3339(), record.message, record.was_replayed],
+                params![record.username, record.id, record.timestamp.to_rfc3339(), record.message, record.is_replayed],
             )?;
             tx.commit()?;
             Ok(record)
         }).await?;
         self.events
-            .raise(Event::PrivateMessageReceived(PrivateMessageReceivedEvent {
-                header: event_header(EventType::PrivateMessageReceived),
-                message: serde_json::to_value(message)?,
-            }));
+            .raise(EventData::PrivateMessageReceived(message));
         Ok(())
     }
 
@@ -229,11 +220,20 @@ impl ConversationService {
         Ok(true)
     }
 
-    async fn send(&self, username: String, message: String) -> ApiResult<()> {
+    async fn send(&self, username: String, message: String) -> ApiResult<PrivateMessage> {
         self.client
             .send_private_message(&username, &message)
             .await?;
-        let timestamp = Utc::now().to_rfc3339();
+        let record = PrivateMessage {
+            id: 0,
+            timestamp: Utc::now(),
+            username: username.clone(),
+            direction: MessageDirection::Out,
+            message: message.clone(),
+            is_acknowledged: true,
+            is_replayed: false,
+        };
+        let timestamp = record.timestamp.to_rfc3339();
         self.db.call(move |db| {
             let tx = db.transaction()?;
             activate(&tx, &username)?;
@@ -244,7 +244,7 @@ impl ConversationService {
             )?;
             tx.commit()
         }).await?;
-        Ok(())
+        Ok(record)
     }
 }
 
@@ -270,8 +270,7 @@ fn read_conversation(row: &Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
         username: row.get(0)?,
         is_active: row.get(1)?,
-        un_acknowledged_message_count: count,
-        has_un_acknowledged_messages: count != 0,
+        unacknowledged_count: count,
         messages: None,
     })
 }
@@ -298,7 +297,7 @@ fn read_message(row: &Row<'_>) -> rusqlite::Result<PrivateMessage> {
         username: row.get(2)?,
         message: row.get(4)?,
         is_acknowledged: row.get(5)?,
-        was_replayed: row.get(6)?,
+        is_replayed: row.get(6)?,
     })
 }
 
@@ -382,26 +381,26 @@ fn deactivate(db: &Connection, username: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/conversations", get(list))
-        .route(
-            "/conversations/{username}",
-            get(get_one).put(ack_all).delete(close).post(send),
-        )
-        .route("/conversations/{username}/{id}", put(ack_one))
-        .route("/conversations/{username}/messages", get(messages))
+pub fn routes() -> Routes {
+    Routes::new()
+        .get("/api/conversations", list)
+        .get("/api/conversations/{username}", get_one)
+        .delete("/api/conversations/{username}", close)
+        .post("/api/conversations/{username}/ack", ack_all)
+        .get("/api/conversations/{username}/messages", messages)
+        .post("/api/conversations/{username}/messages", send)
+        .post("/api/conversations/{username}/messages/{id}/ack", ack_one)
 }
 
 #[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct ListQuery {
     include_inactive: bool,
-    un_acknowledged_only: bool,
+    unacknowledged_only: bool,
 }
 
 #[derive(Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct GetQuery {
     include_messages: bool,
 }
@@ -415,13 +414,9 @@ impl Default for GetQuery {
 }
 
 #[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default)]
 struct MessageQuery {
-    un_acknowledged_only: bool,
-}
-
-fn not_found() -> ApiError {
-    ApiError::NotFound(String::new())
+    unacknowledged_only: bool,
 }
 
 async fn list(
@@ -433,7 +428,7 @@ async fn list(
         app.services
             .messaging
             .conversations
-            .list(q.include_inactive, q.un_acknowledged_only)
+            .list(q.include_inactive, q.unacknowledged_only)
             .await?,
     ))
 }
@@ -441,7 +436,7 @@ async fn list(
 async fn get_one(
     _: Authenticated,
     State(app): State<AppState>,
-    RoutePath(username): RoutePath<String>,
+    Path(username): Path<String>,
     Query(q): Query<GetQuery>,
 ) -> ApiResult<Json<Conversation>> {
     app.services
@@ -450,28 +445,28 @@ async fn get_one(
         .conversation(username, q.include_messages)
         .await?
         .map(Json)
-        .ok_or_else(not_found)
+        .ok_or_else(ApiError::not_found)
 }
 
 async fn messages(
     _: Authenticated,
     State(app): State<AppState>,
-    RoutePath(username): RoutePath<String>,
+    Path(username): Path<String>,
     Query(q): Query<MessageQuery>,
 ) -> ApiResult<Json<Vec<PrivateMessage>>> {
     app.services
         .messaging
         .conversations
-        .messages(username, q.un_acknowledged_only)
+        .messages(username, q.unacknowledged_only)
         .await?
         .map(Json)
-        .ok_or_else(not_found)
+        .ok_or_else(ApiError::not_found)
 }
 
 async fn ack_all(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    RoutePath(username): RoutePath<String>,
+    Path(username): Path<String>,
 ) -> ApiResult<StatusCode> {
     if !app
         .services
@@ -480,15 +475,15 @@ async fn ack_all(
         .acknowledge(username, None)
         .await?
     {
-        return Err(not_found());
+        return Err(ApiError::not_found());
     }
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn ack_one(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    RoutePath((username, id)): RoutePath<(String, i32)>,
+    Path((username, id)): Path<(String, i32)>,
 ) -> ApiResult<StatusCode> {
     if !app
         .services
@@ -497,40 +492,44 @@ async fn ack_one(
         .acknowledge(username, Some(id))
         .await?
     {
-        return Err(not_found());
+        return Err(ApiError::not_found());
     }
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn close(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    RoutePath(username): RoutePath<String>,
+    Path(username): Path<String>,
 ) -> ApiResult<StatusCode> {
     if !app.services.messaging.conversations.close(username).await? {
-        return Err(not_found());
+        return Err(ApiError::not_found());
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Sends a message (201 with the stored message). Messages to blacklisted users are
+/// silently dropped (204).
 async fn send(
     _: RequireReadWrite,
     State(app): State<AppState>,
-    RoutePath(username): RoutePath<String>,
-    Json(message): Json<Option<String>>,
-) -> ApiResult<StatusCode> {
-    if app.services.users.is_blacklisted(&username, None) {
-        return Ok(StatusCode::OK);
+    Path(username): Path<String>,
+    Json(request): Json<SendMessage>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    if request.message.is_empty() {
+        return Err(ApiError::BadRequest("message must not be empty".into()));
     }
-    let message = message
-        .filter(|message| !message.is_empty())
-        .ok_or_else(|| ApiError::BadRequest(String::new()))?;
-    app.services
+    if app.services.users.is_blacklisted(&username, None) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let message = app
+        .services
         .messaging
         .conversations
-        .send(username, message)
+        .send(username, request.message)
         .await?;
-    Ok(StatusCode::CREATED)
+    Ok((StatusCode::CREATED, Json(message)).into_response())
 }
 
 #[cfg(test)]
@@ -601,11 +600,12 @@ mod tests {
     }
 
     #[test]
-    fn query_switches_use_api_casing() {
+    fn query_switches_use_snake_case() {
         let query: ListQuery =
-            serde_json::from_str(r#"{"includeInactive":true,"unAcknowledgedOnly":true}"#).unwrap();
-        assert!(query.include_inactive && query.un_acknowledged_only);
-        let query: GetQuery = serde_json::from_str(r#"{"includeMessages":false}"#).unwrap();
+            serde_json::from_str(r#"{"include_inactive":true,"unacknowledged_only":true}"#)
+                .unwrap();
+        assert!(query.include_inactive && query.unacknowledged_only);
+        let query: GetQuery = serde_json::from_str(r#"{"include_messages":false}"#).unwrap();
         assert!(!query.include_messages);
         let query: GetQuery = serde_json::from_str("{}").unwrap();
         assert!(query.include_messages);

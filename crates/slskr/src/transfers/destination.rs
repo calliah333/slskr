@@ -8,7 +8,7 @@ use std::{
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use slskr_api::{
+use slskr_types::{
     config::Config,
     transfers::{Batch, Transfer},
 };
@@ -87,10 +87,7 @@ pub(super) fn derive(
     batch: Option<&Batch>,
     search_text: Option<&str>,
 ) -> PathBuf {
-    if let Some(explicit) = batch
-        .and_then(|b| b.options.as_ref())
-        .and_then(|o| o.destination.as_deref())
-    {
+    if let Some(explicit) = batch.and_then(|b| b.destination.as_deref()) {
         return sanitized_path(explicit);
     }
     let pattern = options.downloads.subdirectory.trim();
@@ -116,8 +113,7 @@ pub(super) fn derive(
     let username = sanitize(&t.username);
     let external = sanitize(
         batch
-            .and_then(|b| b.options.as_ref())
-            .and_then(|o| o.external_id.as_deref())
+            .and_then(|b| b.external_id.as_deref())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or("unknown_batch_external_id"),
     );

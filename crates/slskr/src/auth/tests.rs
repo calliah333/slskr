@@ -98,7 +98,7 @@ async fn authenticate_schemes_and_roles() {
     let cookie = signed_in(&auth).await;
     let local = addr("127.0.0.1");
 
-    let p = parts("/api/v0/session", &[("cookie", cookie.as_str())]);
+    let p = parts("/api/session", &[("cookie", cookie.as_str())]);
     let principal = auth.authenticate(&p, local).unwrap();
     assert_eq!(principal.method, AuthMethod::Session);
     assert_eq!(principal.name, "admin");
@@ -109,10 +109,10 @@ async fn authenticate_schemes_and_roles() {
     );
     // Other cookies around ours are fine.
     let crowded = format!("theme=dark; {cookie}; other=1");
-    let p = parts("/api/v0/session", &[("cookie", crowded.as_str())]);
+    let p = parts("/api/session", &[("cookie", crowded.as_str())]);
     assert!(auth.authenticate(&p, local).is_ok());
 
-    let p = parts("/api/v0/session", &[("x-api-key", "local-key-0123456789")]);
+    let p = parts("/api/session", &[("x-api-key", "local-key-0123456789")]);
     let principal = auth.authenticate(&p, local).unwrap();
     assert_eq!(principal.method, AuthMethod::ApiKey);
     assert_eq!(
@@ -132,7 +132,7 @@ async fn authenticate_schemes_and_roles() {
         Err(AuthError::Forbidden)
     );
 
-    let none = parts("/api/v0/session", &[]);
+    let none = parts("/api/session", &[]);
     assert_eq!(
         auth.authorize(&none, local, Role::ReadOnly, Policy::Any),
         Err(AuthError::Unauthorized)
@@ -142,13 +142,13 @@ async fn authenticate_schemes_and_roles() {
     let token = cookie.split_once('=').unwrap().1;
     let bearer = format!("Bearer {token}");
     for p in [
-        parts("/api/v0/session", &[("authorization", bearer.as_str())]),
+        parts("/api/session", &[("authorization", bearer.as_str())]),
         parts(
             "/api/events",
             &[("authorization", "Bearer anywhere-key-0123456789")],
         ),
         parts(&format!("/api/events?access_token={token}"), &[]),
-        parts(&format!("/api/v0/session?{COOKIE_NAME}={token}"), &[]),
+        parts(&format!("/api/session?{COOKIE_NAME}={token}"), &[]),
     ] {
         assert_eq!(
             auth.authenticate(&p, local),
@@ -166,7 +166,7 @@ fn origin_matching() {
         if let Some(origin) = origin {
             headers.push(("origin", origin));
         }
-        let p = parts("/api/v0/session", &headers);
+        let p = parts("/api/session", &headers);
         same_origin(&p.headers, &p.uri)
     };
     assert!(check(None, "localhost:5030"));
@@ -207,7 +207,7 @@ async fn cookie_sessions_are_refused_cross_site() {
     // Same origin and absent Origin pass, for state changes and WebSocket upgrades.
     for headers in [vec![host, jar, same], vec![host, jar]] {
         assert!(
-            auth.authenticate(&request(Method::POST, "/api/v0/x", &headers), local)
+            auth.authenticate(&request(Method::POST, "/api/x", &headers), local)
                 .is_ok()
         );
         let mut ws = headers.clone();
@@ -217,12 +217,12 @@ async fn cookie_sessions_are_refused_cross_site() {
 
     // Cross-site: reads pass, state changes and WebSocket upgrades are 403.
     assert!(
-        auth.authenticate(&parts("/api/v0/x", &[host, jar, evil]), local)
+        auth.authenticate(&parts("/api/x", &[host, jar, evil]), local)
             .is_ok()
     );
     for method in [Method::POST, Method::PUT, Method::DELETE] {
         assert_eq!(
-            auth.authenticate(&request(method, "/api/v0/x", &[host, jar, evil]), local),
+            auth.authenticate(&request(method, "/api/x", &[host, jar, evil]), local),
             Err(AuthError::Forbidden)
         );
     }
@@ -241,7 +241,7 @@ async fn cookie_sessions_are_refused_cross_site() {
 
     // API keys skip the check, even alongside a cross-site cookie.
     let key = ("x-api-key", "local-key-0123456789");
-    let p = request(Method::POST, "/api/v0/x", &[host, jar, evil, key]);
+    let p = request(Method::POST, "/api/x", &[host, jar, evil, key]);
     assert_eq!(
         auth.authenticate(&p, local).unwrap().method,
         AuthMethod::ApiKey
@@ -265,7 +265,7 @@ fn passthrough_when_disabled() {
         SessionStore::memory(session::DEFAULT_TTL),
     );
     assert!(!auth.enabled());
-    let p = parts("/api/v0/transfers", &[]);
+    let p = parts("/api/transfers", &[]);
     let principal = auth
         .authorize(
             &p,
@@ -277,15 +277,15 @@ fn passthrough_when_disabled() {
     assert_eq!(principal, Principal::passthrough());
     assert_eq!(
         principal.session(),
-        slskr_api::session::Session {
+        slskr_types::session::Session {
             username: "Anonymous".into(),
-            role: "Administrator".into()
+            role: slskr_types::session::Role::Admin
         }
     );
     // Another site still cannot drive the daemon.
     let p = request(
         Method::POST,
-        "/api/v0/transfers",
+        "/api/transfers",
         &[
             ("host", "localhost:5030"),
             ("origin", "http://evil.example"),

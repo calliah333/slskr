@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use slskr_api::settings::Settings;
+use slskr_types::settings::Settings;
 
 /// Read-only view of `GET /settings` until the settings form lands: the merged values
 /// (secrets left out) and the keys locked by `slskr.toml`, the environment or the
