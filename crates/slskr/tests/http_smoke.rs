@@ -417,6 +417,34 @@ async fn daemon_http_smoke() {
     assert_eq!(search.status(), reqwest::StatusCode::CONFLICT);
     let search: Value = search.json().await.unwrap();
     assert!(search["error"].as_str().unwrap().contains("logged in"));
+    // Server-dependent reads and sends answer 409 too, not 500.
+    for (method, path) in [
+        (reqwest::Method::GET, "users/someone/info"),
+        (reqwest::Method::GET, "users/someone/browse"),
+        (reqwest::Method::GET, "rooms"),
+    ] {
+        let response = client
+            .request(method, format!("{api}/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT, "{path}");
+    }
+    let message = client
+        .post(format!("{api}/conversations/someone/messages"))
+        .json(&serde_json::json!({"message": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(message.status(), reqwest::StatusCode::CONFLICT);
+    let connect = client
+        .post(format!("{api}/server/connect"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(connect.status(), reqwest::StatusCode::CONFLICT);
+    let connect: Value = connect.json().await.unwrap();
+    assert!(connect["error"].as_str().unwrap().contains("credentials"));
     let malformed = client
         .post(format!("{api}/searches"))
         .header("content-type", "application/json")

@@ -556,7 +556,7 @@ pub(crate) fn connection_state(state: ClientState) -> ConnectionState {
     }
 }
 
-fn credentials(options: &Config) -> Option<(&str, &str)> {
+pub(crate) fn credentials(options: &Config) -> Option<(&str, &str)> {
     let s = &options.soulseek;
     let username = Some(s.username.as_str()).filter(|value| !value.trim().is_empty())?;
     let password = Some(s.password.as_str()).filter(|value| !value.trim().is_empty())?;

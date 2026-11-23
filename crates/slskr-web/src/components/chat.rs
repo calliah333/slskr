@@ -42,14 +42,21 @@ pub fn Chat() -> impl IntoView {
     // Each refresh takes a ticket; only the latest one may apply its result.
     let generation = RwSignal::new(0u64);
     let in_flight = RwSignal::new(false);
+    // Acknowledging needs the Soulseek server; unread messages are acknowledged by the
+    // first refresh after logging in.
+    let logged_in = use_context::<crate::components::app::AppContext>()
+        .map(|context| context.state)
+        .map(|state| Signal::derive(move || state.with(|s| s.server.state.is_logged_in())))
+        .unwrap_or_default();
     let refresh = move || {
         let selected = active.get_untracked();
         let ticket = generation.get_untracked().wrapping_add(1);
         generation.set(ticket);
         in_flight.set(true);
         let current = move || generation.try_get_untracked() == Some(ticket);
+        let acknowledge = logged_in.get_untracked();
         spawn_local(async move {
-            let result = load_conversations(selected).await;
+            let result = load_conversations(selected, acknowledge).await;
             if !current() {
                 return;
             }
@@ -212,6 +219,7 @@ pub fn Chat() -> impl IntoView {
 /// Returns the effective selection, the list, and a non-fatal error.
 async fn load_conversations(
     selected: String,
+    acknowledge: bool,
 ) -> Result<(String, Vec<Conversation>, Option<String>), String> {
     let mut value = crate::services::api::get::<Vec<Conversation>>("/conversations")
         .await
@@ -235,6 +243,7 @@ async fn load_conversations(
             .iter()
             .any(|c| c.username == selected && c.unacknowledged_count > 0);
         if unread
+            && acknowledge
             && let Err(e) = crate::services::api::post_empty::<()>(&format!("{path}/ack")).await
         {
             problem = Some(e.to_string());

@@ -105,3 +105,24 @@ async fn rejections_and_unrouted_requests_answer_json_errors() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[test]
+fn soulseek_errors_map_to_documented_statuses() {
+    use soulseek::Error as E;
+    for (error, status) in [
+        (
+            E::InvalidState("not logged in".into()),
+            StatusCode::CONFLICT,
+        ),
+        (E::Argument("bad".into()), StatusCode::BAD_REQUEST),
+        (E::UserOffline("gone".into()), StatusCode::NOT_FOUND),
+        (E::Timeout("slow".into()), StatusCode::GATEWAY_TIMEOUT),
+        (E::RoomJoinForbidden("no".into()), StatusCode::FORBIDDEN),
+        (
+            E::Connection("reset".into()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        assert_eq!(ApiError::from(error).status(), status);
+    }
+}

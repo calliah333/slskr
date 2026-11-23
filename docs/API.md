@@ -62,7 +62,7 @@ need no authentication.
 | GET | `/api/application/version` | readonly | | `VersionState` |
 | POST | `/api/application/version/check` | readwrite | | `VersionState`, after asking GitHub for the latest release |
 | GET | `/api/server` | readonly | | `ServerState` |
-| POST | `/api/server/connect` | readwrite | | 204 |
+| POST | `/api/server/connect` | readwrite | | 204; 409 when no Soulseek credentials are set |
 | POST | `/api/server/disconnect` | readwrite | optional `{message}` | 204 |
 | GET | `/api/config` | readonly | | `Config`, the effective configuration with secrets as `*****` |
 | GET | `/api/settings` | admin session | | `Settings` |

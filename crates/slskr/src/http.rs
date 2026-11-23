@@ -70,6 +70,8 @@ impl From<soulseek::Error> for ApiError {
             E::Timeout(message) | E::NoResponse(message) => {
                 Self::Status(StatusCode::GATEWAY_TIMEOUT, message)
             }
+            // Not connected or not logged in to the Soulseek server.
+            E::InvalidState(message) => Self::Conflict(message),
             E::RoomJoinForbidden(message) => Self::Forbidden(message),
             E::DuplicateTransfer(message) | E::DuplicateToken(message) => Self::Conflict(message),
             other => Self::Internal(anyhow::Error::new(other)),

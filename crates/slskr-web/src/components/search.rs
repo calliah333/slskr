@@ -125,6 +125,11 @@ pub fn Searches() -> impl IntoView {
         (status.get() == Status::Reconnecting).then_some("Disconnected from search updates")
     };
 
+    // Requests run under this page's owner, not the clicked view's: a `search_deleted`
+    // event can dispose the row or detail view before the DELETE answers, which would drop
+    // the task and leave `busy` set.
+    let owner = Owner::current().expect("Searches renders under an owner");
+    let create_owner = owner.clone();
     let create = Callback::new(move |(text, open): (String, bool)| {
         let text = text.trim();
         if text.is_empty() || busy.get_untracked() || !connected.get_untracked() {
@@ -137,7 +142,7 @@ pub fn Searches() -> impl IntoView {
         busy.set(true);
         action_error.set(None);
         let revision = searches.with_untracked(|catalog| catalog.revision);
-        spawn_local_scoped_with_cancellation(async move {
+        let task = async move {
             match api::post::<_, Search>("/searches", &request).await {
                 Ok(search) => {
                     let path = endpoint(&search.id);
@@ -166,7 +171,8 @@ pub fn Searches() -> impl IntoView {
                     busy.set(false);
                 }
             }
-        });
+        };
+        create_owner.with(|| spawn_local_scoped_with_cancellation(task));
     });
     let change = Callback::new(move |(id, remove): (String, bool)| {
         if busy.get_untracked() {
@@ -174,7 +180,7 @@ pub fn Searches() -> impl IntoView {
         }
         busy.set(true);
         action_error.set(None);
-        spawn_local_scoped_with_cancellation(async move {
+        let task = async move {
             let path = endpoint(&id);
             let result = if remove {
                 api::request_text(gloo_net::http::Method::DELETE, &path, None).await
@@ -218,7 +224,8 @@ pub fn Searches() -> impl IntoView {
                 Err(error) => action_error.set(Some(error.to_string())),
             }
             busy.set(false);
-        });
+        };
+        owner.with(|| spawn_local_scoped_with_cancellation(task));
     });
 
     view! {
