@@ -40,7 +40,7 @@ pub fn api_base_url() -> String {
     format!("{}/api/v0", root_url())
 }
 
-/// Base URL of the SignalR hubs (`{url_base}/hub`).
-pub fn hub_base_url() -> String {
-    format!("{}/hub", root_url())
+/// Path of the live updates WebSocket (`{url_base}/api/events`).
+pub fn events_path() -> String {
+    format!("{}{}", root_url(), slskr_api::realtime::PATH)
 }

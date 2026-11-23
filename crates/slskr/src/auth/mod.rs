@@ -720,19 +720,6 @@ impl Auth {
         }
     }
 
-    /// Authorizer for [`crate::signalr::Hub::set_authorizer`] requiring `role` (policy `Any`).
-    pub fn hub_authorizer(
-        &self,
-        role: Role,
-    ) -> impl Fn(&Parts) -> Result<(), StatusCode> + Send + Sync + 'static {
-        let auth = self.clone();
-        move |parts| {
-            auth.authorize(parts, remote_addr(parts), role, Policy::Any)
-                .map(drop)
-                .map_err(AuthError::status)
-        }
-    }
-
     /// Checks the web UI credentials: the plaintext password from the file or environment
     /// in constant time, otherwise the argon2 hash of a password set from the UI (slow;
     /// call from a blocking context). The password is checked even when the username does

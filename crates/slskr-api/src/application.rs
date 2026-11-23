@@ -1,15 +1,9 @@
-//! Application state (`GET /api/v0/application`, application hub `STATE`).
+//! Application state (`GET /api/v0/application`, `state` event).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::server::ServerState;
-
-/// Application hub method names.
-pub mod hub_methods {
-    pub const STATE: &str = "STATE";
-    pub const OPTIONS: &str = "OPTIONS";
-}
 
 /// Root application state (slskd `State`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

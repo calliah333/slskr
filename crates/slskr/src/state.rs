@@ -1,35 +1,34 @@
-//! Shared application state and debounced application-hub notifications.
+//! Shared application state and its coalesced `state` events.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+use std::time::Duration;
+
+use slskr_api::{
+    application::State,
+    realtime::{Event, Topic},
 };
-
-use serde_json::to_value;
-use slskr_api::application::{State, hub_methods};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
-use crate::signalr::Hub;
+use crate::realtime::EventBus;
 
-const BROADCAST_DELAY: Duration = Duration::from_millis(50);
+/// Minimum time between two `state` events (at most four a second).
+pub const STATE_EVENT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct StateStore {
     sender: watch::Sender<State>,
-    hub: Hub,
-    revision: Arc<AtomicU64>,
+}
+
+impl Default for StateStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StateStore {
-    pub fn new(hub: Hub) -> Self {
-        let (sender, _) = watch::channel(State::default());
+    pub fn new() -> Self {
         Self {
-            sender,
-            hub,
-            revision: Arc::new(AtomicU64::new(0)),
+            sender: watch::channel(State::default()).0,
         }
     }
 
@@ -37,24 +36,46 @@ impl StateStore {
         self.sender.borrow().clone()
     }
 
+    /// Changes the state; subscribers are notified only when it actually changed.
     pub fn update(&self, f: impl FnOnce(&mut State)) {
-        self.sender.send_modify(f);
-        let revision = Arc::clone(&self.revision);
-        let generation = revision.fetch_add(1, Ordering::Relaxed) + 1;
-        let sender = self.sender.clone();
-        let hub = self.hub.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(BROADCAST_DELAY).await;
-            if revision.load(Ordering::Relaxed) != generation {
-                return;
-            }
-            if let Ok(value) = to_value(sender.borrow().clone()) {
-                hub.broadcast(hub_methods::STATE, vec![value]);
-            }
+        self.sender.send_if_modified(|state| {
+            let before = state.clone();
+            f(state);
+            *state != before
         });
     }
 
     pub fn subscribe(&self) -> watch::Receiver<State> {
         self.sender.subscribe()
+    }
+
+    /// Publishes the state on `bus` after every change, at most once per
+    /// [`STATE_EVENT_INTERVAL`]: changes in between are coalesced, and the latest state is
+    /// always published. Ends on `shutdown`.
+    pub fn spawn_publisher(&self, bus: EventBus, shutdown: CancellationToken) {
+        let mut changes = self.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    changed = changes.changed() => if changed.is_err() { break },
+                }
+                // Without subscribers only mark the change seen: a new subscriber gets a
+                // snapshot.
+                let event = {
+                    let state = changes.borrow_and_update();
+                    bus.wants(Topic::State)
+                        .then(|| Event::State(Box::new(state.clone())))
+                };
+                if let Some(event) = event {
+                    bus.publish(&event);
+                }
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(STATE_EVENT_INTERVAL) => {}
+                }
+            }
+        });
     }
 }

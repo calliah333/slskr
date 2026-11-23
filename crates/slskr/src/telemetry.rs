@@ -19,16 +19,15 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use slskr_api::{
     config::MetricsConfig,
-    telemetry::{
-        CurrentMetrics, PrometheusMetric, PrometheusMetricSample, PrometheusMetrics, hub_methods,
-    },
+    realtime::{Event, Topic},
+    telemetry::{CurrentMetrics, PrometheusMetric, PrometheusMetricSample, PrometheusMetrics},
 };
 
 #[derive(Clone)]
 pub struct TelemetryService {
     pub reports: reports::ReportsService,
     transfers: TransferService,
-    metrics_hub: crate::signalr::Hub,
+    bus: crate::realtime::EventBus,
     scrape_token: Option<String>,
 }
 
@@ -38,7 +37,7 @@ impl TelemetryService {
         Ok(Self {
             reports: reports::ReportsService::new(transfers.database().clone()),
             transfers: transfers.clone(),
-            metrics_hub: core.hubs.metrics.clone(),
+            bus: core.bus.clone(),
             scrape_token: if config.enabled {
                 configured_token(config)
             } else {
@@ -52,18 +51,12 @@ impl TelemetryService {
         self.transfers.metrics()
     }
 
-    /// Start the one-second MetricsHub update broadcast.
+    /// Publishes the current metrics every second while the `metrics` topic has subscribers
+    /// (a new subscriber gets them at once as its snapshot).
     pub fn start(&self, core: &Core) {
         let transfers = self.transfers.clone();
-        let metrics_hub = self.metrics_hub.clone();
+        let bus = self.bus.clone();
         let shutdown = core.shutdown.clone();
-        // Like upstream MetricsHub.OnConnectedAsync, send current metrics on connect.
-        let current = transfers.clone();
-        metrics_hub.on_connected(move || {
-            serde_json::to_value(current.metrics())
-                .map(|value| vec![(hub_methods::UPDATE.to_owned(), vec![value])])
-                .unwrap_or_default()
-        });
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -71,8 +64,7 @@ impl TelemetryService {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = ticker.tick() => {
-                        let Ok(value) = serde_json::to_value(transfers.metrics()) else { continue };
-                        metrics_hub.broadcast(hub_methods::UPDATE, vec![value]);
+                        bus.publish_with(Topic::Metrics, || Event::Metrics(transfers.metrics()));
                     }
                 }
             }

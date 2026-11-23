@@ -19,14 +19,13 @@ use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use serde_json::json;
 use slskr_api::{
-    application::{
-        DistributedNetworkState, ServerConnectionWatchdogState, UserStatisticsState, hub_methods,
-    },
+    application::{DistributedNetworkState, ServerConnectionWatchdogState, UserStatisticsState},
     config::Config,
     events::{
         Event, EventHeader, EventType, SoulseekClientConnectedEvent,
         SoulseekClientDisconnectedEvent,
     },
+    realtime::{Event as LiveEvent, Topic},
     server::{ServerState, SoulseekClientStates},
 };
 use soulseek::{ClientState, DistributedNetworkInfo, Event as ClientEvent};
@@ -36,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     auth::Auth, config::ConfigStore, events::EventService, files::FileService, logging::LogBuffer,
-    messaging::MessagingService, search::SearchService, shares::ShareService, signalr::Hub,
+    messaging::MessagingService, realtime::EventBus, search::SearchService, shares::ShareService,
     state::StateStore, telemetry::TelemetryService, transfers::TransferService, users::UserService,
 };
 
@@ -55,15 +54,6 @@ pub struct Paths {
     pub content_path: Option<PathBuf>,
 }
 
-/// SignalR hubs mounted at `/hub/{name}`.
-#[derive(Clone)]
-pub struct Hubs {
-    pub application: Hub,
-    pub logs: Hub,
-    pub search: Hub,
-    pub metrics: Hub,
-}
-
 /// Core handles every service may use. Cheap to clone.
 #[derive(Clone)]
 pub struct Core {
@@ -71,7 +61,8 @@ pub struct Core {
     pub options: ConfigStore,
     pub state: StateStore,
     pub client: soulseek::SoulseekClient,
-    pub hubs: Hubs,
+    /// Live updates for `/api/events`.
+    pub bus: EventBus,
     pub auth: Auth,
     pub logs: LogBuffer,
     pub shutdown: CancellationToken,
@@ -216,20 +207,8 @@ impl AppState {
         &self,
         client_events_done: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        let weak = Arc::downgrade(&self.0);
-        self.hubs.application.on_connected(move || {
-            let Some(app) = weak.upgrade() else {
-                return Vec::new();
-            };
-            vec![
-                (hub_methods::STATE.into(), vec![json!(app.state.get())]),
-                (
-                    hub_methods::OPTIONS.into(),
-                    vec![json!(app.options.get().redact())],
-                ),
-            ]
-        });
-
+        self.state
+            .spawn_publisher(self.bus.clone(), self.shutdown.clone());
         crate::logging::start_retention(&self.core);
         self.auth.sessions().spawn_pruner(self.shutdown.clone());
         self.services.users.start(self.clone());
@@ -533,11 +512,9 @@ impl AppState {
                     reconnect || (state.server.is_connected && credentials_changed);
                 state.pending_restart = restart;
             });
-            if self.hubs.application.connection_count() > 0 {
-                self.hubs
-                    .application
-                    .broadcast(hub_methods::OPTIONS, vec![json!(current.redact())]);
-            }
+            self.bus.publish_with(Topic::Settings, || {
+                LiveEvent::Settings(Box::new(current.redact()))
+            });
             previous = current;
         }
     }
@@ -590,4 +567,27 @@ fn credentials(options: &Config) -> Option<(&str, &str)> {
     let username = Some(s.username.as_str()).filter(|value| !value.trim().is_empty())?;
     let password = Some(s.password.as_str()).filter(|value| !value.trim().is_empty())?;
     Some((username, password))
+}
+
+impl crate::realtime::Snapshots for AppState {
+    fn snapshot(&self, topic: Topic, bus: &EventBus) -> (u64, LiveEvent) {
+        // Read the sequence number first: the data then includes every event up to it.
+        let seq = bus.seq();
+        match topic {
+            Topic::State => (seq, LiveEvent::State(Box::new(self.state.get()))),
+            Topic::Settings => (
+                seq,
+                LiveEvent::Settings(Box::new(self.options.get().redact())),
+            ),
+            Topic::Metrics => (seq, LiveEvent::Metrics(self.services.telemetry.metrics())),
+            Topic::Searches => {
+                let (seq, searches) = self.services.search.snapshot();
+                (seq, LiveEvent::SearchList(searches))
+            }
+            Topic::Logs => {
+                let (seq, records) = self.logs.snapshot_with_seq();
+                (seq, LiveEvent::LogBuffer(records))
+            }
+        }
+    }
 }

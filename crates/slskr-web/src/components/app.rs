@@ -5,12 +5,8 @@ use leptos_router::{
     hooks::use_location,
     path,
 };
-use serde::de::DeserializeOwned;
 use slskr_api::{
-    application::{State, hub_methods as application_methods},
-    config::Config,
-    telemetry::{CurrentMetrics, hub_methods as metrics_methods},
-    transfers::TransferDirection,
+    application::State, config::Config, telemetry::CurrentMetrics, transfers::TransferDirection,
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 
@@ -22,7 +18,7 @@ use crate::{
     config,
     services::{
         api,
-        hub::{self, HubConnection},
+        events::{Event, Events, Status, Topic},
     },
     ui::{Modal, ModalAction},
 };
@@ -160,80 +156,6 @@ fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
     }
 }
 
-#[derive(Clone, PartialEq)]
-enum Connection {
-    Starting,
-    Connected,
-    Reconnecting,
-    Closed(String),
-}
-
-fn connect_hub(hub: HubConnection, status: RwSignal<Connection>, label: &'static str) {
-    hub.on_reconnecting(move |_| {
-        status.try_set(Connection::Reconnecting);
-    });
-    hub.on_reconnected(move |_| {
-        status.try_set(Connection::Connected);
-    });
-    hub.on_close(move |error| {
-        let detail = error.unwrap_or_else(|| "connection closed".into());
-        status.try_set(Connection::Closed(format!("{label}: {detail}")));
-    });
-    // Keep a handle for owner cleanup, even if cancellation drops the startup future.
-    let connection = StoredValue::new_local(hub.clone());
-    on_cleanup(move || connection.with_value(HubConnection::stop));
-    spawn_local_scoped_with_cancellation(async move {
-        let next = match hub.start().await {
-            Ok(()) => Connection::Connected,
-            Err(error) => Connection::Closed(format!("{label}: {error}")),
-        };
-        status.try_set(next);
-    });
-}
-
-fn watch_hub_value<T>(
-    hub: &HubConnection,
-    method: &'static str,
-    endpoint: &'static str,
-    connection: RwSignal<Connection>,
-    value: RwSignal<T>,
-) -> RwSignal<Option<Result<(), String>>>
-where
-    T: DeserializeOwned + Send + Sync + 'static,
-{
-    let revision = RwSignal::new(0u64);
-    hub.on(method, move |args| {
-        if let Some(payload) = args.into_iter().next() {
-            match serde_json::from_value::<T>(payload) {
-                Ok(update) => {
-                    revision.try_update(|revision| *revision = revision.wrapping_add(1));
-                    value.try_set(update);
-                }
-                Err(error) => leptos::logging::warn!("Invalid {method} hub update: {error}"),
-            }
-        }
-    });
-    let loaded = RwSignal::new(None);
-    Effect::new(move |_| {
-        if connection.get() == Connection::Connected {
-            let before = revision.get_untracked();
-            spawn_local_scoped_with_cancellation(async move {
-                match api::get::<T>(endpoint).await {
-                    Ok(snapshot) => {
-                        // An update received during the request is newer than the HTTP snapshot.
-                        if revision.get_untracked() == before {
-                            value.set(snapshot);
-                        }
-                        loaded.set(Some(Ok(())));
-                    }
-                    Err(error) => loaded.set(Some(Err(format!("{endpoint}: {error}")))),
-                }
-            });
-        }
-    });
-    loaded
-}
-
 #[component]
 fn AuthenticatedApp(
     dark: RwSignal<bool>,
@@ -247,40 +169,43 @@ fn AuthenticatedApp(
     // The live configuration is loaded (and gates readiness) but no view reads it yet.
     provide_context(AppContext { state, dark });
 
-    let application = hub::create_application_hub();
-    let telemetry = hub::create_metrics_hub();
-    let app_connection = RwSignal::new(Connection::Starting);
-    let metrics_connection = RwSignal::new(Connection::Starting);
-    let snapshots = [
-        watch_hub_value(
-            &application,
-            application_methods::STATE,
-            "/application",
-            app_connection,
-            state,
-        ),
-        watch_hub_value(
-            &application,
-            application_methods::OPTIONS,
-            "/options",
-            app_connection,
-            options,
-        ),
-        watch_hub_value(
-            &telemetry,
-            metrics_methods::UPDATE,
-            "/telemetry/metrics/current",
-            metrics_connection,
-            metrics,
-        ),
+    let events = Events::start();
+    let loaded = [
+        RwSignal::new(false),
+        RwSignal::new(false),
+        RwSignal::new(false),
     ];
-    connect_hub(application, app_connection, "Application hub");
-    connect_hub(telemetry, metrics_connection, "Metrics hub");
+    let [state_loaded, options_loaded, metrics_loaded] = loaded;
+    events.on(Topic::State, move |event| {
+        if let Event::State(update) = event {
+            state.try_set((**update).clone());
+            state_loaded.try_set(true);
+        }
+    });
+    events.on(Topic::Settings, move |event| {
+        if let Event::Settings(update) = event {
+            options.try_set((**update).clone());
+            options_loaded.try_set(true);
+        }
+    });
+    events.on(Topic::Metrics, move |event| {
+        if let Event::Metrics(update) = event {
+            metrics.try_set(update.clone());
+            metrics_loaded.try_set(true);
+        }
+    });
+    let status = events.status();
+    // The session ended while connected: show the sign-in form.
+    Effect::new(move |_| {
+        if status.get() == Status::Unauthorized {
+            retry.run(());
+        }
+    });
     let location = use_location();
     Effect::new(move |_| {
         location.pathname.track();
         location.search.track();
-        let connected = app_connection.get() == Connection::Connected;
+        let connected = status.get() == Status::Open;
         if !passthrough && connected {
             spawn_local_scoped_with_cancellation(async move {
                 match check_token().await {
@@ -291,42 +216,10 @@ fn AuthenticatedApp(
             });
         }
     });
-    let connections = [app_connection, metrics_connection];
-    let ready = Memo::new(move |_| {
-        snapshots
-            .iter()
-            .all(|snapshot| snapshot.with(|result| matches!(result, Some(Ok(())))))
-    });
-    let issue = Memo::new(move |_| {
-        connections
-            .iter()
-            .find_map(|connection| {
-                connection.with(|status| match status {
-                    Connection::Closed(error) => Some(error.clone()),
-                    _ => None,
-                })
-            })
-            .or_else(|| {
-                snapshots.iter().find_map(|snapshot| {
-                    snapshot.with(|result| {
-                        result
-                            .as_ref()
-                            .and_then(|result| result.as_ref().err())
-                            .cloned()
-                    })
-                })
-            })
-    });
-    let reconnecting = move || {
-        connections
-            .iter()
-            .any(|connection| connection.with(|status| matches!(status, Connection::Reconnecting)))
-    };
+    let ready = Memo::new(move |_| loaded.iter().all(|loaded| loaded.get()));
 
     view! {
-        {move || if let Some(message) = issue.get() {
-            view! { <ConnectionError message retry/> }.into_any()
-        } else if reconnecting() {
+        {move || if status.get() == Status::Reconnecting {
             view! { <div class="ui warning message view" role="status">"Lost connection to slskr. Reconnecting…"</div> }.into_any()
         } else if !ready.get() {
             loading().into_any()

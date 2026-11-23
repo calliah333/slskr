@@ -8,44 +8,26 @@ pub fn Logs() -> impl IntoView {
 
 #[component]
 fn LiveLogs() -> impl IntoView {
+    use crate::services::events::{Event, Topic, use_events};
     let lines = RwSignal::new(Vec::<slskr_api::logs::LogRecord>::new());
     let error = RwSignal::new(String::new());
-    let connection = StoredValue::new_local(None::<crate::services::hub::HubConnection>);
-    Effect::new(move |_| {
-        let hub = crate::services::hub::create_logs_hub();
-        let lines_ref = lines;
-        hub.on(slskr_api::logs::hub_methods::BUFFER, move |args| {
-            if let Some(values) = args.first().and_then(|v| {
-                serde_json::from_value::<Vec<slskr_api::logs::LogRecord>>(v.clone()).ok()
-            }) {
-                lines_ref.set(values);
-            }
-        });
-        let lines_ref = lines;
-        hub.on(slskr_api::logs::hub_methods::LOG, move |args| {
-            if let Some(value) = args
-                .first()
-                .and_then(|v| serde_json::from_value::<slskr_api::logs::LogRecord>(v.clone()).ok())
-            {
-                lines_ref.update(|items| {
-                    items.push(value);
-                    if items.len() > 500 {
-                        items.drain(..items.len() - 500);
-                    }
-                });
-            }
-        });
-        connection.set_value(Some(hub.clone()));
-        leptos::task::spawn_local(async move {
-            if let Err(e) = hub.start().await {
-                error.set(e.to_string());
-            }
-        });
-        on_cleanup(move || {
-            if let Some(hub) = connection.get_value() {
-                hub.stop();
-            }
-        });
+    use_events().on(Topic::Logs, move |event| match event {
+        Event::LogBuffer(records) => {
+            lines.try_set(records.clone());
+            error.try_set(String::new());
+        }
+        Event::Log(record) => {
+            lines.try_update(|items| {
+                items.push(record.clone());
+                if items.len() > 500 {
+                    items.drain(..items.len() - 500);
+                }
+            });
+        }
+        Event::Error { message, .. } => {
+            error.try_set(message.clone());
+        }
+        _ => {}
     });
     view! { <p role="alert">{move || error.get()}</p><div class="ui segment" style="overflow:auto;max-height:70vh"><For each=move || lines.get() key=|line| format!("{}-{}", line.timestamp, line.message.clone().unwrap_or_default()) children=move |line| view! { <div><time>{line.timestamp.to_string()}</time>{" ["}{line.level.unwrap_or_default()}{"] "}{line.context.unwrap_or_default()}{": "}{line.message.unwrap_or_default()}</div> }/></div> }
 }

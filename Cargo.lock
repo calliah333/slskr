@@ -2658,7 +2658,6 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
- "http-body-util",
  "lofty",
  "rand 0.9.5",
  "regex",

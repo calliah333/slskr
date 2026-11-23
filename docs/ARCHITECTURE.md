@@ -14,8 +14,8 @@ Toolchain: `nix develop` (flake.nix) provides stable Rust (edition 2024) with th
 | crate | kind | purpose |
 |---|---|---|
 | `crates/soulseek` | lib | async (tokio) Soulseek network client |
-| `crates/slskr-api` | lib | serde DTOs of the slskd HTTP/hub API; shared by daemon and UI |
-| `crates/slskr` | bin `slskr` (+ lib) | the daemon: axum HTTP API, SignalR hubs, services, sqlite |
+| `crates/slskr-api` | lib | serde DTOs of the HTTP API and live events; shared by daemon and UI |
+| `crates/slskr` | bin `slskr` (+ lib) | the daemon: axum HTTP API, live events WebSocket, services, sqlite |
 | `crates/slskr-web` | bin (wasm) | Leptos 0.8 CSR port of the slskd React UI, built with trunk |
 
 ## soulseek crate layout
@@ -124,21 +124,31 @@ enums serialised as comma-separated strings, e.g. `"Completed, Succeeded"`).
 Modules: `application` (State, version), `config` (the merged configuration, snake_case),
 `settings` (`/settings` view: values, pinned keys, secrets set, API keys), `session`,
 `server`, `logs`, `events`, `telemetry`, `search`, `transfers`, `users`,
-`conversations`, `rooms`, `shares`, `files`. No I/O, compiles to wasm.
+`conversations`, `rooms`, `shares`, `files`, `realtime` (live event protocol). No I/O,
+compiles to wasm.
 
 ## Realtime
 
-Daemon implements the ASP.NET SignalR JSON hub protocol (negotiate endpoint +
-WebSocket transport, `\x1e` record separator) at `/hub/{application,logs,search,metrics}`
-so both the original slskd React UI and the Rust UI work against it. The Rust UI
-contains a minimal SignalR client over `web_sys::WebSocket`.
+One plain WebSocket at `{url_base}/api/events` carries every live update as JSON text
+frames of `slskr_api::realtime::Event` (`{"type": "...", "data": ...}`). The client
+subscribes to topics (`state`, `settings`, `searches`, `logs` for administrators,
+`metrics`); each subscription first delivers that topic's snapshot, then changes. Services
+publish to an internal `EventBus`; the socket fans it out per connection. The upgrade is
+authenticated like any route (session cookie or `X-API-Key`, same-origin check for
+cookies). See [daemon internals](DAEMON.md#live-events-srcrealtime) for the message list,
+coalescing, limits and close codes.
+
+The UI (`services/events.rs`) opens the connection after the session check, lets components
+register per-topic handlers that unsubscribe on cleanup, exposes the connection status,
+reconnects after 0 s, 2 s, 10 s, then every 30 s (resubscribing, which brings fresh
+snapshots), and returns to the sign-in form on close code 4401.
 
 ## HTTP API
 
 `/api/v0/...` exactly as slskd (`ref/slskd/src/slskd/**/API/**Controller.cs`).
 Auth: server-side sessions behind an `HttpOnly`, `SameSite=Strict` cookie (`slskr_session`,
 set by `POST /api/v0/session`, cleared by `DELETE`), API keys (`X-API-Key`), or disabled
-auth (passthrough). Browsers send the cookie on same-origin fetches and hub WebSocket
+auth (passthrough). Browsers send the cookie on same-origin fetches and the events WebSocket
 upgrades; see [daemon internals](DAEMON.md#authentication).
 
 ## Web UI

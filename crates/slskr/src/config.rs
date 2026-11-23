@@ -863,7 +863,7 @@ fn validate(c: &Config) -> Result<()> {
         );
         ensure!(
             !reserved_web_path(base),
-            "web.url_base may not use the reserved api, hub or health namespace"
+            "web.url_base may not use the reserved api or health namespace"
         );
     }
     ensure!(
@@ -998,7 +998,7 @@ fn validate(c: &Config) -> Result<()> {
                 && valid_web_path(path)
                 && !reserved_web_path(path)
                 && path != base.trim_end_matches('/'),
-            "metrics.path must be an absolute path outside the reserved api, hub, health and web.url_base roots"
+            "metrics.path must be an absolute path outside the reserved api, health and web.url_base roots"
         );
     }
     ensure!(
@@ -1036,7 +1036,7 @@ fn valid_web_path(path: &str) -> bool {
 fn reserved_web_path(path: &str) -> bool {
     matches!(
         path.trim_start_matches('/').split('/').next(),
-        Some("api" | "hub" | "health")
+        Some("api" | "health")
     )
 }
 

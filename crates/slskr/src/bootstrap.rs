@@ -21,13 +21,13 @@ use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{AppInner, AppState, Core, Hubs, Paths, Services},
-    auth::{self, Auth, Role, SessionStore},
+    app::{AppInner, AppState, Core, Paths, Services},
+    auth::{self, Auth, SessionStore},
     config::{self, ConfigStore, Overrides, Sources},
     core_api, events, files, http, logging, messaging,
+    realtime::{self, EventBus},
     resolvers::AppResolvers,
     search, shares,
-    signalr::Hub,
     state::StateStore,
     telemetry, transfers, users,
 };
@@ -129,19 +129,14 @@ async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) ->
     tokio::fs::create_dir_all(&paths.db_dir).await?;
     tokio::fs::create_dir_all(&startup.downloads.directory).await?;
     tokio::fs::create_dir_all(&startup.downloads.incomplete_directory).await?;
-    let logs = logging::init(startup, &paths)?;
+    let bus = EventBus::new();
+    let logs = logging::init(startup, &paths, bus.clone())?;
     warn_about_web_access(startup, &paths.config_file);
     if paths.content_path.is_none() {
         tracing::warn!(
             "web UI files not found (set SLSKR_CONTENT_PATH to a directory containing index.html)"
         );
     }
-    let hubs = Hubs {
-        application: Hub::new("application"),
-        logs: Hub::new("logs"),
-        search: Hub::new("search"),
-        metrics: Hub::new("metrics"),
-    };
     let current = options.get();
     let sessions = SessionStore::open(
         &paths.db_dir.join("sessions.db"),
@@ -153,13 +148,7 @@ async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) ->
     .context("opening sessions database")?;
     let auth =
         Auth::new(config::auth_config(&current), sessions).with_url_base(&startup.web.url_base);
-    for hub in [&hubs.application, &hubs.search, &hubs.metrics] {
-        hub.set_authorizer(auth.hub_authorizer(Role::ReadOnly));
-    }
-    hubs.logs
-        .set_authorizer(auth.hub_authorizer(Role::Administrator));
-    logs.attach_hub(hubs.logs.clone());
-    let state = StateStore::new(hubs.application.clone());
+    let state = StateStore::new();
     let concurrency = startup.search.incoming_concurrency.try_into()?;
     let resolvers = Arc::new(AppResolvers::new(concurrency));
     let client = soulseek::SoulseekClient::new(config::client_options(startup)?, resolvers.clone());
@@ -168,7 +157,7 @@ async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) ->
         options,
         state,
         client,
-        hubs,
+        bus,
         auth,
         logs,
         shutdown: CancellationToken::new(),
@@ -215,12 +204,16 @@ fn router(app: &AppState) -> Router {
         .route("/api", any(missing))
         .route("/api/{*unknown}", any(missing))
         .route("/health", get(|| async { StatusCode::OK }))
-        .nest("/hub/application", app.hubs.application.router())
-        .nest("/hub/logs", app.hubs.logs.router())
-        .nest("/hub/search", app.hubs.search.router())
-        .nest("/hub/metrics", app.hubs.metrics.router())
-        .route("/hub", any(missing))
-        .route("/hub/{*unknown}", any(missing));
+        .merge(
+            realtime::socket::EventsEndpoint::new(
+                app.auth.clone(),
+                app.bus.clone(),
+                Arc::new(app.clone()),
+                app.shutdown.clone(),
+                realtime::Limits::default(),
+            )
+            .router(),
+        );
     let startup = app.options.startup();
     if startup.metrics.enabled {
         endpoints = endpoints.merge(telemetry::prometheus_routes(&startup.metrics.path));

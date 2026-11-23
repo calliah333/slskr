@@ -1,4 +1,4 @@
-//! Search lifecycle, persistence, HTTP API and search-hub events.
+//! Search lifecycle, persistence, HTTP API and `searches` events.
 
 mod store;
 
@@ -15,9 +15,11 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use slskr_api::search::{self as dto, Search, SearchRequest, SearchStates};
+use serde::Deserialize;
+use slskr_api::{
+    realtime::{Event, Topic},
+    search::{self as dto, Search, SearchRequest, SearchStates},
+};
 use tokio::{
     sync::{Semaphore, mpsc},
     time::{Instant, MissedTickBehavior},
@@ -30,11 +32,12 @@ use crate::{
     auth::{Authenticated, RequireReadWrite},
     db::Database,
     http::{ApiError, ApiResult},
-    signalr::Hub,
+    realtime::EventBus,
     users::convert_file,
 };
 
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// Progress (counts and response batches) is published at most this often per search.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const RETENTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
@@ -43,11 +46,11 @@ pub struct SearchService(Arc<Inner>);
 struct Inner {
     db: Database,
     client: soulseek::SoulseekClient,
-    hub: Hub,
+    bus: EventBus,
     shutdown: CancellationToken,
     create_slot: Semaphore,
-    // Mutations and their broadcasts are ordered by Database::call. The hub's
-    // synchronous initial snapshot never queries SQLite or waits for disk I/O.
+    // Mutations and their events are ordered by Database::call. Snapshots for new
+    // subscribers never query SQLite or wait for disk I/O.
     searches: Mutex<HashMap<Arc<str>, Entry>>,
 }
 
@@ -92,13 +95,8 @@ impl Inner {
         list
     }
 
-    fn broadcast(&self, method: &str, payload: impl Serialize) {
-        if self.hub.connection_count() > 0 {
-            match serde_json::to_value(payload) {
-                Ok(payload) => self.hub.broadcast(method, vec![payload]),
-                Err(error) => tracing::error!(%error, %method, "could not encode search hub event"),
-            }
-        }
+    fn publish(&self, event: impl FnOnce() -> Event) {
+        self.bus.publish_with(Topic::Searches, event);
     }
 }
 
@@ -124,7 +122,7 @@ impl SearchService {
         let service = Self(Arc::new(Inner {
             db,
             client: core.client.clone(),
-            hub: core.hubs.search.clone(),
+            bus: core.bus.clone(),
             shutdown: core.shutdown.clone(),
             create_slot: Semaphore::new(1),
             searches: Mutex::new(searches),
@@ -132,15 +130,6 @@ impl SearchService {
         if let Some(age) = core.options.get().retention.searches {
             service.prune(age).await?;
         }
-        let inner = Arc::downgrade(&service.0);
-        service.0.hub.on_connected(move || {
-            let Some(inner) = inner.upgrade() else {
-                return Vec::new();
-            };
-            // Upstream lists searches with empty (not null) responses.
-            let list: Vec<_> = inner.list().into_iter().map(without_responses).collect();
-            vec![(dto::hub_methods::LIST.into(), vec![json!(list)])]
-        });
         Ok(service)
     }
 
@@ -194,7 +183,7 @@ impl SearchService {
                         .collect()
                 };
                 for entry in removed {
-                    inner.broadcast_delete(entry);
+                    inner.publish_delete(entry);
                 }
                 Ok(())
             })
@@ -247,7 +236,7 @@ impl SearchService {
                         cancel: Some(cancel.clone()),
                     },
                 );
-                service.0.broadcast(dto::hub_methods::CREATE, &search);
+                service.0.publish(|| Event::SearchCreated(search.clone()));
                 // Launch from the insertion callback so a disconnected HTTP caller can't leave a
                 // permanent REQUESTED record after SQLite has committed it.
                 runtime.spawn(service.run(active, query, options, cancel));
@@ -287,6 +276,8 @@ impl SearchService {
         let collect = async {
             let mut progress = tokio::time::interval(PROGRESS_INTERVAL);
             progress.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // Responses stored since the last progress event, published with it.
+            let mut pending = Vec::new();
             let mut dirty = false;
             loop {
                 let result = tokio::select! {
@@ -294,16 +285,27 @@ impl SearchService {
                     Some(state) = states.recv() => self.change_state(&active, state).await,
                     _ = progress.tick(), if dirty => {
                         dirty = false;
-                        self.broadcast_progress(&active).await
+                        self.publish_progress(&active, std::mem::take(&mut pending)).await
                     }
                     response = responses.recv() => {
                         let Some(response) = response else { break };
-                        self.append_response(&active, response).await.map(|stored| dirty |= stored)
+                        self.append_response(&active, response).await.map(|stored| {
+                            if let Some(response) = stored {
+                                dirty = true;
+                                if self.0.bus.wants(Topic::Searches) {
+                                    pending.push(response);
+                                }
+                            }
+                        })
                     }
                 };
                 if let Err(error) = result {
                     tracing::warn!(%error, search_id = %active.id, "could not persist a search update");
                 }
+            }
+            // The final state follows the last responses.
+            if dirty && let Err(error) = self.publish_progress(&active, pending).await {
+                tracing::warn!(%error, search_id = %active.id, "could not publish search progress");
             }
         };
         let (result, ()) = tokio::join!(search, collect);
@@ -348,7 +350,7 @@ impl SearchService {
                     }
                     entry.search = search.clone();
                 }
-                inner.broadcast(dto::hub_methods::UPDATE, search);
+                inner.publish(|| Event::SearchUpdated(search));
                 Ok(())
             })
             .await
@@ -358,7 +360,7 @@ impl SearchService {
         &self,
         active: &ActiveSearch,
         response: soulseek::SearchResponse,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<dto::SoulseekSearchResponse>> {
         let inner = self.0.clone();
         let active = active.clone();
         self.0
@@ -377,7 +379,7 @@ impl SearchService {
                             .saturating_add(count(response.locked_file_count())),
                     ]
                 }) else {
-                    return Ok(false);
+                    return Ok(None);
                 };
 
                 let response = map_response(response);
@@ -394,22 +396,18 @@ impl SearchService {
                         search.locked_file_count,
                     ] = counts;
                 }
-                if inner.hub.connection_count() > 0 {
-                    inner.broadcast(
-                        dto::hub_methods::RESPONSE,
-                        dto::SearchResponseEvent {
-                            search_id: active.id.to_string(),
-                            response,
-                        },
-                    );
-                }
-                Ok(true)
+                Ok(Some(response))
             })
             .await
     }
 
-    async fn broadcast_progress(&self, active: &ActiveSearch) -> anyhow::Result<()> {
-        if self.0.hub.connection_count() == 0 {
+    /// Publishes the responses stored since the last call, then the search's counts.
+    async fn publish_progress(
+        &self,
+        active: &ActiveSearch,
+        responses: Vec<dto::SoulseekSearchResponse>,
+    ) -> anyhow::Result<()> {
+        if !self.0.bus.wants(Topic::Searches) {
             return Ok(());
         }
         let inner = self.0.clone();
@@ -421,11 +419,23 @@ impl SearchService {
                     .entry(&inner.searches())
                     .map(|entry| entry.search.clone());
                 if let Some(search) = search {
-                    inner.broadcast(dto::hub_methods::UPDATE, search);
+                    if !responses.is_empty() {
+                        inner.publish(|| Event::SearchResponses {
+                            search_id: search.id.clone(),
+                            responses,
+                        });
+                    }
+                    inner.publish(|| Event::SearchUpdated(search));
                 }
                 Ok(())
             })
             .await
+    }
+
+    /// Every search (without responses) and the bus sequence number the list includes.
+    pub(crate) fn snapshot(&self) -> (u64, Vec<Search>) {
+        let seq = self.0.bus.seq();
+        (seq, self.0.list())
     }
 
     pub(crate) async fn search_text(&self, id: &str) -> anyhow::Result<Option<String>> {
@@ -465,7 +475,7 @@ impl SearchService {
                     .searches()
                     .remove(id.as_str())
                     .expect("search mutations are serialized by the database");
-                inner.broadcast_delete(entry);
+                inner.publish_delete(entry);
                 Ok(true)
             })
             .await?;
@@ -474,11 +484,11 @@ impl SearchService {
 }
 
 impl Inner {
-    fn broadcast_delete(&self, Entry { search, cancel }: Entry) {
+    fn publish_delete(&self, Entry { search, cancel }: Entry) {
         if let Some(cancel) = cancel {
             cancel.cancel();
         }
-        self.broadcast(dto::hub_methods::DELETE, search);
+        self.publish(|| Event::SearchDeleted { id: search.id });
     }
 }
 
@@ -785,7 +795,7 @@ mod tests {
                 Default::default(),
                 Arc::new(soulseek::resolvers::DefaultResolvers),
             ),
-            hub: Hub::new("search-test"),
+            bus: EventBus::new(),
             shutdown: CancellationToken::new(),
             create_slot: Semaphore::new(1),
             searches: Mutex::new(HashMap::new()),
@@ -846,6 +856,7 @@ mod tests {
                 .append_response(&first, one_response(first.token))
                 .await
                 .unwrap()
+                .is_some()
         );
         service.remove(id.clone()).await.unwrap();
         assert!(service.0.list().is_empty());
@@ -865,6 +876,7 @@ mod tests {
                 .append_response(&first, one_response(first.token))
                 .await
                 .unwrap()
+                .is_some()
         );
         service
             .change_state(&first, SearchStates::COMPLETED | SearchStates::CANCELLED)
@@ -884,6 +896,7 @@ mod tests {
                 .append_response(&second, one_response(second.token))
                 .await
                 .unwrap()
+                .is_some()
         );
         let terminal = SearchStates::COMPLETED | SearchStates::RESPONSE_LIMIT_REACHED;
         service.change_state(&second, terminal).await.unwrap();
@@ -921,6 +934,7 @@ mod tests {
                 .append_response(&expired, one_response(expired.token))
                 .await
                 .unwrap()
+                .is_some()
         );
         service
             .change_state(&current, SearchStates::COMPLETED | SearchStates::TIMED_OUT)

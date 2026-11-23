@@ -787,10 +787,9 @@ mod tests {
     #[tokio::test]
     async fn local_shares_browse_and_search_within_limits() {
         use crate::{
-            app::{Hubs, Paths},
+            app::Paths,
             auth::{Auth, AuthConfig, SessionStore},
             config::{ConfigStore, Overrides, Sources},
-            signalr::Hub,
             state::StateStore,
         };
 
@@ -804,12 +803,6 @@ mod tests {
         config.shares.directories = vec![format!("[music]{}", root.display())];
         let sources = Sources::new(temp.path().into(), Vec::new(), Overrides::default()).unwrap();
         let options = ConfigStore::from_config(config_file.clone(), sources, config);
-        let hubs = Hubs {
-            application: Hub::new("application"),
-            logs: Hub::new("logs"),
-            search: Hub::new("search"),
-            metrics: Hub::new("metrics"),
-        };
         let core = Core {
             paths: Paths {
                 data_dir: temp.path().into(),
@@ -819,12 +812,12 @@ mod tests {
                 content_path: None,
             },
             options,
-            state: StateStore::new(hubs.application.clone()),
+            state: StateStore::new(),
             client: soulseek::SoulseekClient::new(
                 Default::default(),
                 Arc::new(soulseek::resolvers::DefaultResolvers),
             ),
-            hubs,
+            bus: Default::default(),
             auth: Auth::new(
                 AuthConfig {
                     disabled: true,

@@ -4,10 +4,15 @@ use std::{
     time::Duration,
 };
 
+use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::{
     process::{Child, Command},
     time::{sleep, timeout},
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Error as WsError, Message as WsMessage, client::IntoClientRequest},
 };
 
 struct Daemon(Child);
@@ -128,6 +133,65 @@ async fn daemon_http_smoke() {
         .await
         .unwrap();
     assert_eq!(session, login);
+
+    // Live events: the socket under url_base takes the session cookie and sends the
+    // state snapshot on subscribe; a foreign Origin and a missing cookie are refused.
+    let session_cookie = cookie.split(';').next().unwrap();
+    let events_url = format!("ws://127.0.0.1:{port}/client/api/events");
+    let events_request = |headers: &[(&str, &str)]| {
+        let mut request = events_url.as_str().into_client_request().unwrap();
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        request
+    };
+    for (headers, status) in [
+        (vec![], 401),
+        (
+            vec![
+                ("cookie", session_cookie),
+                ("origin", "http://evil.example"),
+            ],
+            403,
+        ),
+    ] {
+        match connect_async(events_request(&headers)).await {
+            Err(WsError::Http(response)) => assert_eq!(response.status().as_u16(), status),
+            other => panic!("expected HTTP {status}, got {:?}", other.map(|_| ())),
+        }
+    }
+    let (mut events, _) = timeout(
+        Duration::from_secs(5),
+        connect_async(events_request(&[
+            ("cookie", session_cookie),
+            ("origin", base.as_str()),
+        ])),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    events
+        .send(WsMessage::Text(
+            r#"{"type":"subscribe","topics":["state"]}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let snapshot = loop {
+        match timeout(Duration::from_secs(5), events.next())
+            .await
+            .unwrap()
+        {
+            Some(Ok(WsMessage::Text(text))) => break serde_json::from_str::<Value>(&text).unwrap(),
+            Some(Ok(WsMessage::Ping(_))) => continue,
+            other => panic!("expected the state snapshot, got {other:?}"),
+        }
+    };
+    assert_eq!(snapshot["type"], "state");
+    assert!(snapshot["data"]["shares"].get("scanProgress").is_some());
+    events.close(None).await.unwrap();
 
     let authorized = client
         .get(format!("{api}/application"))

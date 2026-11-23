@@ -4,5 +4,5 @@
 //! by the page ports alongside these shared foundations.
 
 pub mod api;
-pub mod hub;
+pub mod events;
 pub mod util;

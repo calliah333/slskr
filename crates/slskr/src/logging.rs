@@ -11,11 +11,11 @@ use std::{
 
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
 use chrono::{DateTime, Utc};
-use serde_json::json;
 use slskr_api::{
     config::Config,
     files::FilesystemFile,
-    logs::{LogRecord, hub_methods},
+    logs::LogRecord,
+    realtime::{Event as LiveEvent, Topic},
 };
 use tracing::{
     Event, Level, Subscriber,
@@ -27,22 +27,25 @@ use crate::{
     app::{AppState, Paths},
     auth::RequireAdmin,
     http::{ApiError, ApiResult},
-    signalr::Hub,
+    realtime::EventBus,
 };
 
 const LOG_BUFFER_CAPACITY: usize = 1000;
 
 thread_local! {
-    // The hub can log while dropping a slow subscriber, with its client lock held.
-    static BROADCASTING_LOG: Cell<bool> = const { Cell::new(false) };
+    // Set while a record is buffered and published, with the buffer locked. A record
+    // logged on this thread meanwhile is dropped instead of deadlocking.
+    static BUFFERING: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The recent log records, published as `log` events while the `logs` topic has
+/// subscribers. Cheap to clone.
 #[derive(Clone)]
 pub struct LogBuffer(Arc<Inner>);
 
 struct Inner {
     records: Mutex<VecDeque<LogRecord>>,
-    hub: Mutex<Option<Hub>>,
+    bus: EventBus,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -51,58 +54,45 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Default for LogBuffer {
     fn default() -> Self {
-        Self(Arc::new(Inner {
-            records: Mutex::new(VecDeque::with_capacity(LOG_BUFFER_CAPACITY)),
-            hub: Mutex::new(None),
-        }))
+        Self::new(EventBus::new())
     }
 }
 
 impl LogBuffer {
-    pub fn attach_hub(&self, hub: Hub) {
-        *lock(&self.0.hub) = Some(hub.clone());
-        let buffer = Arc::downgrade(&self.0);
-        hub.on_connected(move || {
-            let snapshot = buffer
-                .upgrade()
-                .map_or_else(|| json!([]), |inner| json!(*lock(&inner.records)));
-            vec![(hub_methods::BUFFER.to_owned(), vec![snapshot])]
-        });
+    pub fn new(bus: EventBus) -> Self {
+        Self(Arc::new(Inner {
+            records: Mutex::new(VecDeque::with_capacity(LOG_BUFFER_CAPACITY)),
+            bus,
+        }))
     }
 
     pub fn snapshot(&self) -> Vec<LogRecord> {
         lock(&self.0.records).iter().cloned().collect()
     }
 
+    /// The buffered records and the last bus sequence number they include. Records are
+    /// published while the buffer is locked, so the two are exact.
+    pub fn snapshot_with_seq(&self) -> (u64, Vec<LogRecord>) {
+        let records = lock(&self.0.records);
+        (self.0.bus.seq(), records.iter().cloned().collect())
+    }
+
     fn push_line(&self, record: LogRecord) {
-        BROADCASTING_LOG.with(|broadcasting| {
-            let hub = if broadcasting.get() {
-                None
-            } else {
-                lock(&self.0.hub)
-                    .clone()
-                    .filter(|hub| hub.connection_count() != 0)
-            };
-            let payload = hub.as_ref().map(|_| json!(record));
+        BUFFERING.with(|buffering| {
+            if buffering.replace(true) {
+                return;
+            }
             {
                 let mut records = lock(&self.0.records);
                 if records.len() == LOG_BUFFER_CAPACITY {
                     records.pop_front();
                 }
+                if self.0.bus.wants(Topic::Logs) {
+                    self.0.bus.publish(&LiveEvent::Log(record.clone()));
+                }
                 records.push_back(record);
             }
-            if let (Some(hub), Some(payload)) = (hub, payload) {
-                struct Reset<'a>(&'a Cell<bool>);
-                impl Drop for Reset<'_> {
-                    fn drop(&mut self) {
-                        self.0.set(false);
-                    }
-                }
-
-                broadcasting.set(true);
-                let _reset = Reset(broadcasting);
-                hub.broadcast(hub_methods::LOG, vec![payload]);
-            }
+            buffering.set(false);
         });
     }
 }
@@ -190,8 +180,8 @@ impl Write for LockedFile<'_> {
 }
 
 /// Initializes tracing and returns the shared live log buffer.
-pub fn init(options: &Config, paths: &Paths) -> anyhow::Result<LogBuffer> {
-    let buffer = LogBuffer::default();
+pub fn init(options: &Config, paths: &Paths, bus: EventBus) -> anyhow::Result<LogBuffer> {
+    let buffer = LogBuffer::new(bus);
     let file = if options.logging.file {
         std::fs::create_dir_all(&paths.logs_dir)?;
         let path = paths

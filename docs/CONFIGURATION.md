@@ -201,7 +201,7 @@ Prometheus exposition.
 | Key | Default | Environment | Restart | Description |
 | --- | --- | --- | --- | --- |
 | `metrics.enabled` | `false` | `SLSKR_METRICS_ENABLED` | yes | Serve metrics at `metrics.path`. |
-| `metrics.path` | `"/metrics"` | `SLSKR_METRICS_PATH` | yes | Outside the `api`, `hub`, `health` and `web.url_base` roots. |
+| `metrics.path` | `"/metrics"` | `SLSKR_METRICS_PATH` | yes | Outside the `api`, `health` and `web.url_base` roots. |
 | `metrics.username` | `""` | `SLSKR_METRICS_USERNAME` | yes | Basic auth; set both or neither. |
 | `metrics.password` | `""` | `SLSKR_METRICS_PASSWORD` | yes | Basic auth password (secret). |
 

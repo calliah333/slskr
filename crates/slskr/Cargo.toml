@@ -40,6 +40,5 @@ cap-fs-ext = "3"
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 tempfile = "3"
 tokio-tungstenite = "0.29"

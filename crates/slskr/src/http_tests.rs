@@ -84,7 +84,7 @@ async fn static_spa_fallback_is_scoped_to_configured_base() {
     for path in [
         "/api/missing",
         "/client/api/missing",
-        "/client/hub/missing",
+        "/client/api/events/missing",
         "/client/missing.wasm",
     ] {
         let response = app

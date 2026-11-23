@@ -6,24 +6,25 @@ corresponding slskd area under `ref/slskd/src/slskd/<Area>`.
 ```
 src/main.rs           CLI entry (clap), calls slskr::run()
 src/lib.rs            module declarations, pub async fn run(cli) (bootstrap)
-src/app.rs            AppState / Core / Services / Hubs / Paths (contract, already written)
-src/bootstrap.rs      CLI (--data-dir, --config, --no-connect), App::build + run(): load config, build core + services, bind HTTP, wire hubs
+src/app.rs            AppState / Core / Services / Paths (contract), Snapshots for the events socket
+src/bootstrap.rs      CLI (--data-dir, --config, --no-connect), App::build + run(): load config, build core + services, bind HTTP, mount /api/events
 src/config.rs         ConfigStore: layers (settings.json, slskr.toml, SLSKR_*, CLI) -> slskr_api::config::Config, pinned keys, settings API, validation, file watch
 src/config/store.rs   settings.json: sparse settings tree, web password hash, API key digests (lenient load)
-src/state.rs          StateStore: application State, broadcasts "state" on the application hub
+src/state.rs          StateStore: application State, coalesced "state" events
 src/db.rs             Database: sqlite wrapper with migrations
 src/http.rs           ApiError, router assembly helpers, static file serving + SPA fallback, urlBase
 src/core_api.rs       /application, /session, /server, /options, /debug controllers
 src/auth/             Auth (sessions, API keys, Origin checks, extractors); session.rs: SessionStore, sessions.db
 src/resolvers.rs      impl soulseek::Resolvers by delegating to services
-src/logging.rs        tracing setup, LogBuffer (ring buffer), logs hub, /logs controller, file logs
+src/logging.rs        tracing setup, LogBuffer (ring buffer, "log" events), /logs controller, file logs
+src/realtime/         EventBus (internal publish/subscribe) + socket.rs: the /api/events WebSocket
 src/events/           EventService (raise/list/subscribe) + /events controller, events.db
 src/users.rs           UserService (peer info/browse cache, group and blacklist policy) + `/users` controller
 src/shares.rs          ShareService (atomic scan snapshots, persisted cache, search/browse/resolve) + `/shares` controller
 src/files/            FileService + /files controller (downloads/incomplete dirs)
-src/telemetry/        TelemetryService (metrics hub "Update", prometheus) + /telemetry controllers (reports from transfers.db)
+src/telemetry/        TelemetryService ("metrics" events, prometheus) + /telemetry controllers (reports from transfers.db)
 src/transfers/        TransferService (downloads, uploads, upload queue, governor) + /transfers controller, transfers.db
-src/search/           SearchService + /searches controller + search hub, search.db
+src/search/           SearchService + /searches controller + "search_*" events, search.db
 src/messaging/        MessagingService (conversations, rooms) + /conversations, /rooms controllers, messaging.db
 ```
 
@@ -101,7 +102,8 @@ incomplete/         default downloads.incomplete_directory
 ### `state::StateStore` (Clone)
 ```rust
 pub fn get(&self) -> State;                            // slskr_api::application::State
-pub fn update(&self, f: impl FnOnce(&mut State));      // mutate + broadcast "state" (debounced) on application hub
+pub fn update(&self, f: impl FnOnce(&mut State));      // mutate; watchers notified only on a real change
+pub fn spawn_publisher(&self, bus: EventBus, shutdown: CancellationToken); // "state" events, at most 4/s, latest always sent
 pub fn subscribe(&self) -> tokio::sync::watch::Receiver<State>;
 ```
 ### `db::Database` (Clone)
@@ -141,7 +143,7 @@ while the daemon was stopped (a salted fingerprint of the credentials is kept in
 table).
 
 Cross-site protection: a cookie-authenticated request other than GET/HEAD/OPTIONS, and any
-WebSocket upgrade (SignalR hubs included), is refused with 403 when it carries an `Origin`
+WebSocket upgrade (`/api/events`), is refused with 403 when it carries an `Origin`
 whose host and port differ from `Host`. Forwarded host headers are not trusted, so a reverse
 proxy must pass the original `Host`. Sign-in and sign-out apply the same check. API-key
 requests skip it; with `web.auth = false` cross-site requests are refused too.
@@ -149,13 +151,15 @@ requests skip it; with `web.auth = false` cross-site requests are refused too.
 ### Auth in handlers
 `crate::auth::{Authenticated, RequireReadWrite, RequireAdmin, RequireAdminSession}` extractors
 (require `Auth: FromRef<AppState>`, implemented in http.rs) reject with 401 or 403.
-`RequireAdminSession` refuses API keys (shutdown, restart, `/settings`). Hubs use
-`Auth::hub_authorizer(role)` on negotiate and upgrade.
+`RequireAdminSession` refuses API keys (shutdown, restart, `/settings`). The events socket
+authenticates its upgrade with `Auth::authenticate_request` and re-checks the same
+credentials on every ping.
 
 ### Routes
 Each service module exposes `pub fn routes() -> axum::Router<AppState>` with paths relative to
 `/api/v0` (e.g. `"/searches/{id}"`, axum 0.8 `{param}` syntax). `bootstrap.rs` merges them.
-Hubs are mounted at `/hub/{name}` by bootstrap.
+The events socket is mounted at `/api/events` by bootstrap (beside `/api/v0`, also under
+`web.url_base`).
 
 ### Service construction (in `bootstrap.rs`, this order)
 ```rust
@@ -228,3 +232,34 @@ CREATE INDEX ix_transfers_username ON transfers(username);
 CREATE INDEX ix_transfers_state ON transfers(state);
 ```
 `state` uses slskd `TransferStates` bit values (same as `soulseek::TransferState`).
+
+## Live events (`src/realtime/`)
+
+Services publish to one `EventBus` (`Core.bus`, a tokio broadcast channel). `publish`
+serializes an `slskr_api::realtime::Event` once and stamps it with a sequence number;
+`wants(topic)` / `publish_with(topic, || event)` skip building events nobody is subscribed
+to. Publishers change their data first and publish second, so a snapshot taken after
+reading `bus.seq()` includes every event up to that number (the log buffer publishes and
+snapshots under its own lock to make this exact).
+
+| Topic | Snapshot on subscribe | Then | Publisher |
+|---|---|---|---|
+| `state` | `state` (`State`) | `state`, coalesced to at most one per 250 ms, the latest always sent | `StateStore::spawn_publisher` |
+| `settings` | `settings` (redacted `Config`, as `GET /options`) | `settings` on every configuration change | `AppState::watch_options` |
+| `searches` | `search_list` (`Vec<Search>`, no responses) | `search_created`, `search_updated`, `search_deleted {id}`, `search_responses {search_id, responses}` | `SearchService`; progress (response batch, then counts) at most every 500 ms per search; state changes and the final state at once |
+| `logs` (administrators) | `log_buffer` (`Vec<LogRecord>`) | `log` per record | `LogBuffer` |
+| `metrics` | `metrics` (`CurrentMetrics`) | `metrics` every second | `TelemetryService` |
+
+Frames are JSON text, `{"type": "<event>", "data": ...}`. The client sends
+`{"type": "subscribe", "topics": [...]}` and `{"type": "unsubscribe", "topics": [...]}`
+(at most 4 KiB per message). Subscribing sends the topic's snapshot, also when it was
+already subscribed. An invalid command, a binary frame, or `logs` without the
+Administrator role is answered with `{"type": "error", "data": {"message", "topic"?}}`;
+the connection stays open.
+
+Each connection (`socket.rs`) is one task: a dispatcher (client commands, bus filtering,
+pings) and a writer draining a bounded queue (256 frames) into the socket. The server pings
+every 20 s and re-checks the upgrade's credentials then. Close codes: `4401` the session or
+key is no longer valid (sign in again), `4408` nothing received for 60 s, `4429` the queue
+or the bus overflowed (reconnect and resubscribe), `1001` daemon shutdown. A closing
+connection drops its queue and gets 5 s to deliver the close frame.

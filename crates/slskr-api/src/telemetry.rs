@@ -1,4 +1,4 @@
-//! Telemetry DTOs: MetricsController, MetricsHub and ReportsController responses.
+//! Telemetry DTOs: metrics, the `metrics` event and ReportsController responses.
 //!
 //! Map keys that are slskd enums (`TransferDirection`, `TransferStates`) are their string
 //! names (`"Upload"`, `"Completed, Succeeded"`), exactly as System.Text.Json writes them.
@@ -33,12 +33,7 @@ pub struct PrometheusMetricSample {
 /// Metrics keyed by family name.
 pub type PrometheusMetrics = BTreeMap<String, PrometheusMetric>;
 
-/// Metrics hub method names.
-pub mod hub_methods {
-    pub const UPDATE: &str = "Update";
-}
-
-/// Live transfer metrics pushed by the metrics hub (`MetricsService.Current()`).
+/// Live transfer metrics sent as the `metrics` event (`MetricsService.Current()`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CurrentMetrics {

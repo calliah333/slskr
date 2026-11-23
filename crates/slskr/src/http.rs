@@ -123,7 +123,7 @@ async fn serve_path(
     State(files): State<StaticFiles>,
     AxumPath(path): AxumPath<String>,
 ) -> Response {
-    if matches!(path.split('/').next(), Some("api" | "hub")) {
+    if matches!(path.split('/').next(), Some("api")) {
         return StatusCode::NOT_FOUND.into_response();
     }
     serve_file(&files, &path, Path::new(&path).extension().is_none()).await

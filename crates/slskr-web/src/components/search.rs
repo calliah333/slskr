@@ -8,14 +8,16 @@ use leptos_router::{
     components::A,
     hooks::{use_navigate, use_params_map},
 };
-use slskr_api::search::{
-    Search, SearchRequest, SearchResponse, SearchResponseEvent, SearchStates, hub_methods,
-};
+use slskr_api::search::{Search, SearchRequest, SearchResponse, SearchStates};
 
 use crate::{
     components::app::AppContext,
     config,
-    services::{api, hub, util},
+    services::{
+        api,
+        events::{Event, Status, Topic, use_events},
+        util,
+    },
 };
 
 #[derive(Default)]
@@ -36,15 +38,18 @@ impl Catalog {
         }
     }
 
-    fn reconcile(&mut self, searches: Vec<Search>, revision: u64) {
-        self.searches
-            .retain(|id, _| self.changed.get(id).is_some_and(|r| *r > revision));
-        for search in searches {
-            if !self.changed.get(&search.id).is_some_and(|r| *r > revision) {
-                self.searches.insert(search.id.clone(), search);
-            }
-        }
-        self.changed.retain(|_, changed| *changed > revision);
+    /// Replaces everything with a snapshot; every listed search counts as changed now.
+    fn replace(&mut self, searches: Vec<Search>) {
+        self.revision += 1;
+        let revision = self.revision;
+        self.changed = searches
+            .iter()
+            .map(|search| (search.id.clone(), revision))
+            .collect();
+        self.searches = searches
+            .into_iter()
+            .map(|search| (search.id.clone(), search))
+            .collect();
     }
 }
 
@@ -62,14 +67,6 @@ fn complete(search: &Search) -> bool {
     search.is_complete || search.state.contains(SearchStates::COMPLETED)
 }
 
-fn payload<T: serde::de::DeserializeOwned>(arguments: Vec<serde_json::Value>) -> Option<T> {
-    serde_json::from_value(arguments.into_iter().next()?)
-        .map_err(|error| {
-            leptos::logging::warn!("Invalid search hub payload: {error}");
-        })
-        .ok()
-}
-
 #[component]
 pub fn Searches() -> impl IntoView {
     let state = expect_context::<AppContext>().state;
@@ -80,90 +77,53 @@ pub fn Searches() -> impl IntoView {
     let searches = RwSignal::new(Catalog::default());
     let live = RwSignal::new(LiveResponses::default());
     let loading = RwSignal::new(true);
-    let load_error = RwSignal::new(None::<String>);
-    let hub_error = RwSignal::new(None::<String>);
     let connection_epoch = RwSignal::new(0u64);
     let query = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
     let action_error = RwSignal::new(None::<String>);
 
-    let connection = hub::create_search_hub();
-    connection.on(hub_methods::LIST, move |arguments| {
-        if let Some(list) = payload::<Vec<Search>>(arguments) {
-            searches.try_update(|catalog| {
-                for search in list {
-                    catalog.update(search.id.clone(), Some(search));
+    let events = use_events();
+    let status = events.status();
+    events.on(Topic::Searches, move |event| match event {
+        Event::SearchList(list) => {
+            // A snapshot (on every (re)connection) replaces what is known.
+            let first = loading.get_untracked();
+            searches.try_update(|catalog| catalog.replace(list.clone()));
+            loading.try_set(false);
+            if !first {
+                connection_epoch.try_update(|epoch| *epoch += 1);
+            }
+        }
+        Event::SearchCreated(search) | Event::SearchUpdated(search) => {
+            let search = search.clone();
+            searches.try_update(|catalog| catalog.update(search.id.clone(), Some(search)));
+        }
+        Event::SearchDeleted { id } => {
+            searches.try_update(|catalog| catalog.update(id.clone(), None));
+        }
+        Event::SearchResponses {
+            search_id,
+            responses,
+        } => {
+            if !route.with_untracked(|id| id.as_ref() == Some(search_id)) {
+                return;
+            }
+            live.try_update(|live| {
+                if &live.id != search_id {
+                    live.id = search_id.clone();
+                    live.responses.clear();
+                }
+                for response in responses {
+                    let response = SearchResponse::from(response.clone());
+                    live.responses.insert(response.username.clone(), response);
                 }
             });
         }
+        _ => {}
     });
-    for method in [
-        hub_methods::CREATE,
-        hub_methods::UPDATE,
-        hub_methods::DELETE,
-    ] {
-        connection.on(method, move |arguments| {
-            if let Some(search) = payload::<Search>(arguments) {
-                let id = search.id.clone();
-                searches.try_update(|catalog| {
-                    catalog.update(id, (method != hub_methods::DELETE).then_some(search))
-                });
-            }
-        });
-    }
-    connection.on(hub_methods::RESPONSE, move |arguments| {
-        let Some(event) = payload::<SearchResponseEvent>(arguments) else {
-            return;
-        };
-        if !route.with_untracked(|id| id.as_ref() == Some(&event.search_id)) {
-            return;
-        }
-        live.try_update(|live| {
-            if live.id != event.search_id {
-                live.id = event.search_id;
-                live.responses.clear();
-            }
-            let response = SearchResponse::from(event.response);
-            live.responses.insert(response.username.clone(), response);
-        });
-    });
-    let disconnected = move |error: Option<String>| {
-        hub_error.try_set(Some(
-            error.unwrap_or_else(|| "Disconnected from search updates".into()),
-        ));
+    let live_error = move || {
+        (status.get() == Status::Reconnecting).then_some("Disconnected from search updates")
     };
-    connection.on_reconnecting(disconnected);
-    connection.on_close(disconnected);
-    connection.on_reconnected(move |_| {
-        hub_error.try_set(None);
-        connection_epoch.try_update(|epoch| *epoch += 1);
-    });
-    let handle = StoredValue::new_local(connection.clone());
-    on_cleanup(move || handle.with_value(hub::HubConnection::stop));
-    spawn_local_scoped_with_cancellation(async move {
-        if let Err(error) = connection.start().await {
-            hub_error.try_set(Some(error.to_string()));
-        }
-    });
-
-    Effect::new(move |_| {
-        let epoch = connection_epoch.get();
-        let revision = searches.with_untracked(|catalog| catalog.revision);
-        spawn_local_scoped_with_cancellation(async move {
-            let snapshot = api::get::<Vec<Search>>("/searches").await;
-            if connection_epoch.get_untracked() != epoch {
-                return;
-            }
-            match snapshot {
-                Ok(data) => {
-                    searches.update(|catalog| catalog.reconcile(data, revision));
-                    load_error.set(None);
-                }
-                Err(error) => load_error.set(Some(error.to_string())),
-            }
-            loading.set(false);
-        });
-    });
 
     let create = Callback::new(move |(text, open): (String, bool)| {
         let text = text.trim();
@@ -237,7 +197,7 @@ pub fn Searches() -> impl IntoView {
                     }
                 }
                 Ok(_) => {
-                    // A successful stop requests cancellation; the completed state arrives through the hub.
+                    // A successful stop requests cancellation; the completed state arrives as an event.
                     if let Ok(search) = api::get::<Search>(&path).await {
                         searches.update(|catalog| {
                             if catalog
@@ -259,8 +219,7 @@ pub fn Searches() -> impl IntoView {
     view! {
         <div class="search-container">
             {move || action_error.get().map(|message| view! { <div class="ui negative message" role="alert">{message}</div> })}
-            {move || hub_error.get().map(|message| view! { <div class="ui warning message" role="status">"Live search updates unavailable: "{message}</div> })}
-            {move || load_error.get().map(|message| view! { <div class="ui negative message" role="alert">{message}</div> })}
+            {move || live_error().map(|message| view! { <div class="ui warning message" role="status">"Live search updates unavailable: "{message}</div> })}
             {move || match route.get() {
                 Some(id) => view! {
                     <SearchDetail id searches live loading connection_epoch busy connected create change/>

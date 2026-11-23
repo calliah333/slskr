@@ -1,4 +1,4 @@
-//! Search API models (`/api/v0/searches`) and search hub payloads.
+//! Search API models (`/api/v0/searches`) and search event payloads.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ pub struct Search {
     #[serde(default)]
     pub response_count: u32,
     /// HTTP emits `[]` unless responses were requested (`includeResponses=true`);
-    /// hub `CREATE`/`UPDATE`/`DELETE` payloads emit `null`, as upstream does.
+    /// `search_*` events emit `null`.
     #[serde(default)]
     pub responses: Option<Vec<SearchResponse>>,
     pub search_text: String,
@@ -142,7 +142,7 @@ impl From<SoulseekSearchResponse> for SearchResponse {
     }
 }
 
-/// Soulseek.NET `SearchResponse`, as broadcast in search hub `RESPONSE` events.
+/// Soulseek.NET `SearchResponse`, as sent in `search_responses` events.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoulseekSearchResponse {
@@ -188,28 +188,6 @@ pub struct SearchRequest {
     /// Milliseconds; slskd requires at least 5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_timeout: Option<u32>,
-}
-
-/// Search hub (`/hub/search`) method names.
-pub mod hub_methods {
-    /// Sent to a caller on connect: `Vec<Search>`.
-    pub const LIST: &str = "LIST";
-    /// A search was created: `Search` without responses.
-    pub const CREATE: &str = "CREATE";
-    /// A response arrived: [`SearchResponseEvent`](super::SearchResponseEvent).
-    pub const RESPONSE: &str = "RESPONSE";
-    /// A search changed: `Search` without responses.
-    pub const UPDATE: &str = "UPDATE";
-    /// A search was deleted: `Search` without responses.
-    pub const DELETE: &str = "DELETE";
-}
-
-/// Payload of the search hub `RESPONSE` method.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchResponseEvent {
-    pub search_id: String,
-    pub response: SoulseekSearchResponse,
 }
 
 #[cfg(test)]
@@ -302,11 +280,5 @@ mod tests {
             serde_json::to_string(&request).unwrap(),
             r#"{"id":"x","searchText":"foo"}"#
         );
-
-        let event: SearchResponseEvent = serde_json::from_str(
-            r#"{"searchId":"x","response":{"fileCount":0,"files":[],"hasFreeUploadSlot":false,"lockedFileCount":0,"lockedFiles":[],"queueLength":0,"token":1,"uploadSpeed":0,"username":"u"}}"#,
-        )
-        .unwrap();
-        assert_eq!(event.response.username, "u");
     }
 }

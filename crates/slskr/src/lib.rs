@@ -1,4 +1,4 @@
-//! slskr daemon library: HTTP API, SignalR hubs and services.
+//! slskr daemon library: HTTP API, live events and services.
 //!
 //! See `docs/DAEMON.md` for module ownership and contracts.
 
@@ -13,10 +13,10 @@ pub mod files;
 pub mod http;
 pub mod logging;
 pub mod messaging;
+pub mod realtime;
 pub mod resolvers;
 pub mod search;
 pub mod shares;
-pub mod signalr;
 pub mod state;
 pub mod telemetry;
 pub mod transfers;

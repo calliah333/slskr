@@ -9,6 +9,7 @@ pub mod conversations;
 pub mod events;
 pub mod files;
 pub mod logs;
+pub mod realtime;
 pub mod rooms;
 pub mod search;
 pub mod server;

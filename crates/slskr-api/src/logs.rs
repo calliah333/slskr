@@ -1,13 +1,7 @@
-//! Log records (`GET /api/v0/logs`, logs hub).
+//! Log records (`GET /api/v0/logs`, `log` events).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-/// Logs hub method names.
-pub mod hub_methods {
-    pub const BUFFER: &str = "BUFFER";
-    pub const LOG: &str = "LOG";
-}
 
 /// A buffered log line.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

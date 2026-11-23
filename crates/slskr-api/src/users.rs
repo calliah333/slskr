@@ -32,7 +32,7 @@ pub struct FileAttribute {
 }
 
 /// Soulseek.NET `File`, as serialized in browse/directory/share responses and
-/// search hub `RESPONSE` events.
+/// `search_responses` events.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct File {

@@ -144,10 +144,10 @@ async fn authenticate_schemes_and_roles() {
     for p in [
         parts("/api/v0/session", &[("authorization", bearer.as_str())]),
         parts(
-            "/hub/logs/negotiate",
+            "/api/events",
             &[("authorization", "Bearer anywhere-key-0123456789")],
         ),
-        parts(&format!("/hub/application?access_token={token}"), &[]),
+        parts(&format!("/api/events?access_token={token}"), &[]),
         parts(&format!("/api/v0/session?{COOKIE_NAME}={token}"), &[]),
     ] {
         assert_eq!(
@@ -189,7 +189,7 @@ fn origin_matching() {
     for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
         assert!(needs_origin_check(&method, &HeaderMap::new()));
     }
-    let upgrade = parts("/hub/application", &[("upgrade", "WebSocket")]);
+    let upgrade = parts("/api/events", &[("upgrade", "WebSocket")]);
     assert!(needs_origin_check(&upgrade.method, &upgrade.headers));
 }
 
@@ -212,10 +212,7 @@ async fn cookie_sessions_are_refused_cross_site() {
         );
         let mut ws = headers.clone();
         ws.extend(upgrade);
-        assert!(
-            auth.authenticate(&parts("/hub/application", &ws), local)
-                .is_ok()
-        );
+        assert!(auth.authenticate(&parts("/api/events", &ws), local).is_ok());
     }
 
     // Cross-site: reads pass, state changes and WebSocket upgrades are 403.
@@ -232,37 +229,14 @@ async fn cookie_sessions_are_refused_cross_site() {
     let mut ws = vec![host, jar, evil];
     ws.extend(upgrade);
     assert_eq!(
-        auth.authenticate(&parts("/hub/application", &ws), local),
+        auth.authenticate(&parts("/api/events", &ws), local),
         Err(AuthError::Forbidden)
     );
-    let hub = auth.hub_authorizer(Role::ReadOnly);
+    let mut anonymous = vec![host, same];
+    anonymous.extend(upgrade);
     assert_eq!(
-        hub(&parts("/hub/application", &ws)),
-        Err(StatusCode::FORBIDDEN)
-    );
-    assert_eq!(
-        hub(&request(
-            Method::POST,
-            "/hub/application/negotiate",
-            &[host, jar, evil]
-        )),
-        Err(StatusCode::FORBIDDEN)
-    );
-    assert_eq!(
-        hub(&request(
-            Method::POST,
-            "/hub/application/negotiate",
-            &[host]
-        )),
-        Err(StatusCode::UNAUTHORIZED)
-    );
-    assert!(
-        hub(&request(
-            Method::POST,
-            "/hub/application/negotiate",
-            &[host, jar, same]
-        ))
-        .is_ok()
+        auth.authenticate(&parts("/api/events", &anonymous), local),
+        Err(AuthError::Unauthorized)
     );
 
     // API keys skip the check, even alongside a cross-site cookie.
@@ -272,10 +246,13 @@ async fn cookie_sessions_are_refused_cross_site() {
         auth.authenticate(&p, local).unwrap().method,
         AuthMethod::ApiKey
     );
-    // The hub authorizer sees no ConnectInfo, so only an unrestricted key applies.
+    // Without ConnectInfo the caller is unknown, so only an unrestricted key applies.
     let mut ws = vec![host, evil, ("x-api-key", "anywhere-key-0123456789")];
     ws.extend(upgrade);
-    assert!(hub(&parts("/hub/application", &ws)).is_ok());
+    assert!(
+        auth.authenticate_request(&parts("/api/events", &ws))
+            .is_ok()
+    );
 }
 
 #[test]
