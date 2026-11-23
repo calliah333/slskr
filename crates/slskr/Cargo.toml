@@ -31,6 +31,7 @@ tokio-util = "0.7"
 base64 = "0.22"
 sha1 = "0.10"
 sha2 = "0.10"
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 cap-std = "3"

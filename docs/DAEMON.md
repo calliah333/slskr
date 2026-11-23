@@ -8,7 +8,8 @@ src/main.rs           CLI entry (clap), calls slskr::run()
 src/lib.rs            module declarations, pub async fn run(cli) (bootstrap)
 src/app.rs            AppState / Core / Services / Hubs / Paths (contract, already written)
 src/bootstrap.rs      CLI (--data-dir, --config, --no-connect), App::build + run(): load config, build core + services, bind HTTP, wire hubs
-src/config.rs         ConfigStore: slskr.toml <-> slskr_api::config::Config, env (SLSKR_*), CLI overrides, validation, save, file watch
+src/config.rs         ConfigStore: layers (settings.json, slskr.toml, SLSKR_*, CLI) -> slskr_api::config::Config, pinned keys, settings API, validation, file watch
+src/config/store.rs   settings.json: sparse settings tree, web password hash, API key digests (lenient load)
 src/state.rs          StateStore: application State, broadcasts "state" on the application hub
 src/db.rs             Database: sqlite wrapper with migrations
 src/http.rs           ApiError, router assembly helpers, static file serving + SPA fallback, urlBase
@@ -33,31 +34,51 @@ src/messaging/        MessagingService (conversations, rooms) + /conversations, 
 pub fn get(&self) -> Arc<Config>;                      // slskr_api::config::Config, current
 pub fn startup(&self) -> &Config;                      // as loaded at process start
 pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Arc<Config>>;
-pub fn read_toml(&self) -> std::io::Result<String>;    // file text, "" when absent
-pub fn validate_toml(&self, text: &str) -> Option<String>;          // None = valid
-pub async fn apply_toml(&self, text: &str) -> Result<(), String>;   // validate + write + reload
+pub async fn settings(&self) -> slskr_api::settings::Settings;            // GET /settings
+pub async fn patch(&self, patch: serde_json::Value) -> Result<Settings, SettingsError>;
+pub async fn reset(&self, dotted_key: &str) -> Result<Settings, SettingsError>;
+pub async fn create_api_key(&self, CreateApiKey) -> Result<CreatedApiKey, SettingsError>;
+pub async fn delete_api_key(&self, name: &str) -> Result<Settings, SettingsError>;
 ```
-Sources, lowest precedence first: `Config::default()`, `slskr.toml` (in `--data-dir`, or
-`--config`), `SLSKR_<SECTION>_<KEY>` environment variables, then CLI flags (`--no-connect`
-sets `soulseek.connect = false`). Environment names are matched against the serialized
-defaults, so keys containing `_` and nested tables (`SLSKR_UPLOADS_LIMITS_QUEUED_FILES`)
-need no extra separator; values are typed like the default (booleans, integers,
-comma-separated lists, strings). `[[web.api_keys]]` and user-defined `[groups.<name>]` are
-file-only. `SLSKR_DATA_DIR`, `SLSKR_CONFIG` and `SLSKR_CONTENT_PATH` are process settings,
-not keys; other `SLSKR_*` names outside the configuration sections are ignored, while an
-unknown key inside a section is an error.
+Layers, lowest precedence first: `Config::default()`, the settings store
+`<data_dir>/settings.json` (written from the settings API), `slskr.toml` (in `--data-dir`,
+or `--config`), `SLSKR_<SECTION>_<KEY>` environment variables, then CLI flags
+(`--no-connect` sets `soulseek.connect = false`). The layers are merged as TOML tables
+into the one `Config`. Every leaf key set by the file, the environment or the CLI is
+*pinned*: `Settings.pinned` lists it and `patch`/`reset` refuse it (409). Environment names
+are matched against the serialized defaults, so keys containing `_` and nested tables
+(`SLSKR_UPLOADS_LIMITS_QUEUED_FILES`) need no extra separator; values are typed like the
+default (booleans, integers, comma-separated lists, strings). `[[web.api_keys]]` and
+user-defined `[groups.<name>]` cannot come from the environment. `SLSKR_DATA_DIR`,
+`SLSKR_CONFIG` and `SLSKR_CONTENT_PATH` are process settings, not keys; other `SLSKR_*`
+names outside the configuration sections are ignored, while an unknown key inside a section
+is an error. [CONFIGURATION.md](CONFIGURATION.md) lists every key; a test keeps it complete.
 
-Every section is `#[serde(default, deny_unknown_fields)]`. Loading normalizes `web.url_base`
-(`/` or `/prefix`) and `metrics.path`, resolves relative paths (`downloads.*directory`,
-`soulseek.picture`, `shares.directories`) against the data directory, then validates;
-errors name the key (`web.api_keys[0].key must be between 16 and 255 characters`). A missing
-file means defaults; nothing is written until the UI saves. `apply_toml` refuses blank
-documents, resolves the full layer stack before writing, keeps the previous file as
-`slskr.toml.bak`, and replaces the file atomically (temp file + rename, mode 0600). The text
-is written as given, so comments survive. The file is polled every second; a valid change is
-published to subscribers, an invalid one is logged and ignored.
+The file is strict: every section is `#[serde(default, deny_unknown_fields)]` and errors
+name the key (`web.api_keys[0].key must be between 16 and 255 characters`). Loading
+normalizes `web.url_base` (`/` or `/prefix`) and `metrics.path`, resolves relative paths
+(`downloads.*directory`, `soulseek.picture`, `shares.directories`) against the data
+directory, then validates. The daemon never writes the file. It is polled every second; a
+valid change is published to subscribers, an invalid one is logged and ignored.
 
-`config::restart_required(startup, current)` drives `State.pending_restart`: `web.listen`,
+The store is lenient (`config/store.rs`): `{"version": 1, "settings": {<sparse Config
+tree>}, "web_password_hash": "$argon2id$...", "api_keys": [{name, sha256, role, allow}]}`.
+`settings` holds only keys changed through the API. On load, unknown keys, values that do
+not deserialize, and values the merged configuration rejects are logged and dropped, and an
+unreadable file is ignored, so the store never prevents startup. `patch` deep-merges a
+sparse object (objects merge, other values replace, `null` resets), checks each leaf on its
+own (errors name the key), validates the fully merged configuration, writes the store
+atomically (temp file + rename, mode 0600) and publishes the result. `web.password` is
+taken in plain text and stored as an argon2id hash (`Config.web.password_hash`, a
+`serde(skip)` field); a plaintext `web.password` from the file or environment wins and pins
+the key. `soulseek.password` and `metrics.password` are stored as given. API keys created
+through the API keep only their SHA-256 (`Config.web.managed_api_keys`); the key is
+returned once. Secrets are never returned: `Settings.values` leaves out
+`slskr_api::config::SECRET_KEYS` that are set (listed in `Settings.secrets_set`) and
+`web.api_keys` (listed without keys in `Settings.api_keys`).
+
+`config::restart_required(startup, current)` drives `State.pending_restart` and
+`Settings.pending_restart`: `web.listen`,
 `web.url_base`, `web.auth`, `web.log_requests`, `soulseek.connect`, `uploads.slots`,
 `downloads.slots`, `search.incoming_concurrency`, `[logging]` and `[metrics]` apply only on
 restart. Everything else is read live or applied on change: web credentials and API keys
@@ -69,7 +90,8 @@ searches and retention.
 
 ### Data directory
 ```
-slskr.toml          configuration (optional)
+slskr.toml          configuration file (optional, hand-edited)
+settings.json       settings changed from the web UI (written by the daemon, 0600)
 db/                 events.db, transfers.db, search.db, messaging.db, sessions.db, shares-cache.json
 logs/               slskr-YYYYMMDD.log (pruned by retention.logs)
 downloads/          default downloads.directory
@@ -99,9 +121,11 @@ implementing `IntoResponse` like ASP.NET results (`BadRequest("msg")` -> 400 wit
 `pub type ApiResult<T> = Result<T, ApiError>;`
 
 ### Authentication
-`POST /api/v0/session` with `{username, password}` checks the web credentials in constant
-time (a failure answers 401 after a 500 ms async delay) and returns the `Session`
-(`{username, role}`) with `Set-Cookie: slskr_session=<token>; HttpOnly; SameSite=Strict;
+`POST /api/v0/session` with `{username, password}` checks the web credentials (a plaintext
+`web.password` from the file or environment in constant time, otherwise the argon2id hash
+of a password set from the UI, on a blocking thread; API keys are compared by SHA-256 in
+constant time). A failure answers 401 after a 500 ms async delay; success returns the
+`Session` (`{username, role}`) with `Set-Cookie: slskr_session=<token>; HttpOnly; SameSite=Strict;
 Path=<url_base>; Max-Age=<web.session_ttl>`, plus `Secure` when `X-Forwarded-Proto: https`
 (TLS is a reverse proxy's job). `GET` returns the caller's `Session` (cookie, API key, or the
 `Anonymous` administrator when `web.auth = false`) or 401; `DELETE` deletes the session and
@@ -125,7 +149,7 @@ requests skip it; with `web.auth = false` cross-site requests are refused too.
 ### Auth in handlers
 `crate::auth::{Authenticated, RequireReadWrite, RequireAdmin, RequireAdminSession}` extractors
 (require `Auth: FromRef<AppState>`, implemented in http.rs) reject with 401 or 403.
-`RequireAdminSession` refuses API keys (shutdown, restart, raw configuration file). Hubs use
+`RequireAdminSession` refuses API keys (shutdown, restart, `/settings`). Hubs use
 `Auth::hub_authorizer(role)` on negotiate and upgrade.
 
 ### Routes

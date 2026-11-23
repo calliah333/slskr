@@ -25,3 +25,10 @@ lto = "thin"
 
 [profile.release.package.slskr-web]
 opt-level = "z"
+
+# Password hashing is deliberately expensive; unoptimized it makes sign-in and tests slow.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

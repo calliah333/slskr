@@ -32,7 +32,8 @@ use crate::{
     telemetry, transfers, users,
 };
 
-/// Command line. Everything else is configured in `slskr.toml` or `SLSKR_*` variables.
+/// Command line. Everything else is configured in the web UI, `slskr.toml` or `SLSKR_*`
+/// variables.
 #[derive(Debug, Parser)]
 #[command(
     name = "slskr",
@@ -146,7 +147,7 @@ async fn build(data_dir: PathBuf, config_file: PathBuf, options: ConfigStore) ->
         &paths.db_dir.join("sessions.db"),
         current.web.session_ttl,
         &current.web.username,
-        &current.web.password,
+        &auth::credential_secret(&current.web.password, &current.web.password_hash),
     )
     .await
     .context("opening sessions database")?;
@@ -299,7 +300,7 @@ fn warn_about_web_access(config: &Config, file: &Path) {
                 "web.auth is disabled on a non-loopback address: anyone on the network has full control of this daemon"
             );
         }
-    } else if web.password.is_empty() {
+    } else if web.password.is_empty() && web.password_hash.is_empty() {
         tracing::warn!(
             file = %file.display(),
             "web.password is not set; web sign-in is disabled until it is configured"

@@ -1,4 +1,5 @@
-//! The slskr configuration (`slskr.toml`, `GET /api/v0/options`, application hub `OPTIONS`).
+//! The slskr configuration (`slskr.toml`, `settings.json`, `GET /api/v0/options`,
+//! application hub `OPTIONS`).
 //!
 //! Keys are snake_case in TOML and JSON alike. Every section is `#[serde(default)]`, so a
 //! partial document fills in the defaults below, and `deny_unknown_fields`, so a typo is an
@@ -52,14 +53,69 @@ impl Config {
         {
             c.soulseek.proxy = format!("{scheme}://{REDACTED}@{host}");
         }
+        if !c.web.password_hash.is_empty() {
+            c.web.password = REDACTED.to_owned();
+            c.web.password_hash.clear();
+        }
         hide(&mut c.web.password);
+        c.web.managed_api_keys.clear();
         for key in &mut c.web.api_keys {
             hide(&mut key.key);
         }
         hide(&mut c.metrics.password);
         c
     }
+
+    /// True when `soulseek.proxy` carries credentials (it is then treated as a secret).
+    pub fn proxy_has_credentials(&self) -> bool {
+        self.soulseek
+            .proxy
+            .split_once("://")
+            .is_some_and(|(_, rest)| rest.contains('@'))
+    }
+
+    /// Dotted keys of the [`SECRET_KEYS`] that have a value (`web.password` also counts
+    /// when only its hash is stored).
+    pub fn secrets_set(&self) -> Vec<String> {
+        let set = [
+            !self.soulseek.password.is_empty(),
+            self.proxy_has_credentials(),
+            !self.web.password.is_empty() || !self.web.password_hash.is_empty(),
+            !self.metrics.password.is_empty(),
+        ];
+        SECRET_KEYS
+            .iter()
+            .zip(set)
+            .filter(|(_, set)| *set)
+            .map(|(key, _)| (*key).to_owned())
+            .collect()
+    }
+
+    /// JSON without secrets: the [`SECRET_KEYS`] that are set (`soulseek.proxy` only when it
+    /// carries credentials) and `web.api_keys` are left out rather than masked, so a client
+    /// that sends values back can not overwrite a secret with a placeholder.
+    pub fn public_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("Config serializes to JSON");
+        for key in self.secrets_set() {
+            let (section, name) = key.split_once('.').expect("dotted secret key");
+            if let Some(section) = value.get_mut(section).and_then(|v| v.as_object_mut()) {
+                section.remove(name);
+            }
+        }
+        if let Some(web) = value.get_mut("web").and_then(|v| v.as_object_mut()) {
+            web.remove("api_keys");
+        }
+        value
+    }
 }
+
+/// Dotted keys whose values are never sent to clients.
+pub const SECRET_KEYS: [&str; 4] = [
+    "soulseek.password",
+    "soulseek.proxy",
+    "web.password",
+    "metrics.password",
+];
 
 /// `[soulseek]`: the Soulseek network client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +178,14 @@ pub struct WebConfig {
     pub session_ttl: Duration,
     pub log_requests: bool,
     pub api_keys: Vec<ApiKeyConfig>,
+    /// argon2id PHC hash of a password set from the web UI (`settings.json`). Not a
+    /// configuration key: never read from `slskr.toml` and never serialized.
+    #[serde(skip)]
+    pub password_hash: String,
+    /// API keys created from the web UI (`settings.json`); only digests are kept. Not a
+    /// configuration key: never read from `slskr.toml` and never serialized.
+    #[serde(skip)]
+    pub managed_api_keys: Vec<ManagedApiKey>,
 }
 
 impl Default for WebConfig {
@@ -135,6 +199,8 @@ impl Default for WebConfig {
             session_ttl: Duration::from_secs(30 * 86_400),
             log_requests: false,
             api_keys: Vec::new(),
+            password_hash: String::new(),
+            managed_api_keys: Vec::new(),
         }
     }
 }
@@ -160,6 +226,19 @@ impl Default for ApiKeyConfig {
             allow: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
         }
     }
+}
+
+/// An API key created from the web UI: the key itself is shown once and only its SHA-256
+/// is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedApiKey {
+    pub name: String,
+    /// Lowercase hex SHA-256 of the key.
+    pub sha256: String,
+    pub role: ApiKeyRole,
+    /// CIDR ranges allowed to use the key.
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,5 +761,50 @@ mod tests {
         assert_eq!(r.web.api_keys[0].key, REDACTED);
         assert_eq!(r.web.api_keys[0].role, ApiKeyRole::ReadOnly);
         assert_eq!(r.metrics.password, "");
+    }
+
+    #[test]
+    fn public_json_leaves_secrets_out() {
+        let mut c = Config::default();
+        c.soulseek.username = "u".into();
+        c.soulseek.password = "pw".into();
+        c.web.password_hash = "$argon2id$...".into();
+        c.metrics.username = "m".into();
+        c.metrics.password = "mp".into();
+        c.web.api_keys.push(ApiKeyConfig {
+            name: "a".into(),
+            key: "x".repeat(16),
+            ..Default::default()
+        });
+        assert_eq!(
+            c.secrets_set(),
+            ["soulseek.password", "web.password", "metrics.password"]
+        );
+        let v = c.public_json();
+        assert_eq!(v["soulseek"]["username"], "u");
+        assert!(v["soulseek"].get("password").is_none());
+        assert_eq!(v["soulseek"]["proxy"], "");
+        assert!(v["web"].get("password").is_none());
+        assert!(v["web"].get("password_hash").is_none());
+        assert!(v["web"].get("api_keys").is_none());
+        assert!(v["metrics"].get("password").is_none());
+        assert_eq!(v["metrics"]["username"], "m");
+        let text = v.to_string();
+        assert!(
+            !text.contains("\"pw\"") && !text.contains("argon2"),
+            "{text}"
+        );
+
+        // Absent secrets deserialize as empty.
+        let back: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(back.soulseek.password, "");
+        assert_eq!(back.web.password_hash, "");
+        assert_eq!(c.redact().web.password, REDACTED);
+
+        c.soulseek.proxy = "socks5://user:pass@proxy:1080".into();
+        assert!(c.secrets_set().contains(&"soulseek.proxy".to_owned()));
+        assert!(c.public_json()["soulseek"].get("proxy").is_none());
+        c.soulseek.proxy = "socks5://proxy:1080".into();
+        assert_eq!(c.public_json()["soulseek"]["proxy"], "socks5://proxy:1080");
     }
 }

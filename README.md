@@ -7,11 +7,12 @@ replace the central Soulseek server.
 
 ## Run on NixOS
 
-slskr keeps its configuration, databases, logs and default download directories in a
-data directory: `$XDG_DATA_HOME/slskr` (usually `~/.local/share/slskr`), or the one
-given with `--data-dir`. Configuration is read from `slskr.toml` there (or the file
-given with `--config`); without one, slskr starts with defaults. Copy
-[`slskr.example.toml`](slskr.example.toml), which documents every key, and set at least:
+slskr keeps its settings, databases, logs and default download directories in a data
+directory: `$XDG_DATA_HOME/slskr` (usually `~/.local/share/slskr`), or the one given with
+`--data-dir`. Most settings are changed in the web UI (System → Options) and saved to
+`settings.json` there. Infrastructure you want in a file, or credentials you provision
+before the first start, go in an optional `slskr.toml` (or the file given with
+`--config`); start from the short [`slskr.example.toml`](slskr.example.toml):
 
 ```toml
 [soulseek]
@@ -34,14 +35,14 @@ together. Configure `shares.directories` to share files and `soulseek.listen_por
 incoming peers. Use only directories you intend to share. To inspect the UI without
 connecting to Soulseek, pass `--no-connect` (or set `soulseek.connect = false`).
 
-Every scalar or list key can also come from the environment as
-`SLSKR_<SECTION>_<KEY>`, for example `SLSKR_SOULSEEK_PASSWORD` or `SLSKR_WEB_LISTEN`
-(lists are comma-separated). Environment variables override the file, and
-command-line flags override both. Relative paths in the file resolve against the data
-directory. Changes saved to the file, by hand or from System → Options in the UI, apply
-without a restart except for the web listener, URL base, authentication switch,
-logging, metrics, slot counts and incoming search concurrency; the UI shows when a
-restart is pending. Keep credentials out of Git.
+Settings are layered, lowest precedence first: defaults, the UI's `settings.json`,
+`slskr.toml`, `SLSKR_<SECTION>_<KEY>` environment variables (for example
+`SLSKR_SOULSEEK_PASSWORD` or `SLSKR_WEB_LISTEN`; lists are comma-separated), then
+command-line flags. A key set in the file, the environment or on the command line is
+locked in the UI. Changes apply without a restart except for the web listener, URL base,
+authentication switch, logging, metrics, slot counts and incoming search concurrency; the
+UI shows when a restart is pending. [docs/CONFIGURATION.md](docs/CONFIGURATION.md) lists
+every key. Keep credentials out of Git.
 
 ## Develop
 

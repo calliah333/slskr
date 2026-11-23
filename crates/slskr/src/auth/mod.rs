@@ -124,11 +124,88 @@ impl Policy {
     }
 }
 
+/// The secret of an API key: plaintext from `slskr.toml`, or the SHA-256 of a key created
+/// from the web UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeySecret {
+    Plain(String),
+    Sha256([u8; 32]),
+}
+
+impl ApiKeySecret {
+    fn digest(&self) -> [u8; 32] {
+        match self {
+            Self::Plain(key) => sha256(key.as_bytes()),
+            Self::Sha256(digest) => *digest,
+        }
+    }
+}
+
+impl From<&str> for ApiKeySecret {
+    fn from(key: &str) -> Self {
+        Self::Plain(key.to_owned())
+    }
+}
+
+/// SHA-256 of `bytes`.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    sha256(bytes).iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+/// Parses a lowercase or uppercase hex SHA-256 digest.
+pub fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.is_ascii() {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
+/// argon2id PHC hash of `password` with a random salt.
+pub fn hash_password(password: &str) -> anyhow::Result<String> {
+    use argon2::{PasswordHasher, password_hash::SaltString};
+    let salt = SaltString::encode_b64(&rand::random::<[u8; 16]>())
+        .map_err(|e| anyhow::anyhow!("password salt: {e}"))?;
+    Ok(argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("hashing password: {e}"))?
+        .to_string())
+}
+
+/// True when `hash` is an argon2id PHC string.
+pub fn valid_password_hash(hash: &str) -> bool {
+    argon2::PasswordHash::new(hash)
+        .is_ok_and(|hash| hash.algorithm == argon2::Algorithm::Argon2id.ident())
+}
+
+/// Checks `password` against an argon2 PHC hash (slow by design).
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    use argon2::PasswordVerifier;
+    argon2::PasswordHash::new(hash).is_ok_and(|hash| {
+        argon2::Argon2::default()
+            .verify_password(password.as_bytes(), &hash)
+            .is_ok()
+    })
+}
+
 /// A configured API key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiKey {
     pub name: String,
-    pub key: String,
+    pub key: ApiKeySecret,
     pub role: Role,
     /// Comma separated list of address ranges allowed to use the key.
     pub cidr: String,
@@ -139,9 +216,30 @@ pub struct ApiKey {
 pub struct AuthConfig {
     pub disabled: bool,
     pub username: String,
+    /// Plaintext password from `slskr.toml` or the environment; takes precedence over
+    /// `password_hash`.
     pub password: String,
+    /// argon2id PHC hash of a password set from the web UI.
+    pub password_hash: String,
     pub session_ttl: Duration,
     pub api_keys: Vec<ApiKey>,
+}
+
+impl AuthConfig {
+    /// The password material sessions are bound to: changing it signs out every session.
+    pub fn credential_secret(&self) -> String {
+        credential_secret(&self.password, &self.password_hash)
+    }
+}
+
+/// See [`AuthConfig::credential_secret`]; just the password while no hash is set, so
+/// existing sessions survive the upgrade.
+pub fn credential_secret(password: &str, password_hash: &str) -> String {
+    if password_hash.is_empty() {
+        password.to_owned()
+    } else {
+        format!("{password}\0{password_hash}")
+    }
 }
 
 impl Default for AuthConfig {
@@ -150,6 +248,7 @@ impl Default for AuthConfig {
             disabled: false,
             username: "admin".into(),
             password: String::new(),
+            password_hash: String::new(),
             session_ttl: session::DEFAULT_TTL,
             api_keys: Vec::new(),
         }
@@ -274,7 +373,8 @@ impl IntoResponse for LoginError {
 
 struct CompiledApiKey {
     name: String,
-    key: Vec<u8>,
+    /// SHA-256 of the key, so plaintext and hashed keys compare alike in constant time.
+    digest: [u8; 32],
     role: Role,
     cidr: String,
     ranges: Vec<IpRange>,
@@ -283,6 +383,7 @@ struct CompiledApiKey {
 struct Credentials {
     username: String,
     password: String,
+    password_hash: String,
     api_keys: Vec<CompiledApiKey>,
 }
 
@@ -293,7 +394,7 @@ impl Credentials {
             .iter()
             .map(|k| CompiledApiKey {
                 name: k.name.clone(),
-                key: k.key.as_bytes().to_vec(),
+                digest: k.key.digest(),
                 role: k.role,
                 cidr: k.cidr.clone(),
                 ranges: k
@@ -313,8 +414,13 @@ impl Credentials {
         Self {
             username: config.username.clone(),
             password: config.password.clone(),
+            password_hash: config.password_hash.clone(),
             api_keys,
         }
+    }
+
+    fn login_configured(&self) -> bool {
+        !self.username.is_empty() && (!self.password.is_empty() || !self.password_hash.is_empty())
     }
 }
 
@@ -469,8 +575,9 @@ impl Auth {
                 .credentials
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            let changed =
-                credentials.username != config.username || credentials.password != config.password;
+            let changed = credentials.username != config.username
+                || credentials.password != config.password
+                || credentials.password_hash != config.password_hash;
             *credentials = Credentials::from_config(config);
             changed
         };
@@ -478,7 +585,7 @@ impl Auth {
         if changed {
             self.inner
                 .sessions
-                .reset(&config.username, &config.password);
+                .reset(&config.username, &config.credential_secret());
         }
     }
 
@@ -498,12 +605,12 @@ impl Auth {
             .credentials
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let candidate = key.as_bytes();
+        let candidate = sha256(key.as_bytes());
 
         let record = credentials
             .api_keys
             .iter()
-            .find(|k| constant_time_eq(&k.key, candidate))
+            .find(|k| constant_time_eq(&k.digest, &candidate))
             .ok_or(ApiKeyError::Unknown)?;
 
         let remote = remote.to_canonical();
@@ -626,17 +733,31 @@ impl Auth {
         }
     }
 
-    /// Constant-time check of the configured web UI credentials.
+    /// Checks the web UI credentials: the plaintext password from the file or environment
+    /// in constant time, otherwise the argon2 hash of a password set from the UI (slow;
+    /// call from a blocking context). The password is checked even when the username does
+    /// not match, so timing does not reveal the username.
     pub fn check_credentials(&self, username: &str, password: &str) -> bool {
-        let credentials = self
-            .inner
-            .credentials
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        let username_matches =
-            constant_time_eq(credentials.username.as_bytes(), username.as_bytes());
-        let password_matches =
-            constant_time_eq(credentials.password.as_bytes(), password.as_bytes());
+        let (expected_username, plain, hash) = {
+            let credentials = self
+                .inner
+                .credentials
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            (
+                credentials.username.clone(),
+                credentials.password.clone(),
+                credentials.password_hash.clone(),
+            )
+        };
+        let username_matches = constant_time_eq(expected_username.as_bytes(), username.as_bytes());
+        let password_matches = if !plain.is_empty() {
+            constant_time_eq(plain.as_bytes(), password.as_bytes())
+        } else if !hash.is_empty() {
+            verify_password(password, &hash)
+        } else {
+            false
+        };
         username_matches & password_matches
     }
 
@@ -653,21 +774,27 @@ impl Auth {
             ));
         }
 
-        {
-            let credentials = self
-                .inner
-                .credentials
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
-            if credentials.username.is_empty() || credentials.password.is_empty() {
-                tracing::error!(
-                    "Authentication is misconfigured; when enabled, username and password must be at least one character. Login is disabled."
-                );
-                return Err(LoginError::Misconfigured);
-            }
+        let configured = self
+            .inner
+            .credentials
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .login_configured();
+        if !configured {
+            tracing::error!(
+                "Authentication is misconfigured; when enabled, username and password must be at least one character. Login is disabled."
+            );
+            return Err(LoginError::Misconfigured);
         }
 
-        if !self.check_credentials(username, password) {
+        let matches = {
+            let (auth, username, password) =
+                (self.clone(), username.to_owned(), password.to_owned());
+            tokio::task::spawn_blocking(move || auth.check_credentials(&username, &password))
+                .await
+                .map_err(|e| anyhow::anyhow!("checking credentials: {e}"))?
+        };
+        if !matches {
             tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
             return Err(LoginError::Unauthorized);
         }

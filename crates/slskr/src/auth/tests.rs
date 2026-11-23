@@ -6,6 +6,7 @@ fn config() -> AuthConfig {
         disabled: false,
         username: "admin".into(),
         password: "hunter2".into(),
+        password_hash: String::new(),
         session_ttl: session::DEFAULT_TTL,
         api_keys: vec![
             ApiKey {
@@ -530,4 +531,84 @@ async fn used_sessions_resend_the_cookie() {
     assert!(auth.sessions().lookup(&token).unwrap().expires_at > before);
     // Once per refresh interval.
     assert_eq!(set_cookie(&send(None).await.unwrap()), None);
+}
+
+#[tokio::test]
+async fn hashed_password_login_and_invalidation() {
+    let hash = hash_password("from-the-ui").unwrap();
+    assert!(hash.starts_with("$argon2id$"), "{hash}");
+    assert!(valid_password_hash(&hash));
+    assert!(!valid_password_hash("plaintext"));
+    assert!(verify_password("from-the-ui", &hash));
+    assert!(!verify_password("wrong", &hash));
+
+    let auth = Auth::new(
+        AuthConfig {
+            password: String::new(),
+            password_hash: hash.clone(),
+            ..config()
+        },
+        SessionStore::memory(session::DEFAULT_TTL),
+    );
+    assert!(auth.login("admin", "from-the-ui").await.is_ok());
+    assert!(matches!(
+        auth.login("admin", "hunter2").await,
+        Err(LoginError::Unauthorized)
+    ));
+    assert!(matches!(
+        auth.login("root", "from-the-ui").await,
+        Err(LoginError::Unauthorized)
+    ));
+
+    // A new hash (a password change from the UI) signs out every session.
+    let cookie = signed_in_as(&auth, "admin", "from-the-ui").await;
+    let headers = parts("/", &[("cookie", cookie.as_str())]).headers;
+    let changed = hash_password("next").unwrap();
+    auth.update(&AuthConfig {
+        password: String::new(),
+        password_hash: changed,
+        ..config()
+    });
+    assert!(auth.session_principal(&headers).is_none());
+    assert!(auth.login("admin", "next").await.is_ok());
+
+    // A plaintext password from the file takes precedence over the hash.
+    let both = Auth::new(
+        AuthConfig {
+            password_hash: hash,
+            ..config()
+        },
+        SessionStore::memory(session::DEFAULT_TTL),
+    );
+    assert!(both.login("admin", "hunter2").await.is_ok());
+    assert!(both.login("admin", "from-the-ui").await.is_err());
+}
+
+#[test]
+fn hashed_api_keys() {
+    let key = "managed-key-0123456789abcdef";
+    let digest = parse_sha256_hex(&sha256_hex(key.as_bytes())).unwrap();
+    assert_eq!(digest, sha256(key.as_bytes()));
+    assert!(parse_sha256_hex("zz").is_none());
+    let auth = Auth::new(
+        AuthConfig {
+            api_keys: vec![ApiKey {
+                name: "managed".into(),
+                key: ApiKeySecret::Sha256(digest),
+                role: Role::Administrator,
+                cidr: ALLOW_ALL_CIDR.into(),
+            }],
+            ..config()
+        },
+        SessionStore::memory(session::DEFAULT_TTL),
+    );
+    let principal = auth
+        .authenticate_api_key(key, "10.0.0.1".parse().unwrap())
+        .unwrap();
+    assert_eq!(principal.name, "managed");
+    assert_eq!(principal.role, Role::Administrator);
+    assert!(matches!(
+        auth.authenticate_api_key(&sha256_hex(key.as_bytes()), "10.0.0.1".parse().unwrap()),
+        Err(ApiKeyError::Unknown)
+    ));
 }

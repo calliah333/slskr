@@ -155,28 +155,137 @@ async fn daemon_http_smoke() {
     assert_eq!(options["web"]["password"], "*****");
     assert!(options["shares"].get("directories").is_some());
 
-    let file = client
-        .get(format!("{api}/options/toml"))
+    // Settings: keys from slskr.toml are pinned, secrets are never returned.
+    let settings: Value = client
+        .get(format!("{api}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pinned: Vec<&str> = settings["pinned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for key in [
+        "soulseek.connect",
+        "shares.directories",
+        "web.listen",
+        "web.password",
+        "web.url_base",
+        "web.username",
+    ] {
+        assert!(pinned.contains(&key), "{key} not in {pinned:?}");
+    }
+    assert!(!pinned.contains(&"uploads.slots"));
+    assert_eq!(settings["secrets_set"], serde_json::json!(["web.password"]));
+    assert!(settings["values"]["web"].get("password").is_none());
+    assert_eq!(settings["values"]["web"]["username"], "smoke");
+    assert!(!settings.to_string().contains("\"secret\""), "{settings}");
+    assert_eq!(settings["pending_restart"], false);
+
+    let patch = |body: Value| client.patch(format!("{api}/settings")).json(&body).send();
+    let changed: Value = patch(serde_json::json!({"uploads": {"slots": 3}}))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(changed["values"]["uploads"]["slots"], 3);
+    assert_eq!(changed["pending_restart"], true);
+    let store: Value = serde_json::from_str(
+        &std::fs::read_to_string(data_dir.path().join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store["settings"],
+        serde_json::json!({"uploads": {"slots": 3}})
+    );
+    let pinned = patch(serde_json::json!({"web": {"listen": "127.0.0.1:1"}}))
+        .await
+        .unwrap();
+    assert_eq!(pinned.status(), reqwest::StatusCode::CONFLICT);
+    assert!(pinned.text().await.unwrap().contains("web.listen"));
+    let invalid = patch(serde_json::json!({"uploads": {"slots": 0}}))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(invalid.text().await.unwrap().contains("uploads.slots"));
+    let reset = client
+        .delete(format!("{api}/settings/uploads.slots"))
         .send()
         .await
         .unwrap()
         .error_for_status()
         .unwrap();
-    assert!(
-        file.headers()["content-type"]
-            .to_str()
-            .unwrap()
-            .starts_with("application/toml")
-    );
-    assert_eq!(file.text().await.unwrap(), config);
-    let invalid = client
-        .put(format!("{api}/options/toml"))
-        .header("content-type", "application/toml")
-        .body("[web]\nlisten = \"nowhere\"\n")
+    let reset: Value = reset.json().await.unwrap();
+    assert_eq!(reset["values"]["uploads"]["slots"], 20);
+    assert_eq!(reset["pending_restart"], false);
+    // The raw configuration file endpoints are gone.
+    for path in ["/options/toml", "/options/toml/location"] {
+        let gone = client.get(format!("{api}{path}")).send().await.unwrap();
+        assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+
+    // API keys: created once, used with X-API-Key, refused after deletion.
+    let created = client
+        .post(format!("{api}/settings/api-keys"))
+        .json(&serde_json::json!({"name": "smoke-key", "role": "readwrite"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created: Value = created.json().await.unwrap();
+    let key = created["key"].as_str().unwrap().to_owned();
+    let keyed = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let with_key = |path: &str| {
+        keyed
+            .get(format!("{api}{path}"))
+            .header("X-API-Key", &key)
+            .send()
+    };
+    assert_eq!(
+        with_key("/application").await.unwrap().status(),
+        reqwest::StatusCode::OK
+    );
+    // Settings need an interactive sign-in.
+    assert_eq!(
+        with_key("/settings").await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let listed: Value = client
+        .get(format!("{api}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["api_keys"],
+        serde_json::json!([{"name": "smoke-key", "role": "readwrite", "allow": ["0.0.0.0/0", "::/0"], "pinned": false}])
+    );
+    assert!(!listed.to_string().contains(&key));
+    let deleted = client
+        .delete(format!("{api}/settings/api-keys/smoke-key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        with_key("/application").await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     // Deleting a missing download is a 404; deletion is confined to the downloads root.
     let deletion = client

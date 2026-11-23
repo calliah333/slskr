@@ -219,7 +219,8 @@ impl SessionStore {
     }
 
     /// Opens (or creates) the sessions database and loads unexpired sessions. Sessions
-    /// issued for other web credentials than `username`/`password` are discarded.
+    /// issued for other web credentials than `username`/`password` (the password material,
+    /// see [`super::credential_secret`]) are discarded.
     pub async fn open(
         path: &Path,
         ttl: Duration,

@@ -1,14 +1,14 @@
-//! Application, session, server, options, and debug HTTP endpoints.
+//! Application, session, server, options, settings, and debug HTTP endpoints.
 
 use std::time::Duration;
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -18,6 +18,7 @@ use slskr_api::{
     config::Config,
     server::ServerState,
     session::{LoginRequest, Session},
+    settings::{CreateApiKey, Settings},
 };
 
 use crate::{
@@ -25,6 +26,7 @@ use crate::{
     auth::{
         self, Authenticated, LoginError, RequireAdmin, RequireAdminSession, RequireReadWrite, Role,
     },
+    config::{self, SettingsError},
     http::ApiError,
 };
 
@@ -45,9 +47,10 @@ pub fn routes() -> Router<AppState> {
         .route("/server", get(server).put(connect).delete(disconnect))
         .route("/options", get(options))
         .route("/options/startup", get(startup_options))
-        .route("/options/toml/location", get(toml_location))
-        .route("/options/toml", get(read_toml).put(write_toml))
-        .route("/options/toml/validate", post(validate_toml))
+        .route("/settings", get(get_settings).patch(patch_settings))
+        .route("/settings/api-keys", post(create_api_key))
+        .route("/settings/api-keys/{name}", delete(delete_api_key))
+        .route("/settings/{key}", delete(reset_setting))
         .route("/debug/transfers", get(debug_transfers))
 }
 
@@ -257,74 +260,79 @@ async fn startup_options(_: RequireAdmin, State(app): State<AppState>) -> Json<C
     Json(app.options.startup().redact())
 }
 
-async fn toml_location(
-    _: RequireAdminSession,
-    State(app): State<AppState>,
-) -> HttpResult<Json<String>> {
-    Ok(Json(app.paths.config_file.to_string_lossy().into_owned()))
+async fn get_settings(_: RequireAdminSession, State(app): State<AppState>) -> Json<Settings> {
+    Json(app.options.settings().await)
 }
 
-async fn read_toml(
+/// Applies a settings change at once, so a credential change signs sessions out before the
+/// response (the options watcher applies it again, as a no-op).
+fn applied(app: &AppState, result: Result<Settings, SettingsError>) -> HttpResult<Json<Settings>> {
+    let settings = result.map_err(settings_error)?;
+    app.auth.update(&config::auth_config(&app.options.get()));
+    Ok(Json(settings))
+}
+
+async fn patch_settings(
     _: RequireAdminSession,
     State(app): State<AppState>,
     headers: HeaderMap,
+    body: Bytes,
+) -> HttpResult<Json<Settings>> {
+    let patch = optional_json::<Value>(&headers, &body)?
+        .ok_or_else(|| bad_request("No settings provided"))?;
+    let result = app.options.patch(patch).await;
+    applied(&app, result)
+}
+
+async fn reset_setting(
+    _: RequireAdminSession,
+    State(app): State<AppState>,
+    Path(key): Path<String>,
+) -> HttpResult<Json<Settings>> {
+    let result = app.options.reset(&key).await;
+    applied(&app, result)
+}
+
+async fn create_api_key(
+    _: RequireAdminSession,
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> HttpResult<Response> {
-    let text = app
+    let request = optional_json::<CreateApiKey>(&headers, &body)?
+        .ok_or_else(|| bad_request("No API key provided"))?;
+    let created = app
         .options
-        .read_toml()
-        .map_err(|error| ApiError::Internal(error.into()).into_response())?;
-    let json_requested = headers
-        .get_all(header::ACCEPT)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-        });
-    if json_requested {
-        Ok(Json(text).into_response())
-    } else {
-        Ok((
-            [(header::CONTENT_TYPE, "application/toml; charset=utf-8")],
-            text,
-        )
-            .into_response())
-    }
+        .create_api_key(request)
+        .await
+        .map_err(settings_error)?;
+    app.auth.update(&config::auth_config(&app.options.get()));
+    Ok((StatusCode::CREATED, Json(created)).into_response())
 }
 
-async fn write_toml(
+async fn delete_api_key(
     _: RequireAdminSession,
     State(app): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
+    Path(name): Path<String>,
 ) -> HttpResult<StatusCode> {
-    let text = toml_body(&headers, &body)?;
-    if let Some(error) = app.options.validate_toml(&text) {
-        return Err(bad_request(error));
-    }
-    app.options.apply_toml(&text).await.map_err(|error| {
-        ApiError::Internal(anyhow::anyhow!(
-            "Failed to update configuration file: {error}"
-        ))
-        .into_response()
-    })?;
-    Ok(StatusCode::OK)
+    app.options
+        .delete_api_key(&name)
+        .await
+        .map_err(settings_error)?;
+    app.auth.update(&config::auth_config(&app.options.get()));
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn validate_toml(
-    _: RequireAdmin,
-    State(app): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> HttpResult<Response> {
-    let text = toml_body(&headers, &body)?;
-    Ok(match app.options.validate_toml(&text) {
-        Some(error) => Json(error).into_response(),
-        None => StatusCode::OK.into_response(),
-    })
+fn settings_error(error: SettingsError) -> Response {
+    match error {
+        SettingsError::Pinned(message) | SettingsError::Conflict(message) => {
+            ApiError::Conflict(message)
+        }
+        SettingsError::Invalid(message) => ApiError::BadRequest(message),
+        SettingsError::NotFound(message) => ApiError::NotFound(message),
+        SettingsError::Internal(error) => ApiError::Internal(error),
+    }
+    .into_response()
 }
 
 fn media_type(headers: &HeaderMap) -> &str {
@@ -354,27 +362,6 @@ fn optional_json<T: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> HttpR
         return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
     }
     serde_json::from_slice(body).map_err(|error| bad_request(error.to_string()))
-}
-
-fn toml_body<'a>(headers: &HeaderMap, body: &'a [u8]) -> HttpResult<std::borrow::Cow<'a, str>> {
-    let media = media_type(headers);
-    if is_json(media) {
-        return Ok(optional_json::<String>(headers, body)?
-            .unwrap_or_default()
-            .into());
-    }
-    if ["application/toml", "text/x-toml", "text/plain"]
-        .iter()
-        .any(|mime| media.eq_ignore_ascii_case(mime))
-    {
-        return std::str::from_utf8(body)
-            .map(Into::into)
-            .map_err(|error| bad_request(error.to_string()));
-    }
-    if body.is_empty() {
-        return Ok("".into());
-    }
-    Err(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response())
 }
 
 fn bad_request(message: impl Into<String>) -> Response {

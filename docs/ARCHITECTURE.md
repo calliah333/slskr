@@ -121,7 +121,8 @@ network manager, and a `Waiter` keyed by message kind + discriminator
 
 Mirrors slskd JSON exactly (camelCase fields, enum string formats, slskd's flags
 enums serialised as comma-separated strings, e.g. `"Completed, Succeeded"`).
-Modules: `application` (State, version), `options` (Options tree), `session`,
+Modules: `application` (State, version), `config` (the merged configuration, snake_case),
+`settings` (`/settings` view: values, pinned keys, secrets set, API keys), `session`,
 `server`, `logs`, `events`, `telemetry`, `search`, `transfers`, `users`,
 `conversations`, `rooms`, `shares`, `files`. No I/O, compiles to wasm.
 

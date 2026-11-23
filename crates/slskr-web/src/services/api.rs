@@ -140,11 +140,6 @@ pub async fn put<B: Serialize + ?Sized, T: DeserializeOwned>(
     request(Method::PUT, path, Some(to_body(body)?)).await
 }
 
-/// `PUT path` with a JSON body, raw text response.
-pub async fn put_text<B: Serialize + ?Sized>(path: &str, body: &B) -> Result<String, ApiError> {
-    request_text(Method::PUT, path, Some(to_body(body)?)).await
-}
-
 /// `PUT path` without a body, JSON response.
 pub async fn put_empty<T: DeserializeOwned>(path: &str) -> Result<T, ApiError> {
     request(Method::PUT, path, None).await
