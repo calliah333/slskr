@@ -52,7 +52,54 @@ pub fn read_file(r: &mut MessageReader) -> Result<File, ProtocolError> {
     })
 }
 
-fn read_files(r: &mut MessageReader, count: u32) -> Result<Vec<File>, ProtocolError> {
+/// Maximum file entries parsed from one message (all directories and lists combined).
+pub const MAX_PARSED_FILES: usize = 5_000_000;
+/// Maximum directory entries parsed from one message (all lists combined).
+pub const MAX_PARSED_DIRECTORIES: usize = 1_000_000;
+
+/// Per-message budget bounding how many entries a decompressed payload may expand into.
+#[derive(Debug, Clone, Copy)]
+struct EntryBudget {
+    files: usize,
+    directories: usize,
+}
+
+impl EntryBudget {
+    const fn new() -> Self {
+        Self {
+            files: MAX_PARSED_FILES,
+            directories: MAX_PARSED_DIRECTORIES,
+        }
+    }
+
+    fn take_files(&mut self, count: u32) -> Result<(), ProtocolError> {
+        self.files = self.files.checked_sub(count as usize).ok_or_else(|| {
+            ProtocolError::Invalid(format!(
+                "message exceeds the limit of {MAX_PARSED_FILES} file entries"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn take_directories(&mut self, count: u32) -> Result<(), ProtocolError> {
+        self.directories = self
+            .directories
+            .checked_sub(count as usize)
+            .ok_or_else(|| {
+                ProtocolError::Invalid(format!(
+                    "message exceeds the limit of {MAX_PARSED_DIRECTORIES} directory entries"
+                ))
+            })?;
+        Ok(())
+    }
+}
+
+fn read_files(
+    r: &mut MessageReader,
+    count: u32,
+    budget: &mut EntryBudget,
+) -> Result<Vec<File>, ProtocolError> {
+    budget.take_files(count)?;
     let mut files = Vec::with_capacity(count.min(1024) as usize);
     for _ in 0..count {
         files.push(read_file(r)?);
@@ -70,18 +117,30 @@ pub fn write_directory(b: &mut MessageBuilder, dir: &Directory) {
 
 /// Reads a directory entry.
 pub fn read_directory(r: &mut MessageReader) -> Result<Directory, ProtocolError> {
+    read_directory_budgeted(r, &mut EntryBudget::new())
+}
+
+fn read_directory_budgeted(
+    r: &mut MessageReader,
+    budget: &mut EntryBudget,
+) -> Result<Directory, ProtocolError> {
     let name = r.string()?;
     let count = r.u32()?;
     Ok(Directory {
         name,
-        files: read_files(r, count)?,
+        files: read_files(r, count, budget)?,
     })
 }
 
-fn read_directories(r: &mut MessageReader, count: u32) -> Result<Vec<Directory>, ProtocolError> {
+fn read_directories(
+    r: &mut MessageReader,
+    count: u32,
+    budget: &mut EntryBudget,
+) -> Result<Vec<Directory>, ProtocolError> {
+    budget.take_directories(count)?;
     let mut dirs = Vec::with_capacity(count.min(1024) as usize);
     for _ in 0..count {
-        dirs.push(read_directory(r)?);
+        dirs.push(read_directory_budgeted(r, budget)?);
     }
     Ok(dirs)
 }
@@ -118,13 +177,14 @@ impl BrowseResponse {
     pub fn decode(r: &mut MessageReader) -> Result<Self, ProtocolError> {
         r.decompress()?;
         let count = r.u32()?;
-        let directories = read_directories(r, count)?;
+        let mut budget = EntryBudget::new();
+        let directories = read_directories(r, count, &mut budget)?;
         let mut locked_directories = Vec::new();
         if r.has_remaining() {
             r.u32()?;
             if r.has_remaining() {
                 let count = r.u32()?;
-                locked_directories = read_directories(r, count)?;
+                locked_directories = read_directories(r, count, &mut budget)?;
             }
         }
         Ok(Self {
@@ -169,7 +229,7 @@ impl SearchResponse {
         }
         b.bool(self.has_free_upload_slot)
             .u32(self.upload_speed)
-            .u32(self.queue_length.min(u32::MAX as u64) as u32)
+            .u32(self.queue_length.min(i32::MAX as u64) as u32)
             .u32(0)
             .u32(self.locked_files.len() as u32);
         for f in &self.locked_files {
@@ -184,7 +244,8 @@ impl SearchResponse {
         let username = r.string()?;
         let token = r.u32()?;
         let count = r.u32()?;
-        let files = read_files(r, count)?;
+        let mut budget = EntryBudget::new();
+        let files = read_files(r, count, &mut budget)?;
         let has_free_upload_slot = r.u8()? > 0;
         let upload_speed = r.u32()?;
         let queue_length = r.u32()? as u64;
@@ -194,7 +255,7 @@ impl SearchResponse {
         let mut locked_files = Vec::new();
         if r.has_remaining() {
             let count = r.u32()?;
-            locked_files = read_files(r, count)?;
+            locked_files = read_files(r, count, &mut budget)?;
         }
         Ok(Self {
             username,
@@ -316,7 +377,7 @@ impl FolderContentsResponse {
         Ok(Self {
             token,
             directory_name,
-            directories: read_directories(r, count)?,
+            directories: read_directories(r, count, &mut EntryBudget::new())?,
         })
     }
 }
@@ -671,6 +732,82 @@ mod tests {
             queue_length: 3,
         };
         assert_eq!(decode(m.to_bytes()), PeerIncoming::SearchResponse(m));
+    }
+
+    #[test]
+    fn search_response_queue_length_clamps_to_i32() {
+        let m = SearchResponse {
+            username: "u".into(),
+            token: 9,
+            files: vec![],
+            locked_files: vec![],
+            has_free_upload_slot: false,
+            upload_speed: 1,
+            queue_length: u64::MAX,
+        };
+        let PeerIncoming::SearchResponse(d) = decode(m.to_bytes()) else {
+            panic!()
+        };
+        assert_eq!(d.queue_length, i32::MAX as u64);
+    }
+
+    fn assert_invalid(frame: Bytes) {
+        assert!(matches!(
+            PeerIncoming::decode(frame.slice(4..)),
+            Err(ProtocolError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn entry_budget_rejects_oversized_counts() {
+        let mut b = MessageBuilder::new();
+        b.code_u32(PeerCode::BrowseResponse.as_u32())
+            .u32(MAX_PARSED_DIRECTORIES as u32 + 1);
+        assert_invalid(b.compress().build());
+
+        let mut b = MessageBuilder::new();
+        b.code_u32(PeerCode::BrowseResponse.as_u32())
+            .u32(1)
+            .string("d")
+            .u32(MAX_PARSED_FILES as u32 + 1);
+        assert_invalid(b.compress().build());
+
+        let mut b = MessageBuilder::new();
+        b.code_u32(PeerCode::SearchResponse.as_u32())
+            .string("u")
+            .u32(1)
+            .u32(MAX_PARSED_FILES as u32 + 1);
+        assert_invalid(b.compress().build());
+
+        let mut b = MessageBuilder::new();
+        b.code_u32(PeerCode::FolderContentsResponse.as_u32())
+            .u32(1)
+            .string("d")
+            .u32(MAX_PARSED_DIRECTORIES as u32 + 1);
+        assert_invalid(b.compress().build());
+    }
+
+    #[test]
+    fn entry_budget_is_shared_across_lists() {
+        let mut budget = EntryBudget::new();
+        budget.take_files(MAX_PARSED_FILES as u32 - 1).unwrap();
+        budget
+            .take_directories(MAX_PARSED_DIRECTORIES as u32)
+            .unwrap();
+        assert!(matches!(
+            budget.take_directories(1),
+            Err(ProtocolError::Invalid(_))
+        ));
+        let mut b = MessageBuilder::new();
+        b.code_u32(0);
+        write_file(&mut b, &file("a"));
+        write_file(&mut b, &file("b"));
+        let mut r = MessageReader::new(b.build().slice(8..));
+        assert!(matches!(
+            read_files(&mut r, 2, &mut budget),
+            Err(ProtocolError::Invalid(_))
+        ));
+        assert_eq!(read_files(&mut r, 1, &mut budget).unwrap().len(), 1);
     }
 
     #[test]

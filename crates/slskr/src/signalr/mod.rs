@@ -43,6 +43,8 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const CONNECTION_BUFFER: usize = 1024;
 /// How long a negotiated connection token stays valid without a WebSocket connect.
 const PENDING_TTL: Duration = Duration::from_secs(120);
+/// Largest client WebSocket message or frame; see `protocol::MAX_BUFFERED` for sizing.
+const MAX_WEBSOCKET_MESSAGE: usize = 2 * protocol::MAX_BUFFERED;
 
 type InitialMessages = Vec<(String, Vec<Value>)>;
 type OnConnected = dyn Fn() -> InitialMessages + Send + Sync;
@@ -422,7 +424,11 @@ impl Hub {
 
         let peer_ip = remote_addr(&parts).ip();
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-            Ok(upgrade) => upgrade,
+            // axum's 64 MiB default would let one message far exceed the record cap; allow one
+            // maximal record plus room for a few small records batched into the same message.
+            Ok(upgrade) => upgrade
+                .max_message_size(MAX_WEBSOCKET_MESSAGE)
+                .max_frame_size(MAX_WEBSOCKET_MESSAGE),
             Err(rejection) => return rejection.into_response(),
         };
 

@@ -285,9 +285,8 @@ impl Transfer {
     /// Estimated remaining time from the average speed.
     pub fn remaining(&self) -> Option<Duration> {
         if self.average_speed > 0.0 && self.average_speed.is_finite() {
-            Some(Duration::from_secs_f64(
-                self.bytes_remaining() as f64 / self.average_speed,
-            ))
+            // A huge advertised size with a tiny speed can overflow `Duration`.
+            Duration::try_from_secs_f64(self.bytes_remaining() as f64 / self.average_speed).ok()
         } else {
             None
         }
@@ -342,5 +341,22 @@ mod tests {
         assert_eq!(t.percent_complete(), 25.0);
         assert_eq!(t.remaining(), Some(Duration::from_secs(3)));
         assert_eq!(t.elapsed(), None);
+    }
+
+    #[test]
+    fn remaining_does_not_panic_on_overflow() {
+        let mut t = Transfer::new(
+            TransferDirection::Download,
+            "u",
+            "f",
+            1,
+            TransferState::IN_PROGRESS,
+            u64::MAX,
+            0,
+        );
+        t.average_speed = 1e-6;
+        assert_eq!(t.remaining(), None);
+        t.average_speed = f64::MIN_POSITIVE;
+        assert_eq!(t.remaining(), None);
     }
 }

@@ -180,6 +180,10 @@ impl TransferManager {
                         entry.remote_token = Some(token);
                         return;
                     }
+                    // Like upstream, only offers for downloads we no longer have are
+                    // rejected; a re-offer for one still in progress is ignored.
+                    tracing::debug!(%username, filename = %entry.filename, token, "Ignoring repeated offer for an active download");
+                    return;
                 }
                 drop(registry);
                 self.respond(client, username, remote, Reply::RejectOffer(token));
@@ -619,6 +623,13 @@ impl ActiveTransfer {
         cancel: &CancellationToken,
     ) -> Result<()> {
         let client = self.client.clone();
+        // Like upstream's global download semaphore, hold the slot from before the request
+        // so the uploader is not left waiting for our TransferResponse once it offers.
+        let _slot = client
+            .inner
+            .transfers
+            .slot(&client, Direction::Download)
+            .await;
         let peer = self.message_connection(cancel).await?;
         self.snapshot.ip_endpoint = Some(peer.remote());
         let (response, acknowledged) = oneshot::channel();
@@ -671,12 +682,6 @@ impl ActiveTransfer {
                 return Err(error);
             }
         }
-        // Remotely queued downloads do not consume a data slot.
-        let _slot = client
-            .inner
-            .transfers
-            .slot(&client, Direction::Download)
-            .await;
         self.state(State::INITIALIZING);
         let conn = if let Some(offer) = offer {
             let peer = self.message_connection(cancel).await?;
@@ -713,7 +718,20 @@ impl ActiveTransfer {
         request: TransferRequest,
         acknowledged: oneshot::Receiver<TransferResponse>,
     ) -> Result<TransferResponse> {
-        timeout(self.message_timeout(), async {
+        // Upstream bounds the acknowledgement by the peer connection inactivity timeout.
+        let limit = {
+            let options = self
+                .client
+                .inner
+                .options
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            options
+                .peer_connection_options
+                .inactivity_timeout
+                .unwrap_or(options.message_timeout)
+        };
+        timeout(limit, async {
             peer.send(request.to_bytes()).await?;
             tokio::select! {
                 biased;

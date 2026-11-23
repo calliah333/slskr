@@ -16,6 +16,19 @@ use crate::options::{ConnectionOptions, ProxyOptions};
 // Accommodate large compressed share listings without honoring arbitrary u32 sizes.
 pub(super) const MAX_FRAME_BODY_LEN: usize = 64 * 1024 * 1024;
 const FRAME_HEADER_LEN: usize = size_of::<u32>();
+const FRAME_CODE_LEN: usize = size_of::<u32>();
+
+/// Progress of a frame body being read (code and payload, without the length prefix).
+pub(crate) struct FrameProgress {
+    pub code: u32,
+    pub received: usize,
+    pub total: usize,
+    /// Set on the first report for a frame, as soon as its code is known.
+    pub first: bool,
+}
+
+/// Invoked by a message connection's reader while frames arrive.
+pub(crate) type FrameObserver = Arc<dyn Fn(&FrameProgress) + Send + Sync>;
 
 pub(crate) struct Connection {
     stream: TcpStream,
@@ -111,10 +124,49 @@ impl ReadBuffer {
         input: &mut (impl AsyncRead + Unpin),
         inactivity: Option<&Inactivity>,
     ) -> Result<Bytes> {
+        self.read_frame_observed(input, inactivity, None).await
+    }
+
+    /// Like [`Self::read_frame`], additionally reporting the progress of frames with a
+    /// code (body of at least 4 bytes) to `observer` once the code is known and after
+    /// each further read until the body is complete.
+    pub(super) async fn read_frame_observed(
+        &mut self,
+        input: &mut (impl AsyncRead + Unpin),
+        inactivity: Option<&Inactivity>,
+        observer: Option<&FrameObserver>,
+    ) -> Result<Bytes> {
         self.fill_until(input, inactivity, FRAME_HEADER_LEN).await?;
         let len = frame_body_len((&self.bytes[..FRAME_HEADER_LEN]).try_into().unwrap())?;
-        self.fill_until(input, inactivity, FRAME_HEADER_LEN + len)
-            .await?;
+        let end = FRAME_HEADER_LEN + len;
+        match observer {
+            Some(observer) if len >= FRAME_CODE_LEN => {
+                self.fill_until(input, inactivity, FRAME_HEADER_LEN + FRAME_CODE_LEN)
+                    .await?;
+                let code = u32::from_le_bytes(
+                    self.bytes[FRAME_HEADER_LEN..FRAME_HEADER_LEN + FRAME_CODE_LEN]
+                        .try_into()
+                        .unwrap(),
+                );
+                let mut first = true;
+                loop {
+                    observer(&FrameProgress {
+                        code,
+                        received: (self.bytes.len() - FRAME_HEADER_LEN).min(len),
+                        total: len,
+                        first,
+                    });
+                    if self.bytes.len() >= end {
+                        break;
+                    }
+                    first = false;
+                    // One read at a time, so progress is reported per chunk.
+                    self.fill_until(input, inactivity, self.bytes.len() + 1)
+                        .await?;
+                }
+            }
+            _ => self.fill_until(input, inactivity, end).await?,
+        }
         self.bytes.advance(FRAME_HEADER_LEN);
         Ok(self.bytes.split_to(len).freeze())
     }

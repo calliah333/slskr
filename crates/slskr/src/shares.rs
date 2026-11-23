@@ -641,15 +641,25 @@ impl ShareService {
         share.resolve(&remote, parent, name)
     }
 
-    pub fn search(&self, query: &soulseek::SearchQuery) -> Result<Vec<soulseek::File>> {
-        let local = self.snapshot();
+    /// Returns at most `limit` shared files matching `query`, stopping the scan
+    /// once the limit is reached so broad queries stay bounded.
+    pub fn search(
+        &self,
+        query: &soulseek::SearchQuery,
+        limit: usize,
+    ) -> Result<Vec<soulseek::File>> {
         let mut collect = SearchMatches {
             query,
+            limit,
             filename: String::new(),
             matches: Vec::new(),
         };
+        if collect.is_full() {
+            return Ok(collect.matches);
+        }
+        let local = self.snapshot();
         if let Some(snapshot) = &local {
-            for share in snapshot.shares.values() {
+            'local: for share in snapshot.shares.values() {
                 for (parent, files) in &share.directories {
                     if files.is_empty() {
                         continue;
@@ -657,12 +667,18 @@ impl ShareService {
                     collect.parent(parent);
                     for file in files {
                         collect.file(&file.name, |filename| file.wire(filename));
+                        if collect.is_full() {
+                            break 'local;
+                        }
                     }
                 }
             }
         }
+        if collect.is_full() {
+            return Ok(collect.matches);
+        }
         let remotes = self.relay_snapshots();
-        for (agent, snapshot) in remotes.iter() {
+        'remote: for (agent, snapshot) in remotes.iter() {
             for (parent, files) in &snapshot.directories {
                 if files.is_empty() {
                     continue;
@@ -674,6 +690,9 @@ impl ShareService {
                 for file in files {
                     if !is_shadowed(&remotes, agent, parent, &file.name, local_files) {
                         collect.file(&file.name, |filename| file.wire(filename));
+                        if collect.is_full() {
+                            break 'remote;
+                        }
                     }
                 }
             }
@@ -698,11 +717,16 @@ impl ShareService {
 
 struct SearchMatches<'a> {
     query: &'a soulseek::SearchQuery,
+    limit: usize,
     filename: String,
     matches: Vec<soulseek::File>,
 }
 
 impl SearchMatches<'_> {
+    fn is_full(&self) -> bool {
+        self.matches.len() >= self.limit
+    }
+
     fn parent(&mut self, parent: &str) {
         self.filename.clear();
         self.filename.push_str(parent);
@@ -1113,9 +1137,16 @@ mod tests {
         assert_eq!(shares.browse().unwrap().directories.len(), 2);
         assert_eq!(shares.list_directory("music").unwrap()[0].files[0].size, 5);
         let found = shares
-            .search(&soulseek::SearchQuery::parse("remote"))
+            .search(&soulseek::SearchQuery::parse("remote"), usize::MAX)
             .unwrap();
         assert_eq!(found[0].filename, "music\\albums\\remote.txt");
+        // The response limit caps collection, local matches first, and skips relays when full.
+        let txt = soulseek::SearchQuery::parse("txt");
+        assert_eq!(shares.search(&txt, usize::MAX).unwrap().len(), 2);
+        let capped = shares.search(&txt, 1).unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].filename, "music\\collision.txt");
+        assert!(shares.search(&txt, 0).unwrap().is_empty());
 
         db.execute("UPDATE files SET size = -1", []).unwrap();
         drop(db);

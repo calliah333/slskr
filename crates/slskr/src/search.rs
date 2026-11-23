@@ -142,7 +142,9 @@ impl SearchService {
             let Some(inner) = inner.upgrade() else {
                 return Vec::new();
             };
-            vec![(dto::hub_methods::LIST.into(), vec![json!(inner.list())])]
+            // Upstream lists searches with empty (not null) responses.
+            let list: Vec<_> = inner.list().into_iter().map(without_responses).collect();
+            vec![(dto::hub_methods::LIST.into(), vec![json!(list)])]
         });
         Ok(service)
     }
@@ -596,6 +598,13 @@ pub fn routes() -> Router<AppState> {
         .route("/searches/{id}/responses", get(responses))
 }
 
+/// HTTP payloads carry `responses: []` when responses were not loaded, matching
+/// upstream's `WithoutResponses()` projection.
+fn without_responses(mut search: Search) -> Search {
+    search.responses.get_or_insert_with(Vec::new);
+    search
+}
+
 fn local_service(state: &AppState) -> ApiResult<&SearchService> {
     if state.services.relay.is_agent() {
         return Err(ApiError::Forbidden(
@@ -606,7 +615,14 @@ fn local_service(state: &AppState) -> ApiResult<&SearchService> {
 }
 
 async fn list(_: Authenticated, State(state): State<AppState>) -> ApiResult<Json<Vec<Search>>> {
-    Ok(Json(local_service(&state)?.0.list()))
+    Ok(Json(
+        local_service(&state)?
+            .0
+            .list()
+            .into_iter()
+            .map(without_responses)
+            .collect(),
+    ))
 }
 
 async fn create(
@@ -624,7 +640,7 @@ async fn create(
         };
         ApiError::Status(status, error.body_text())
     })?;
-    Ok(Json(service.create(body).await?))
+    Ok(Json(without_responses(service.create(body).await?)))
 }
 
 #[derive(Deserialize)]
@@ -640,11 +656,10 @@ async fn get_one(
     Path(id): Path<Uuid>,
     Query(query): Query<Include>,
 ) -> ApiResult<Json<Search>> {
-    Ok(Json(
-        local_service(&state)?
-            .get(&id.to_string(), query.include_responses)
-            .await?,
-    ))
+    let search = local_service(&state)?
+        .get(&id.to_string(), query.include_responses)
+        .await?;
+    Ok(Json(without_responses(search)))
 }
 
 async fn responses(

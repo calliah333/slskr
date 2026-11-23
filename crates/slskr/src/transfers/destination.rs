@@ -213,11 +213,16 @@ impl Partial {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
             Err(error) => return Err(error),
         }
-        match regular(&directory.join(&self.filename))? {
-            Some(metadata) if metadata.len() <= expected => {
-                ensure_unlinked(&metadata)?;
-                Ok(metadata.len())
+        let path = directory.join(&self.filename);
+        match regular(&path)? {
+            // A partial with another name (for example, left behind when an
+            // install linked it but could not remove the source) must never be
+            // written through. Drop only our name and download from scratch.
+            Some(metadata) if hard_linked(&metadata) => {
+                unlink_partial(&path)?;
+                Ok(0)
             }
+            Some(metadata) if metadata.len() <= expected => Ok(metadata.len()),
             _ => Ok(0),
         }
     }
@@ -226,18 +231,33 @@ impl Partial {
         let path = self.parent()?.join(&self.filename);
         let mut opts = OpenOptions::new();
         opts.write(true);
-        let file = if regular(&path)?.is_some() {
+        let mut file = if regular(&path)?.is_some() {
             opts.open(&path)?
         } else if offset == 0 {
-            opts.create_new(true).open(&path)?
+            opts.clone().create_new(true).open(&path)?
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Incomplete file disappeared",
             ));
         };
-        let metadata = verify(&file, &path)?;
-        ensure_unlinked(&metadata)?;
+        let mut metadata = verify(&file, &path)?;
+        if hard_linked(&metadata) {
+            // Never write through another name: unlink ours and start over.
+            drop(file);
+            unlink_partial(&path)?;
+            if offset != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Incomplete file was hard-linked and has been discarded",
+                ));
+            }
+            file = opts.create_new(true).open(&path)?;
+            metadata = verify(&file, &path)?;
+            if hard_linked(&metadata) {
+                return Err(io::Error::other("Incomplete file is hard-linked"));
+            }
+        }
         if offset == 0 {
             file.set_len(0)?;
         } else if metadata.len() != offset {
@@ -257,7 +277,9 @@ impl Partial {
         let from_dir = self.parent()?;
         let source = from_dir.join(&self.filename);
         let mut file = open_shared(&source, size)?;
-        ensure_unlinked(&file.metadata()?)?;
+        if hard_linked(&file.metadata()?) {
+            return Err(io::Error::other("Incomplete file is hard-linked"));
+        }
         let destination = confined_directory(root, subdirectory, mode)?;
         set_file_mode(&file, mode)?;
         let mut candidate = destination.join(&self.filename);
@@ -265,6 +287,9 @@ impl Partial {
             return Ok(source);
         }
         let mut staged = None;
+        // Set once the destination filesystem refuses hard links (exFAT, vfat,
+        // CIFS, some FUSE); later attempts use an exclusive-create rename.
+        let mut link_unsupported = false;
         let mut last_tick = 0_i128;
         loop {
             let input = staged
@@ -272,16 +297,35 @@ impl Partial {
                 .map_or(source.as_path(), |file: &Staged| file.0.as_path());
             let result = if overwrite {
                 fs::rename(input, &candidate)
+            } else if link_unsupported {
+                rename_noreplace(input, &candidate)
             } else {
                 fs::hard_link(input, &candidate)
             };
             match result {
                 Ok(()) => {
-                    if !overwrite || staged.is_some() {
-                        fs::remove_file(&source)?;
+                    let source_moved = staged.is_none() && (overwrite || link_unsupported);
+                    if !source_moved && let Err(error) = fs::remove_file(&source) {
+                        // The download is already installed; a stale partial
+                        // is discarded by the next `offset`/`open`.
+                        tracing::warn!(
+                            source = %source.display(),
+                            %error,
+                            "failed to remove incomplete file after install",
+                        );
                     }
                     let _ = fs::remove_dir(&from_dir);
                     return Ok(candidate);
+                }
+                Err(error)
+                    if !overwrite
+                        && !link_unsupported
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+                        ) =>
+                {
+                    link_unsupported = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::CrossesDevices && staged.is_none() => {
                     staged = Some(Staged::copy(&mut file, &destination, mode)?);
@@ -435,17 +479,46 @@ fn verify(file: &File, path: &Path) -> io::Result<fs::Metadata> {
     Ok(actual)
 }
 
-fn ensure_unlinked(metadata: &fs::Metadata) -> io::Result<()> {
+fn hard_linked(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(io::Error::other("Incomplete file is hard-linked"));
-        }
+        metadata.nlink() != 1
     }
     #[cfg(not(unix))]
-    let _ = metadata;
-    Ok(())
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn unlink_partial(path: &Path) -> io::Result<()> {
+    tracing::warn!(
+        path = %path.display(),
+        "discarding hard-linked incomplete file",
+    );
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Moves `from` to `to` without replacing an existing `to`, for filesystems
+/// that cannot hard-link. The name is reserved with an exclusive create (which
+/// does not follow symlinks), then the source is renamed over our own
+/// placeholder. Fails with `AlreadyExists` when `to` is taken.
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(to)?);
+    fs::rename(from, to).inspect_err(|_| {
+        let _ = fs::remove_file(to);
+    })
 }
 
 fn set_file_mode(file: &File, mode: Option<u32>) -> io::Result<()> {
@@ -597,7 +670,62 @@ mod tests {
         assert_eq!(outside.read_dir().unwrap().count(), 0);
         let file = part.parent().unwrap().join(&part.filename);
         fs::hard_link(&file, outside.join("link")).unwrap();
-        assert!(part.open(0).is_err());
-        assert_eq!(fs::read(file).unwrap(), b"abc");
+        // A hard-linked partial is discarded, never written through.
+        part.open(0).unwrap().write_all(b"xyz").unwrap();
+        assert_eq!(fs::read(outside.join("link")).unwrap(), b"abc");
+        assert_eq!(fs::read(&file).unwrap(), b"xyz");
+
+        fs::hard_link(&file, outside.join("link2")).unwrap();
+        assert_eq!(part.offset(true, 3).unwrap(), 0);
+        assert!(!file.exists());
+        assert_eq!(fs::read(outside.join("link2")).unwrap(), b"xyz");
+    }
+
+    #[test]
+    fn rename_noreplace_never_clobbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        fs::write(&from, b"new").unwrap();
+        fs::write(&to, b"existing").unwrap();
+        let error = rename_noreplace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&from).unwrap(), b"new");
+        assert_eq!(fs::read(&to).unwrap(), b"existing");
+
+        let fresh = tmp.path().join("fresh");
+        rename_noreplace(&from, &fresh).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&fresh).unwrap(), b"new");
+
+        // A failed rename releases the reserved name.
+        let missing = tmp.path().join("missing");
+        let target = tmp.path().join("target");
+        assert!(rename_noreplace(&missing, &target).is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_succeeds_when_partial_cannot_be_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("downloads");
+        let part = Partial::new(tmp.path().join("partial"), "peer", "song.flac", 3);
+        part.open(0).unwrap().write_all(b"abc").unwrap();
+        let from_dir = part.parent().unwrap();
+        let source = from_dir.join(&part.filename);
+        fs::set_permissions(&from_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let installed = part.finish(&root, Path::new(""), 3, false, None);
+        fs::set_permissions(&from_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let installed = installed.unwrap();
+        assert_eq!(fs::read(&installed).unwrap(), b"abc");
+        // Root ignores directory permissions, so the source may be gone.
+        if source.exists() {
+            assert_eq!(part.offset(true, 3).unwrap(), 0);
+            assert!(!source.exists());
+            assert_eq!(fs::read(&installed).unwrap(), b"abc");
+        }
     }
 }

@@ -580,7 +580,11 @@ impl AppState {
                 || initial_web.https != web.https
                 || initial_web.url_base != web.url_base
                 || initial_web.content_path != web.content_path
-                || initial_web.logging != web.logging;
+                || initial_web.logging != web.logging
+                // Auth::update reloads credentials and API keys only, as slskd marks these
+                // [RequiresRestart].
+                || initial_web.authentication.disabled != web.authentication.disabled
+                || initial_web.authentication.jwt != web.authentication.jwt;
             self.state.update(|state| {
                 state.pending_reconnect |=
                     reconnect || (state.server.is_connected && credentials_changed);

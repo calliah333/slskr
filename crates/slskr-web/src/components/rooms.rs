@@ -1,13 +1,18 @@
 use crate::{config, services::util};
+use leptos::{html, prelude::*};
 use leptos_router::{
     NavigateOptions,
     components::A,
     hooks::{use_navigate, use_url},
 };
+use slskr_api::rooms::{RoomMessage, UserData};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use wasm_bindgen_futures::spawn_local;
+
+mod join;
 
 fn stored_room() -> String {
     web_sys::window()
@@ -16,11 +21,11 @@ fn stored_room() -> String {
         .unwrap_or_default()
 }
 
-use leptos::prelude::*;
-use slskr_api::rooms::{RoomMessage, UserData};
-use wasm_bindgen_futures::spawn_local;
-
-mod join;
+fn set_if_changed<T: PartialEq + Send + Sync + 'static>(signal: RwSignal<T>, value: T) {
+    if signal.try_with_untracked(|current| *current != value) == Some(true) {
+        let _ = signal.try_set(value);
+    }
+}
 
 #[component]
 pub fn Rooms() -> impl IntoView {
@@ -37,55 +42,103 @@ pub fn Rooms() -> impl IntoView {
     let users = RwSignal::new(Vec::<UserData>::new());
     let draft = RwSignal::new(String::new());
     let ticker = RwSignal::new(String::new());
+    // The room whose ticker was last loaded; the ticker is fetched only on room change so
+    // polling never overwrites what the user is typing.
+    let ticker_room = RwSignal::new(None::<String>);
+    // Errors from user actions persist until the next action; polling errors are
+    // tracked separately and cleared once polling succeeds again.
     let error = RwSignal::new(None::<String>);
+    let poll_error = RwSignal::new(None::<String>);
+    let generation = RwSignal::new(0u64);
+    let in_flight = RwSignal::new(false);
     let alive = Arc::new(AtomicBool::new(true));
     let poll_alive = Arc::clone(&alive);
 
     let refresh = move || {
+        let ticket = generation.get_untracked().wrapping_add(1);
+        generation.set(ticket);
+        in_flight.set(true);
+        // A newer refresh supersedes this one; its results are dropped.
+        let current = move || generation.try_get_untracked() == Some(ticket);
+        // Only the latest refresh owns the in-flight flag.
+        let finish = move || {
+            if current() {
+                let _ = in_flight.try_set(false);
+            }
+        };
         spawn_local(async move {
             let response = crate::services::api::get::<Vec<String>>("/rooms/joined").await;
-            let Some(active_name) = active.try_get_untracked() else {
+            let Some(active_name) = active.try_get_untracked().filter(|_| current()) else {
                 return;
             };
-            match response {
-                Ok(rooms) => {
-                    let selected = if rooms.contains(&active_name) {
-                        active_name
-                    } else {
-                        let first = rooms.first().cloned().unwrap_or_default();
-                        if first != active_name {
-                            active.set(first.clone());
-                        }
-                        first
-                    };
-                    joined.set(rooms);
-                    if !selected.is_empty() {
-                        let encoded = crate::services::util::encode_uri_component(&selected);
-                        let messages_path = format!("/rooms/joined/{encoded}/messages");
-                        let users_path = format!("/rooms/joined/{encoded}/users");
-                        match crate::services::api::get::<Vec<RoomMessage>>(&messages_path).await {
-                            Ok(value) => messages.set(value),
-                            Err(e) => error.set(Some(e.to_string())),
-                        }
-                        match crate::services::api::get::<Vec<UserData>>(&users_path).await {
-                            Ok(value) => users.set(value),
-                            Err(e) => error.set(Some(e.to_string())),
-                        }
-                        if let Ok(value) = crate::services::api::get::<String>(&format!(
-                            "/rooms/joined/{encoded}/ticker"
-                        ))
-                        .await
-                        {
-                            ticker.set(value);
-                        }
-                    } else {
-                        messages.set(Vec::new());
-                        users.set(Vec::new());
-                    }
-                    error.set(None);
+            let rooms = match response {
+                Ok(rooms) => rooms,
+                Err(e) => {
+                    set_if_changed(poll_error, Some(e.to_string()));
+                    finish();
+                    return;
                 }
-                Err(e) => error.set(Some(e.to_string())),
+            };
+            let selected = if rooms.contains(&active_name) {
+                active_name
+            } else {
+                let first = rooms.first().cloned().unwrap_or_default();
+                if first != active_name {
+                    let _ = active.try_set(first.clone());
+                }
+                first
+            };
+            set_if_changed(joined, rooms);
+            let mut problem = None;
+            if selected.is_empty() {
+                set_if_changed(messages, Vec::new());
+                set_if_changed(users, Vec::new());
+            } else {
+                let encoded = util::encode_uri_component(&selected);
+                // Responses for a room that is no longer active must not replace its view.
+                let still_active =
+                    || current() && active.try_get_untracked().as_deref() == Some(&selected);
+                let value = crate::services::api::get::<Vec<RoomMessage>>(&format!(
+                    "/rooms/joined/{encoded}/messages"
+                ))
+                .await;
+                if !still_active() {
+                    finish();
+                    return;
+                }
+                match value {
+                    Ok(value) => set_if_changed(messages, value),
+                    Err(e) => problem = Some(e.to_string()),
+                }
+                let value = crate::services::api::get::<Vec<UserData>>(&format!(
+                    "/rooms/joined/{encoded}/users"
+                ))
+                .await;
+                if !still_active() {
+                    finish();
+                    return;
+                }
+                match value {
+                    Ok(value) => set_if_changed(users, value),
+                    Err(e) => problem = Some(e.to_string()),
+                }
+                if ticker_room.try_with_untracked(|room| room.as_deref() != Some(&selected))
+                    == Some(true)
+                {
+                    let value = crate::services::api::get::<String>(&format!(
+                        "/rooms/joined/{encoded}/ticker"
+                    ))
+                    .await;
+                    if !still_active() {
+                        finish();
+                        return;
+                    }
+                    let _ = ticker.try_set(value.unwrap_or_default());
+                    let _ = ticker_room.try_set(Some(selected));
+                }
             }
+            set_if_changed(poll_error, problem);
+            finish();
         });
     };
 
@@ -93,7 +146,8 @@ pub fn Rooms() -> impl IntoView {
     spawn_local(async move {
         while poll_alive.load(Ordering::Relaxed) {
             crate::services::util::sleep(1_000).await;
-            if poll_alive.load(Ordering::Relaxed) {
+            // Skip ticks while a refresh is still outstanding so polls never overlap.
+            if poll_alive.load(Ordering::Relaxed) && in_flight.try_get_untracked() == Some(false) {
                 refresh();
             }
         }
@@ -101,7 +155,13 @@ pub fn Rooms() -> impl IntoView {
     on_cleanup(move || alive.store(false, Ordering::Relaxed));
 
     let select_room = Callback::new(move |name: String| {
+        if active.get_untracked() != name {
+            messages.set(Vec::new());
+            users.set(Vec::new());
+            ticker.set(String::new());
+        }
         active.set(name.clone());
+        error.set(None);
         let encoded = util::encode_uri_component(&name);
         if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
             let _ = storage.set_item("slskr.activeRoom", &name);
@@ -123,15 +183,19 @@ pub fn Rooms() -> impl IntoView {
             return;
         }
         draft.set(String::new());
+        error.set(None);
         spawn_local(async move {
             let path = format!(
                 "/rooms/joined/{}/messages",
                 crate::services::util::encode_uri_component(&room)
             );
             if let Err(e) = crate::services::api::post_text(&path, &text).await {
-                error.set(Some(e.to_string()));
+                let _ = error.try_set(Some(e.to_string()));
             }
-            refresh();
+            // Refresh only while the component (and its signals) is still alive.
+            if generation.try_get_untracked().is_some() {
+                refresh();
+            }
         });
     };
     let set_ticker = move |_| {
@@ -140,13 +204,14 @@ pub fn Rooms() -> impl IntoView {
         if room.is_empty() {
             return;
         }
+        error.set(None);
         spawn_local(async move {
             let path = format!(
                 "/rooms/joined/{}/ticker",
                 crate::services::util::encode_uri_component(&room)
             );
             if let Err(e) = crate::services::api::post_text(&path, &text).await {
-                error.set(Some(e.to_string()));
+                let _ = error.try_set(Some(e.to_string()));
             }
         });
     };
@@ -156,6 +221,7 @@ pub fn Rooms() -> impl IntoView {
         if name.is_empty() {
             return;
         }
+        error.set(None);
         spawn_local(async move {
             let path = format!(
                 "/rooms/joined/{}",
@@ -165,13 +231,30 @@ pub fn Rooms() -> impl IntoView {
                 .await
             {
                 Ok(_) => {
-                    active.set(String::new());
-                    refresh();
+                    if active.try_set(String::new()).is_none() {
+                        refresh();
+                    }
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(e) => {
+                    let _ = error.try_set(Some(e.to_string()));
+                }
             }
         });
     };
+    let anchor = NodeRef::<html::Div>::new();
+    // Scroll to the newest message when the history grows or the room changes
+    // (upstream Rooms.jsx scrolls the list's last child into view).
+    let scrolled_to = StoredValue::new(None::<Option<RoomMessage>>);
+    Effect::new(move |_| {
+        let last = messages.with(|m| m.last().cloned());
+        if let Some(anchor) = anchor.get()
+            && scrolled_to.with_value(|s| s.as_ref() != Some(&last))
+        {
+            scrolled_to.set_value(Some(last));
+            anchor.scroll_into_view();
+        }
+    });
+    let shown_error = move || error.get().or_else(|| poll_error.get());
     view! {
         <section class="rooms">
             <nav class="room-menu">
@@ -182,8 +265,8 @@ pub fn Rooms() -> impl IntoView {
                 }/>
                 <join::RoomJoin on_join=select_room/>
             </nav>
-            <Show when=move || error.get().is_some()>
-                <p class="error">{move || error.get().unwrap_or_default()}</p>
+            <Show when=move || shown_error().is_some()>
+                <p class="error">{move || shown_error().unwrap_or_default()}</p>
             </Show>
             <Show when=move || !active.get().is_empty() fallback=|| view! { <p class="placeholder-segment">"Join a room to start chatting."</p> }>
                 <div class="room-active-card">
@@ -196,7 +279,7 @@ pub fn Rooms() -> impl IntoView {
                                 <span class="room-message-name">{message.username} ": "</span><span>{message.message}</span>
                             </div> }
                         }/>
-                        <div id="room-history-scroll-anchor"></div>
+                        <div id="room-history-scroll-anchor" node_ref=anchor></div>
                     </div>
                     <form class="room-input" on:submit=move |ev| { ev.prevent_default(); send(()); }>
                         <input id="room-message-input" prop:value=move || draft.get() on:input=move |ev| draft.set(event_target_value(&ev)) placeholder="Message room"/>

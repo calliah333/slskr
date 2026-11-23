@@ -112,6 +112,8 @@ pub fn Dashboard() -> impl IntoView {
     let tab = RwSignal::new(0_usize);
     let pareto_direction = RwSignal::new("All".to_owned());
     let recent_direction = RwSignal::new("All".to_owned());
+    // Bumped per load so a slow response for an earlier period cannot overwrite a newer one.
+    let generation = StoredValue::new(0_u64);
 
     Effect::new(move |_| {
         let selected = PERIODS[period.get()];
@@ -122,6 +124,8 @@ pub fn Dashboard() -> impl IntoView {
             .unwrap_or_else(|| DateTimeEpoch::value());
         let start_text = start.to_rfc3339();
         let end_text = end.to_rfc3339();
+        let current = generation.get_value().wrapping_add(1);
+        generation.set_value(current);
         loading.set(true);
         load_error.set(None);
         spawn_local(async move {
@@ -147,6 +151,10 @@ pub fn Dashboard() -> impl IntoView {
                 reports::errors(&start_text, &end_text, "Download"),
             )
             .await;
+            // Period changed or page unmounted while loading: drop the stale result.
+            if generation.try_get_value() != Some(current) {
+                return;
+            }
             let failed = [
                 summary.is_err(),
                 histogram.is_err(),
@@ -160,7 +168,7 @@ pub fn Dashboard() -> impl IntoView {
             ]
             .into_iter()
             .any(|failed| failed);
-            data.set(DashboardData {
+            let _ = data.try_set(DashboardData {
                 summary: summary.unwrap_or_default(),
                 histogram: histogram.unwrap_or_default(),
                 uploads: uploads.unwrap_or_default(),
@@ -172,9 +180,10 @@ pub fn Dashboard() -> impl IntoView {
                 download_errors: download_errors.unwrap_or_default(),
             });
             if failed {
-                load_error.set(Some("Some dashboard reports could not be loaded.".into()));
+                let _ =
+                    load_error.try_set(Some("Some dashboard reports could not be loaded.".into()));
             }
-            loading.set(false);
+            let _ = loading.try_set(false);
         });
     });
 
@@ -317,17 +326,8 @@ where
     H: Future,
     I: Future,
 {
-    (
-        a.await,
-        b.await,
-        c.await,
-        d.await,
-        e.await,
-        f.await,
-        g.await,
-        h.await,
-        i.await,
-    )
+    // Concurrently, not one request after another.
+    futures::join!(a, b, c, d, e, f, g, h, i)
 }
 
 struct DateTimeEpoch;

@@ -9,7 +9,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -504,11 +504,29 @@ pub fn routes() -> Router<AppState> {
         .route("/users/{username}/endpoint", get(endpoint))
         .route("/users/{username}/directory", post(directory))
 }
+/// Upstream rejects every `/users` action in relay-agent mode and hides
+/// blacklisted peers from network lookups.
+fn ensure_available(app: &AppState) -> ApiResult<()> {
+    if app.services.relay.is_agent() {
+        return Err(ApiError::Forbidden(String::new()));
+    }
+    Ok(())
+}
+
+fn ensure_lookup(app: &AppState, username: &str) -> ApiResult<()> {
+    ensure_available(app)?;
+    if app.services.users.is_blacklisted(username, None) {
+        return Err(ApiError::NotFound(String::new()));
+    }
+    Ok(())
+}
+
 async fn browse(
-    _: Authenticated,
+    _: RequireReadWrite,
     State(s): State<AppState>,
     Path(u): Path<String>,
 ) -> ApiResult<Response> {
+    ensure_lookup(&s, &u)?;
     let response = s.services.users.browse_peer(&u).await?;
     Ok(Json(response.as_ref()).into_response())
 }
@@ -518,6 +536,7 @@ async fn browse_status(
     State(s): State<AppState>,
     Path(u): Path<String>,
 ) -> ApiResult<Json<BrowseStatus>> {
+    ensure_available(&s)?;
     s.services
         .users
         .browse_status(&u)
@@ -526,19 +545,21 @@ async fn browse_status(
 }
 
 async fn info(
-    _: Authenticated,
+    _: RequireReadWrite,
     State(s): State<AppState>,
     Path(u): Path<String>,
 ) -> ApiResult<Response> {
+    ensure_lookup(&s, &u)?;
     let response = s.services.users.info(&u).await?;
     Ok(Json(response.as_ref()).into_response())
 }
 
 async fn status(
-    _: Authenticated,
+    _: RequireReadWrite,
     State(s): State<AppState>,
     Path(u): Path<String>,
 ) -> ApiResult<Json<Status>> {
+    ensure_lookup(&s, &u)?;
     Ok(Json(s.services.users.status(&u).await?))
 }
 
@@ -547,14 +568,16 @@ async fn statistics(
     State(s): State<AppState>,
     Path(u): Path<String>,
 ) -> ApiResult<Json<Statistics>> {
+    ensure_lookup(&s, &u)?;
     Ok(Json(s.services.users.statistics(&u).await?))
 }
 
 async fn endpoint(
-    _: Authenticated,
+    _: RequireReadWrite,
     State(s): State<AppState>,
     Path(u): Path<String>,
 ) -> ApiResult<Json<Endpoint>> {
+    ensure_lookup(&s, &u)?;
     Ok(Json(Endpoint::from_socket_addr(
         s.core.client.get_user_endpoint(&u).await?,
     )))
@@ -564,12 +587,18 @@ async fn directory(
     _: RequireReadWrite,
     State(s): State<AppState>,
     Path(u): Path<String>,
-    Json(q): Json<DirectoryContentsRequest>,
+    body: Result<Json<DirectoryContentsRequest>, JsonRejection>,
 ) -> ApiResult<Json<Vec<Directory>>> {
+    ensure_available(&s)?;
+    let directory = match body {
+        Ok(Json(q)) if !q.directory.is_empty() => q.directory,
+        _ => return Err(ApiError::BadRequest(String::new())),
+    };
+    ensure_lookup(&s, &u)?;
     let dirs = s
         .core
         .client
-        .get_directory_contents(&u, &q.directory, None, s.core.shutdown.child_token())
+        .get_directory_contents(&u, &directory, None, s.core.shutdown.child_token())
         .await?;
     Ok(Json(dirs.into_iter().map(convert_directory).collect()))
 }

@@ -97,9 +97,10 @@ impl OptionsStore {
 
     pub fn validate_yaml(yaml: &str) -> Option<String> {
         (|| -> Result<()> {
+            ensure_document(yaml)?;
             let mut values = options_mapping(&Options::default());
             merge(&mut values, parse_document(yaml)?);
-            validate(&serde_yaml::from_value(Value::Mapping(values))?)
+            validate(&typed(values)?)
         })()
         .err()
         .map(|e| e.to_string())
@@ -113,6 +114,7 @@ impl OptionsStore {
 
     async fn write_yaml(&self, yaml: &str) -> Result<()> {
         let inner = &self.0;
+        ensure_document(yaml)?;
         let _guard = inner.disk.lock().await;
         let options = inner.resolve(Some(yaml))?;
         if let Some(previous) = read_optional(&inner.path).await? {
@@ -177,8 +179,7 @@ impl Inner {
                 let keys = path.iter().map(String::as_str).collect::<Vec<_>>();
                 insert(&mut root, &keys, value.clone());
             }
-            let mut options: Options =
-                serde_yaml::from_value(Value::Mapping(root)).expect("typed overlay");
+            let mut options = typed(root).expect("typed overlay");
             options
                 .app_directory
                 .clone_from(&current.base.app_directory);
@@ -287,7 +288,7 @@ fn resolve(
         merge(&mut result, parse_document(yaml)?);
     }
     merge(&mut result, cli.clone());
-    let mut options: Options = serde_yaml::from_value(Value::Mapping(result))?;
+    let mut options = typed(result)?;
     options.app_directory = dir.to_owned();
     options.configuration_file = path.to_string_lossy().into_owned();
     validate(&options)?;
@@ -301,6 +302,209 @@ fn parse_document(yaml: &str) -> Result<Mapping> {
         Value::Null => Ok(Mapping::new()),
         Value::Mapping(values) => Ok(values),
         _ => Err(anyhow!("configuration must be a YAML mapping")),
+    }
+}
+
+/// A document sent to replace slskd.yml must not be blank (e.g. an emptied editor).
+fn ensure_document(yaml: &str) -> Result<()> {
+    ensure!(
+        !yaml.trim().is_empty(),
+        "configuration document may not be empty"
+    );
+    Ok(())
+}
+
+/// Binds merged configuration values to `Options` like the .NET configuration binder,
+/// which sees every scalar as text, and normalizes `web.url_base` like slskd startup.
+fn typed(values: Mapping) -> Result<Options, serde_yaml::Error> {
+    use serde::Deserialize;
+    let mut options = Options::deserialize(Lenient(Value::Mapping(values)))?;
+    if !options.web.url_base.starts_with('/') {
+        options.web.url_base.insert(0, '/');
+    }
+    Ok(options)
+}
+
+/// `serde_yaml::Value` deserializer that accepts YAML numbers and booleans for string
+/// fields (`password: 12345678`) and numeric or boolean strings for typed scalars.
+struct Lenient(Value);
+
+impl<'de> serde::de::IntoDeserializer<'de, serde_yaml::Error> for Lenient {
+    type Deserializer = Self;
+
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+
+macro_rules! lenient_parse {
+    ($($method:ident: $ty:ty),* $(,)?) => {$(
+        fn $method<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            use serde::de::IntoDeserializer;
+            if let Value::String(text) = &self.0
+                && let Ok(value) = text.trim().parse::<$ty>()
+            {
+                return IntoDeserializer::<Self::Error>::into_deserializer(value)
+                    .deserialize_any(visitor);
+            }
+            self.0.$method(visitor)
+        }
+    )*};
+}
+
+macro_rules! lenient_delegate {
+    ($($method:ident),* $(,)?) => {$(
+        fn $method<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            self.0.$method(visitor)
+        }
+    )*};
+}
+
+impl<'de> serde::Deserializer<'de> for Lenient {
+    type Error = serde_yaml::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        use serde::de::value::{MapDeserializer, SeqDeserializer};
+        match self.0 {
+            Value::Sequence(items) => {
+                let mut items = SeqDeserializer::new(items.into_iter().map(Lenient));
+                let value = visitor.visit_seq(&mut items)?;
+                items.end()?;
+                Ok(value)
+            }
+            Value::Mapping(entries) => {
+                let mut entries = MapDeserializer::new(
+                    entries.into_iter().map(|(k, v)| (Lenient(k), Lenient(v))),
+                );
+                let value = visitor.visit_map(&mut entries)?;
+                entries.end()?;
+                Ok(value)
+            }
+            other => other.deserialize_any(visitor),
+        }
+    }
+
+    fn deserialize_str<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_string(visitor)
+    }
+
+    fn deserialize_string<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            Value::Bool(value) => visitor.visit_string(value.to_string()),
+            Value::Number(value) => visitor.visit_string(value.to_string()),
+            other => other.deserialize_string(visitor),
+        }
+    }
+
+    fn deserialize_bool<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        if let Value::String(text) = &self.0 {
+            let text = text.trim();
+            if text.eq_ignore_ascii_case("true") {
+                return visitor.visit_bool(true);
+            }
+            if text.eq_ignore_ascii_case("false") {
+                return visitor.visit_bool(false);
+            }
+        }
+        self.0.deserialize_bool(visitor)
+    }
+
+    lenient_parse! {
+        deserialize_i8: i8, deserialize_i16: i16, deserialize_i32: i32, deserialize_i64: i64,
+        deserialize_u8: u8, deserialize_u16: u16, deserialize_u32: u32, deserialize_u64: u64,
+        deserialize_f32: f32, deserialize_f64: f64,
+    }
+
+    lenient_delegate! {
+        deserialize_char, deserialize_bytes, deserialize_byte_buf, deserialize_unit,
+        deserialize_identifier, deserialize_ignored_any,
+    }
+
+    fn deserialize_option<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            Value::Null => visitor.visit_none(),
+            other => visitor.visit_some(Lenient(other)),
+        }
+    }
+
+    fn deserialize_unit_struct<V: serde::de::Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_unit_struct(name, visitor)
+    }
+
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_seq<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_tuple<V: serde::de::Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_tuple_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_map<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_enum(name, variants, visitor)
     }
 }
 
@@ -1304,11 +1508,23 @@ fn validate(options: &Options) -> Result<()> {
         auth.disabled || (!auth.username.trim().is_empty() && !auth.password.trim().is_empty()),
         "web authentication username and password may not be blank"
     );
+    // slskd: [StringLength(255, MinimumLength = 32)] Key (generated when unset here),
+    // [Range(3600000, int.MaxValue)] Ttl, API keys between 16 and 255 characters.
     ensure!(
-        auth.jwt.ttl > 0,
-        "web.authentication.jwt.ttl must be positive"
+        auth.jwt.key.is_empty() || (32..=255).contains(&auth.jwt.key.chars().count()),
+        "web.authentication.jwt.key must be between 32 and 255 characters"
     );
-    auth_keys(options)?;
+    ensure!(
+        auth.jwt.ttl >= 3_600_000,
+        "web.authentication.jwt.ttl must be at least 3600000 milliseconds"
+    );
+    for key in auth_keys(options)? {
+        ensure!(
+            (16..=255).contains(&key.key.chars().count()),
+            "API key {} must be between 16 and 255 characters",
+            key.name
+        );
+    }
     ensure!(
         !options.soulseek.address.trim().is_empty(),
         "soulseek.address may not be blank"
@@ -1486,4 +1702,62 @@ pub(crate) fn client_patch(old: &ClientOptions, options: &Options) -> Result<Cli
         distributed_connection_options: changed!(distributed_connection_options),
         ..ClientOptionsPatch::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve_yaml(yaml: &str, cli: &Mapping) -> Result<Options> {
+        let defaults = options_mapping(&Options::default());
+        resolve(
+            &defaults,
+            Some(yaml),
+            cli,
+            "/app",
+            Path::new("/app/slskd.yml"),
+        )
+    }
+
+    #[test]
+    fn scalars_bind_to_string_fields_like_the_dotnet_binder() {
+        let options = resolve_yaml(
+            "soulseek:\n  username: 1234\n  password: 12345678\nweb:\n  port: \"5031\"\n  authentication:\n    password: true\n",
+            &Mapping::new(),
+        )
+        .unwrap();
+        assert_eq!(options.soulseek.username.as_deref(), Some("1234"));
+        assert_eq!(options.soulseek.password.as_deref(), Some("12345678"));
+        assert_eq!(options.web.port, 5031);
+        assert_eq!(options.web.authentication.password, "true");
+
+        let mut cli = Mapping::new();
+        cli_assignment(&mut cli, "soulseek.password=87654321").unwrap();
+        cli_assignment(&mut cli, "web.url_base=client").unwrap();
+        let options = resolve_yaml("", &cli).unwrap();
+        assert_eq!(options.soulseek.password.as_deref(), Some("87654321"));
+        assert_eq!(options.web.url_base, "/client");
+    }
+
+    #[test]
+    fn authentication_limits_match_slskd() {
+        let cli = Mapping::new();
+        let auth = |body: &str| resolve_yaml(&format!("web:\n  authentication:\n{body}"), &cli);
+        assert!(auth("    jwt:\n      key: short\n").is_err());
+        assert!(auth(&format!("    jwt:\n      key: {}\n", "k".repeat(32))).is_ok());
+        assert!(auth(&format!("    jwt:\n      key: {}\n", "k".repeat(256))).is_err());
+        assert!(auth("    jwt:\n      ttl: 3599999\n").is_err());
+        assert!(auth("    jwt:\n      ttl: 3600000\n").is_ok());
+        assert!(auth("    api_key: too-short\n").is_err());
+        assert!(auth("    api_key: role=readonly;cidr=10.0.0.0/8;0123456789abcdef\n").is_ok());
+        assert!(auth("    api_keys:\n      bot:\n        key: short\n").is_err());
+        assert!(auth("    api_keys:\n      bot:\n        key: 0123456789abcdef\n").is_ok());
+    }
+
+    #[test]
+    fn blank_documents_are_refused() {
+        assert!(OptionsStore::validate_yaml("").is_some());
+        assert!(OptionsStore::validate_yaml("  \n\t\n").is_some());
+        assert!(OptionsStore::validate_yaml("web:\n  port: 5030\n").is_none());
+    }
 }

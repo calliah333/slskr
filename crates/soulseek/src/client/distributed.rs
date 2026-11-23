@@ -37,7 +37,6 @@ struct State {
     // These notifications may precede the login response.
     candidates: Vec<NetInfoParent>,
     candidate_revision: u64,
-    search_timeout: Option<Duration>,
     parent_idle: Option<Duration>,
     ping_interval: Option<Duration>,
 }
@@ -429,9 +428,8 @@ impl DistributedManager {
                     Self::start_scope(&mut state, client, &client.options(), true);
                 }
             }
-            ServerIncoming::SearchInactivityTimeout(seconds) => {
-                state.search_timeout = duration(*seconds)
-            }
+            // Upstream does not use it; parent candidates wait the message timeout.
+            ServerIncoming::SearchInactivityTimeout(_) => {}
             ServerIncoming::ParentInactivityTimeout(seconds) => {
                 state.parent_idle = duration(*seconds);
                 Self::update_parent_timers(&state);
@@ -585,9 +583,9 @@ impl DistributedManager {
             return;
         }
         scope.selecting_parent = true;
-        let wait = state
-            .search_timeout
-            .unwrap_or_else(|| client.options().message_timeout);
+        // Upstream waits for a candidate's branch info and first search with the
+        // waiter's default (message) timeout.
+        let wait = client.options().message_timeout;
         tokio::spawn(select_parent(
             scope.client.clone(),
             scope.stop.clone(),

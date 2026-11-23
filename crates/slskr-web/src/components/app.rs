@@ -411,8 +411,24 @@ fn AppShell(
 
 #[component]
 fn NavLink(path: &'static str, icon: &'static str, label: &'static str) -> impl IntoView {
-    let href = format!("{}{path}", config::url_base().trim_end_matches('/'));
-    view! { <A href=href attr:class="item"><i class=icon aria-hidden="true"></i>{label}</A> }
+    let base = config::url_base().trim_end_matches('/').to_owned();
+    let href = format!("{base}{path}");
+    let location = leptos_router::hooks::use_location();
+    // The vendored CSS styles `.active.item`; `<A>` alone only sets `aria-current`.
+    let class = move || {
+        location.pathname.with(|current| {
+            let current = current
+                .strip_prefix(base.as_str())
+                .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+                .unwrap_or(current);
+            let active = current == path
+                || current
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'));
+            if active { "active item" } else { "item" }
+        })
+    };
+    view! { <A href=href attr:class=class><i class=icon aria-hidden="true"></i>{label}</A> }
 }
 
 #[component]

@@ -388,24 +388,6 @@ impl PeerManager {
         cancellable(cancel, conn.send(frame)).await
     }
 
-    /// Looks up an existing source socket, not its user's replacement in the cache.
-    /// Intended for transfer messages whose dispatch hook takes a remote endpoint.
-    pub(crate) fn message_connection_at(
-        &self,
-        username: &str,
-        remote: SocketAddr,
-    ) -> Option<MessageConnection> {
-        let state = self.lock();
-        let sockets = state.sockets.get(username)?;
-        let mut matching = sockets
-            .cached
-            .iter()
-            .chain(&sockets.uncached)
-            .filter(|conn| !conn.is_closed() && conn.remote() == remote);
-        let conn = matching.next()?;
-        matching.next().is_none().then(|| conn.clone())
-    }
-
     pub(crate) fn handle_incoming_peer_init(
         &self,
         client: &SoulseekClient,
@@ -638,7 +620,9 @@ impl PeerManager {
         conn: Connection,
         supersede: bool,
     ) {
-        let (conn, incoming) = MessageConnection::spawn(conn, Some(username.clone()));
+        let (observer, tracking) = peer_handler::observer(client, &username);
+        let (conn, incoming) =
+            MessageConnection::spawn_observed(conn, Some(username.clone()), Some(observer));
         let sockets = state.sockets.entry(username.clone()).or_default();
         if supersede || sockets.cached().is_none() {
             sockets.uncache();
@@ -653,7 +637,14 @@ impl PeerManager {
                 .expect("installed peer socket")
                 .clone())));
         }
-        peer_handler::spawn(client, username, conn, incoming, state.session.clone());
+        peer_handler::spawn(
+            client,
+            username,
+            conn,
+            incoming,
+            state.session.clone(),
+            tracking,
+        );
     }
 
     pub(super) fn forget_message(&self, username: &str, id: u64) {
@@ -733,7 +724,7 @@ async fn request<T: Send + 'static>(
     client: &SoulseekClient,
     username: &str,
     message: Bytes,
-    key: impl FnOnce(u64) -> WaitKey,
+    key: WaitKey,
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<T> {
@@ -743,7 +734,8 @@ async fn request<T: Send + 'static>(
         .get_message_connection(client, username, cancel)
         .await?;
     cancellable(cancel, async {
-        let response = client.inner().waiter.wait_indefinitely(key(conn.id()));
+        // Keyed by user: the reply may arrive on any of the user's connections.
+        let response = client.inner().waiter.wait_indefinitely(key);
         conn.send(message).await?;
         tokio::time::timeout(timeout, response).await?
     })
@@ -761,8 +753,11 @@ impl SoulseekClient {
     /// Fetches the share list of `username`.
     ///
     /// Sends BrowseRequest over the peer message connection, then waits up to
-    /// [`BrowseOptions::response_timeout`] for the complete response.
-    /// The framed transport reports [`Event::BrowseProgressUpdated`] upon completion.
+    /// [`BrowseOptions::response_timeout`] for the response to start arriving (on any
+    /// of the user's connections), and then until it is complete or that connection
+    /// closes (bounded by the connection's inactivity timeout).
+    /// [`Event::BrowseProgressUpdated`] is raised while the response is received and
+    /// upon completion.
     pub async fn browse(
         &self,
         username: &str,
@@ -771,14 +766,24 @@ impl SoulseekClient {
     ) -> Result<BrowseResponse> {
         require_non_blank(username, "username")?;
         self.inner().ensure_logged_in("browse")?;
-        let (response, size) = request(
-            self,
-            username,
-            BrowseRequest.to_bytes(),
-            peer_handler::browse_key,
-            options.response_timeout,
-            &cancel,
-        )
+        let (response, size) = async {
+            let conn = self
+                .inner()
+                .peers
+                .get_message_connection(self, username, &cancel)
+                .await?;
+            cancellable(&cancel, async {
+                let waiter = &self.inner().waiter;
+                let response = waiter
+                    .wait_indefinitely::<(BrowseResponse, u64)>(peer_handler::browse_key(username));
+                let started =
+                    waiter.wait_indefinitely::<u64>(peer_handler::browse_start_key(username));
+                conn.send(BrowseRequest.to_bytes()).await?;
+                tokio::time::timeout(options.response_timeout, started).await??;
+                response.await
+            })
+            .await
+        }
         .await
         .map_err(|error| operation_error(error, || format!("Failed to browse user {username}")))?;
         self.inner().emit(Event::BrowseProgressUpdated {
@@ -791,7 +796,7 @@ impl SoulseekClient {
 
     /// Fetches the contents of `directory` shared by `username` (FolderContentsRequest
     /// with `token`, generated when `None`); waits [`ClientOptions::message_timeout`]
-    /// for the response keyed by connection and token.
+    /// for the response keyed by user and token.
     pub async fn get_directory_contents(
         &self,
         username: &str,
@@ -817,7 +822,7 @@ impl SoulseekClient {
                 directory_name: directory.to_owned(),
             }
             .to_bytes(),
-            |id| peer_handler::directory_key(id, token),
+            peer_handler::directory_key(username, token),
             timeout,
             &cancel,
         )
@@ -847,7 +852,7 @@ impl SoulseekClient {
             self,
             username,
             UserInfoRequest.to_bytes(),
-            peer_handler::info_key,
+            peer_handler::info_key(username),
             timeout,
             &cancel,
         )
@@ -891,6 +896,7 @@ mod tests {
     use std::sync::Arc;
 
     use futures::future::{BoxFuture, ready};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
     use super::*;
@@ -964,23 +970,48 @@ mod tests {
             let browse = client.browse("peer", BrowseOptions::default(), CancellationToken::new());
             let (actual, ()) = tokio::join!(browse, request);
             assert_eq!(actual.unwrap(), response);
-            assert!(
-                matches!(events.recv().await.unwrap(), Event::BrowseProgressUpdated {
-                username, bytes_transferred, size,
-            } if username == "peer" && size == body.len() as u64 && bytes_transferred == size)
-            );
+            // Partial progress may precede completion if the frame arrives in pieces.
+            loop {
+                let Event::BrowseProgressUpdated {
+                    username,
+                    bytes_transferred,
+                    size,
+                } = events.recv().await.unwrap()
+                else {
+                    panic!("expected browse progress");
+                };
+                assert_eq!(username, "peer");
+                assert_eq!(size, body.len() as u64);
+                if bytes_transferred == size {
+                    break;
+                }
+            }
         };
         tokio::time::timeout(Duration::from_secs(2), exchange)
             .await
             .unwrap();
     }
 
+    fn large_browse_body() -> Bytes {
+        let response = BrowseResponse {
+            directories: (0..64)
+                .map(|n| Directory {
+                    name: format!("shared\\{n:04}-{}", "x".repeat(200)),
+                    files: vec![],
+                })
+                .collect(),
+            ..BrowseResponse::default()
+        };
+        response.to_bytes().slice(4..)
+    }
+
     #[tokio::test]
-    async fn uncached_socket_gets_its_own_reply_and_cannot_complete_replacement_waiter() {
+    async fn reply_on_another_socket_from_the_same_user_completes_the_request() {
         let client = logged_in_client();
         let mut old = install_peer(&client).await;
         let mut current = install_peer(&client).await;
         let exchange = async {
+            // The superseded socket still answers requests it receives.
             let request = FolderContentsRequest {
                 token: 7,
                 directory_name: "requested".into(),
@@ -994,68 +1025,160 @@ mod tests {
                     && response.directories[0].name == "requested")
             );
 
-            let cancel = CancellationToken::new();
-            let conn = client
-                .inner()
-                .peers
-                .get_message_connection(&client, "peer", &cancel)
-                .await
-                .unwrap();
-            let wait = client
-                .inner()
-                .waiter
-                .wait_indefinitely::<Vec<Directory>>(peer_handler::directory_key(conn.id(), 9));
-            let response = |name: &str| {
-                FolderContentsResponse {
-                    token: 9,
+            // Upstream keys responses by username (and token): a reply on any of the
+            // user's sockets completes a request sent on the cached one.
+            let remote = async {
+                let PeerIncoming::FolderContentsRequest(request) =
+                    PeerIncoming::decode(read_frame(&mut current).await).unwrap()
+                else {
+                    panic!("expected FolderContentsRequest on the cached socket");
+                };
+                assert_eq!(request.token, 9);
+                let wrong_token = FolderContentsResponse {
+                    token: 8,
                     directory_name: "requested".into(),
                     directories: vec![Directory {
-                        name: name.into(),
+                        name: "wrong".into(),
                         files: vec![],
                     }],
                 }
-                .to_bytes()
+                .to_bytes();
+                write_frame(&mut old, &wrong_token[4..]).await;
+                let response = FolderContentsResponse {
+                    token: 9,
+                    directory_name: "requested".into(),
+                    directories: vec![Directory {
+                        name: "right".into(),
+                        files: vec![],
+                    }],
+                }
+                .to_bytes();
+                write_frame(&mut old, &response[4..]).await;
             };
-            write_frame(&mut old, &response("wrong")[4..]).await;
-            let original = client
-                .inner()
-                .peers
-                .message_connection_at("peer", old.local_addr().unwrap())
-                .unwrap();
-            let old_id = original.id();
-            let drained = client
-                .inner()
-                .waiter
-                .wait_indefinitely::<Vec<Directory>>(peer_handler::directory_key(old_id, 10));
-            let marker = FolderContentsResponse {
-                token: 10,
-                directory_name: "marker".into(),
-                directories: vec![],
-            }
-            .to_bytes();
-            write_frame(&mut old, &marker[4..]).await;
-            drained.await.unwrap();
-            drop(old);
-            original.closed().await;
-            while client.inner().peers.lock().sockets["peer"]
-                .uncached
-                .iter()
-                .any(|conn| conn.id() == old_id)
-            {
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                client
-                    .inner()
-                    .peers
-                    .get_message_connection(&client, "peer", &cancel)
-                    .await
-                    .unwrap()
-                    .id(),
-                conn.id()
+            let request = client.get_directory_contents(
+                "peer",
+                "requested",
+                Some(9),
+                CancellationToken::new(),
             );
-            write_frame(&mut current, &response("right")[4..]).await;
-            assert_eq!(wait.await.unwrap()[0].name, "right");
+            let (directories, ()) = tokio::join!(request, remote);
+            assert_eq!(directories.unwrap()[0].name, "right");
+
+            let remote = async {
+                assert!(matches!(
+                    PeerIncoming::decode(read_frame(&mut current).await).unwrap(),
+                    PeerIncoming::InfoRequest(_)
+                ));
+                let info = UserInfo {
+                    description: "other socket".into(),
+                    ..UserInfo::default()
+                };
+                write_frame(&mut old, &info.to_bytes()[4..]).await;
+            };
+            let (info, ()) = tokio::join!(
+                client.get_user_info("peer", CancellationToken::new()),
+                remote
+            );
+            assert_eq!(info.unwrap().description, "other socket");
+        };
+        tokio::time::timeout(Duration::from_secs(2), exchange)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_timeout_bounds_only_the_start_of_a_slow_response() {
+        let client = logged_in_client();
+        let mut old = install_peer(&client).await;
+        let mut current = install_peer(&client).await;
+        let mut events = client.subscribe();
+        let body = large_browse_body();
+        let exchange = async {
+            let remote = async {
+                assert!(matches!(
+                    PeerIncoming::decode(read_frame(&mut current).await).unwrap(),
+                    PeerIncoming::BrowseRequest(_)
+                ));
+                // Answer on the other socket, and keep streaming past the response timeout.
+                old.write_u32_le(body.len() as u32).await.unwrap();
+                old.write_all(&body[..16]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                old.write_all(&body[16..]).await.unwrap();
+            };
+            let options = BrowseOptions {
+                response_timeout: Duration::from_millis(100),
+            };
+            let (response, ()) = tokio::join!(
+                client.browse("peer", options, CancellationToken::new()),
+                remote
+            );
+            assert_eq!(response.unwrap().directories.len(), 64);
+            let size = body.len() as u64;
+            assert!(
+                matches!(events.recv().await.unwrap(), Event::BrowseProgressUpdated {
+                bytes_transferred, size: total, ..
+            } if bytes_transferred < size && total == size)
+            );
+            loop {
+                if let Event::BrowseProgressUpdated {
+                    bytes_transferred, ..
+                } = events.recv().await.unwrap()
+                    && bytes_transferred == size
+                {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), exchange)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_fails_when_the_response_connection_closes_mid_frame() {
+        let client = logged_in_client();
+        let mut peer = install_peer(&client).await;
+        let body = large_browse_body();
+        let exchange = async {
+            let remote = async {
+                assert!(matches!(
+                    PeerIncoming::decode(read_frame(&mut peer).await).unwrap(),
+                    PeerIncoming::BrowseRequest(_)
+                ));
+                peer.write_u32_le(body.len() as u32).await.unwrap();
+                peer.write_all(&body[..16]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(peer);
+            };
+            let (response, ()) = tokio::join!(
+                client.browse("peer", BrowseOptions::default(), CancellationToken::new()),
+                remote
+            );
+            assert!(
+                matches!(response, Err(Error::Other(message)) if message.contains("closed while receiving"))
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(2), exchange)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_times_out_when_no_response_starts() {
+        let client = logged_in_client();
+        let mut peer = install_peer(&client).await;
+        let exchange = async {
+            let remote = async {
+                read_frame(&mut peer).await;
+            };
+            let options = BrowseOptions {
+                response_timeout: Duration::from_millis(50),
+            };
+            let (response, ()) = tokio::join!(
+                client.browse("peer", options, CancellationToken::new()),
+                remote
+            );
+            assert!(matches!(response, Err(Error::Timeout(_))));
         };
         tokio::time::timeout(Duration::from_secs(2), exchange)
             .await

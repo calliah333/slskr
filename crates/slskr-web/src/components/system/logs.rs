@@ -52,13 +52,15 @@ fn LiveLogs() -> impl IntoView {
 
 #[component]
 fn LogHistory() -> impl IntoView {
-    let files = RwSignal::new(Vec::<String>::new());
+    let files = RwSignal::new(Vec::<slskr_api::files::FilesystemFile>::new());
     let selected = RwSignal::new(String::new());
     let contents = RwSignal::new(String::new());
     let error = RwSignal::new(String::new());
     Effect::new(move |_| {
         leptos::task::spawn_local(async move {
-            match crate::services::api::get::<Vec<String>>("/logs/files").await {
+            match crate::services::api::get::<Vec<slskr_api::files::FilesystemFile>>("/logs/files")
+                .await
+            {
                 Ok(names) => files.set(names),
                 Err(e) => error.set(e.to_string()),
             }
@@ -76,5 +78,5 @@ fn LogHistory() -> impl IntoView {
             }
         });
     };
-    view! { <p role="alert">{move || error.get()}</p><div class="ui grid"><aside class="four wide column"><ul>{move || files.get().into_iter().map(|name| { let click = name.clone(); view! { <li><button class="ui basic button" on:click=move |_: web_sys::MouseEvent| open(click.clone())>{name}</button></li> } }).collect_view()}</ul></aside><main class="twelve wide column"><h4>{move || selected.get()}</h4><pre class="ui segment" style="overflow:auto;max-height:70vh">{move || contents.get()}</pre></main></div> }
+    view! { <p role="alert">{move || error.get()}</p><div class="ui grid"><aside class="four wide column"><ul>{move || files.get().into_iter().map(|file| { let name = file.name; let click = name.clone(); view! { <li><button class="ui basic button" on:click=move |_: web_sys::MouseEvent| open(click.clone())>{name}</button></li> } }).collect_view()}</ul></aside><main class="twelve wide column"><h4>{move || selected.get()}</h4><pre class="ui segment" style="overflow:auto;max-height:70vh">{move || contents.get()}</pre></main></div> }
 }

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::connection::{Connection, frame_body_len, until_idle, write_all};
+use super::connection::{Connection, FrameObserver, frame_body_len, until_idle, write_all};
 use crate::error::{Error, Result};
 
 const INCOMING_CAPACITY: usize = 16;
@@ -34,6 +34,15 @@ impl Drop for Inner {
 impl MessageConnection {
     /// Starts the reader and writer. The receiver yields frame bodies without the length prefix.
     pub fn spawn(conn: Connection, username: Option<String>) -> (Self, mpsc::Receiver<Bytes>) {
+        Self::spawn_observed(conn, username, None)
+    }
+
+    /// Like [`Self::spawn`]; `observer` sees the progress of each frame while it is read.
+    pub fn spawn_observed(
+        conn: Connection,
+        username: Option<String>,
+        observer: Option<FrameObserver>,
+    ) -> (Self, mpsc::Receiver<Bytes>) {
         let remote = conn.remote();
         let capacity = conn.write_queue_size().clamp(1, Semaphore::MAX_PERMITS);
         let (mut read, mut write, mut buffer, inactivity) = conn.into_framed_parts();
@@ -52,7 +61,7 @@ impl MessageConnection {
                     biased;
                     () = read_closed.cancelled() => break,
                     () = incoming.closed() => break,
-                    result = buffer.read_frame(&mut read, inactivity) => match result {
+                    result = buffer.read_frame_observed(&mut read, inactivity, observer.as_ref()) => match result {
                         Ok(frame) => frame,
                         Err(err) => {
                             tracing::debug!(%remote, %err, "Message connection read stopped");

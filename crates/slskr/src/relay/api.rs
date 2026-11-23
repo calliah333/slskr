@@ -33,6 +33,11 @@ use super::{
 
 const TIB: usize = 1 << 40;
 const METADATA_LIMIT: usize = 1024 * 1024;
+/// Mirrors `shares::relay::MAX_DATABASE_BYTES` (that module is private to `shares`);
+/// the importer re-checks the staged file against its own constant.
+const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Database part + metadata part + slack for multipart boundaries and part headers.
+const SHARES_BODY_LIMIT: usize = MAX_DATABASE_BYTES as usize + METADATA_LIMIT + 1024 * 1024;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -43,7 +48,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/relay/controller/shares/{token}",
-            post(upload_shares).layer(DefaultBodyLimit::max(TIB)),
+            post(upload_shares).layer(DefaultBodyLimit::max(SHARES_BODY_LIMIT)),
         )
         .route(
             "/relay/controller/downloads/{token}",
@@ -274,7 +279,7 @@ async fn receive_shares(
         match field.name() {
             Some("shares") if metadata.is_none() && field.file_name().is_none() => {
                 let mut bytes = Vec::new();
-                while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+                while let Some(chunk) = field.chunk().await.map_err(|error| error.status())? {
                     if bytes.len() + chunk.len() > METADATA_LIMIT {
                         return Err(StatusCode::PAYLOAD_TOO_LARGE);
                     }
@@ -285,7 +290,12 @@ async fn receive_shares(
             }
             Some("database") if !database && field.file_name() == Some("shares") => {
                 let mut output = tokio::fs::File::create_new(path).await.map_err(internal)?;
-                while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+                let mut written = 0u64;
+                while let Some(chunk) = field.chunk().await.map_err(|error| error.status())? {
+                    written += chunk.len() as u64;
+                    if written > MAX_DATABASE_BYTES {
+                        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                    }
                     output.write_all(&chunk).await.map_err(internal)?;
                 }
                 output.flush().await.map_err(internal)?;

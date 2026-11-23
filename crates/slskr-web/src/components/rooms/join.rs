@@ -13,8 +13,12 @@ pub fn RoomJoin(on_join: Callback<String>) -> impl IntoView {
         if open.get() {
             spawn_local(async move {
                 match crate::services::api::get::<Vec<RoomInfo>>("/rooms/available").await {
-                    Ok(value) => rooms.set(value),
-                    Err(e) => error.set(Some(e.to_string())),
+                    Ok(value) => {
+                        let _ = rooms.try_set(value);
+                    }
+                    Err(e) => {
+                        let _ = error.try_set(Some(e.to_string()));
+                    }
                 }
             });
         }
@@ -27,10 +31,13 @@ pub fn RoomJoin(on_join: Callback<String>) -> impl IntoView {
         spawn_local(async move {
             match crate::services::api::post_text("/rooms/joined", &name).await {
                 Ok(_) => {
-                    on_join.run(name);
-                    open.set(false);
+                    if open.try_set(false).is_none() {
+                        on_join.run(name);
+                    }
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(e) => {
+                    let _ = error.try_set(Some(e.to_string()));
+                }
             }
         });
     };

@@ -1,6 +1,6 @@
 //! Persistent private conversations and message delivery acknowledgements.
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use axum::{
     Json, Router,
@@ -15,7 +15,7 @@ use slskr_api::{
     conversations::{Conversation, MessageDirection, PrivateMessage},
     events::{Event, EventType, PrivateMessageReceivedEvent},
 };
-use tokio::sync::{Mutex, broadcast::error::RecvError};
+use tokio::sync::broadcast::error::RecvError;
 
 use super::{ensure_available, event_header};
 use crate::{
@@ -37,6 +37,9 @@ const MIGRATIONS: &[&str] = &[
     "DROP INDEX ix_private_messages_username;
      CREATE INDEX ix_private_messages_history ON private_messages(username, timestamp);
      CREATE INDEX ix_private_messages_unread ON private_messages(username, id) WHERE is_acknowledged = 0;",
+    // Bumped whenever a (replayed) message is reset to unacknowledged, so an acknowledgement
+    // only commits rows that were not reset while its network ACK was in flight.
+    "ALTER TABLE private_messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
 ];
 
 const HISTORY_LIMIT: usize = 100;
@@ -46,9 +49,9 @@ pub struct ConversationService {
     db: Database,
     client: soulseek::SoulseekClient,
     events: EventService,
-    // Prevent a replay from resetting a message between sending its ACK and committing it,
-    // and prevent a new incoming message from being hidden by a concurrent close.
-    mutations: Arc<Mutex<()>>,
+    // No lock is held across network I/O. Instead, a replay that resets a message while its
+    // ACK is in flight bumps `revision`, so `mark_acknowledged` skips it, and `close` only
+    // deactivates a conversation that has no unacknowledged messages left.
 }
 
 impl ConversationService {
@@ -62,7 +65,6 @@ impl ConversationService {
             db,
             client: core.client.clone(),
             events: events.clone(),
-            mutations: Arc::default(),
         })
     }
 
@@ -94,7 +96,6 @@ impl ConversationService {
     }
 
     async fn receive(&self, message: soulseek::PrivateMessage) -> anyhow::Result<()> {
-        let _guard = self.mutations.lock().await;
         let message = self.db.call(move |db| {
             let record = PrivateMessage {
                 timestamp: message.timestamp.into(),
@@ -111,7 +112,7 @@ impl ConversationService {
                 "INSERT INTO private_messages(username,id,timestamp,direction,message,is_acknowledged,was_replayed)
                  VALUES (?1,?2,?3,'In',?4,0,?5)
                  ON CONFLICT(username,id,timestamp) DO UPDATE
-                 SET is_acknowledged=0, was_replayed=excluded.was_replayed",
+                 SET is_acknowledged=0, was_replayed=excluded.was_replayed, revision=revision+1",
                 params![record.username, record.id, record.timestamp.to_rfc3339(), record.message, record.was_replayed],
             )?;
             tx.commit()?;
@@ -189,11 +190,6 @@ impl ConversationService {
     }
 
     async fn acknowledge(&self, username: String, id: Option<i32>) -> ApiResult<bool> {
-        let _guard = self.mutations.lock().await;
-        self.acknowledge_locked(username, id).await
-    }
-
-    async fn acknowledge_locked(&self, username: String, id: Option<i32>) -> ApiResult<bool> {
         let selected = self
             .db
             .call(move |db| unacknowledged_messages(db, &username, id))
@@ -204,7 +200,7 @@ impl ConversationService {
 
         let mut sent = 0;
         let mut failure = None;
-        for &(_, id) in &selected {
+        for &(_, id, _) in &selected {
             if let Err(error) = self.client.acknowledge_private_message(id as u32).await {
                 failure = Some(error);
                 break;
@@ -224,7 +220,6 @@ impl ConversationService {
     }
 
     async fn close(&self, username: String) -> ApiResult<bool> {
-        let _guard = self.mutations.lock().await;
         let active = self
             .db
             .call({
@@ -235,21 +230,12 @@ impl ConversationService {
         if !active {
             return Ok(false);
         }
-        self.acknowledge_locked(username.clone(), None).await?;
-        self.db
-            .call(move |db| {
-                db.execute(
-                    "UPDATE conversations SET is_active = 0 WHERE username = ?1",
-                    [username],
-                )?;
-                Ok(())
-            })
-            .await?;
+        self.acknowledge(username.clone(), None).await?;
+        self.db.call(move |db| deactivate(db, &username)).await?;
         Ok(true)
     }
 
     async fn send(&self, username: String, message: String) -> ApiResult<()> {
-        let _guard = self.mutations.lock().await;
         self.client
             .send_private_message(&username, &message)
             .await?;
@@ -345,7 +331,7 @@ fn unacknowledged_messages(
     db: &Connection,
     username: &str,
     id: Option<i32>,
-) -> rusqlite::Result<Option<Vec<(i64, i32)>>> {
+) -> rusqlite::Result<Option<Vec<(i64, i32, i64)>>> {
     let (known, sql) = match id {
         Some(id) => (
             db.query_row(
@@ -353,12 +339,13 @@ fn unacknowledged_messages(
                 params![username, id],
                 |row| row.get(0),
             )?,
-            "SELECT rowid, id FROM private_messages
+            "SELECT rowid, id, revision FROM private_messages
              WHERE username = ?1 AND id = ?2 AND is_acknowledged = 0",
         ),
         None => (
             exists(db, username, false)?,
-            "SELECT rowid, id FROM private_messages WHERE username = ?1 AND is_acknowledged = 0",
+            "SELECT rowid, id, revision FROM private_messages
+             WHERE username = ?1 AND is_acknowledged = 0",
         ),
     };
     if !known {
@@ -372,21 +359,33 @@ fn unacknowledged_messages(
     };
     let mut messages = Vec::new();
     while let Some(row) = rows.next()? {
-        messages.push((row.get(0)?, row.get(1)?));
+        messages.push((row.get(0)?, row.get(1)?, row.get(2)?));
     }
     Ok(Some(messages))
 }
 
-fn mark_acknowledged(db: &mut Connection, messages: &[(i64, i32)]) -> rusqlite::Result<()> {
+/// Marks the selected rows acknowledged, skipping any a replay reset after selection.
+fn mark_acknowledged(db: &mut Connection, messages: &[(i64, i32, i64)]) -> rusqlite::Result<()> {
     let tx = db.transaction()?;
     {
-        let mut update =
-            tx.prepare("UPDATE private_messages SET is_acknowledged = 1 WHERE rowid = ?1")?;
-        for &(rowid, _) in messages {
-            update.execute([rowid])?;
+        let mut update = tx.prepare(
+            "UPDATE private_messages SET is_acknowledged = 1 WHERE rowid = ?1 AND revision = ?2",
+        )?;
+        for &(rowid, _, revision) in messages {
+            update.execute([rowid, revision])?;
         }
     }
     tx.commit()
+}
+
+/// Deactivates a conversation unless a message arrived (or was reset) since it was acknowledged.
+fn deactivate(db: &Connection, username: &str) -> rusqlite::Result<()> {
+    db.execute(
+        "UPDATE conversations SET is_active = 0 WHERE username = ?1 AND NOT EXISTS(
+            SELECT 1 FROM private_messages WHERE username = ?1 AND is_acknowledged = 0)",
+        [username],
+    )?;
+    Ok(())
 }
 
 pub fn routes() -> Router<AppState> {
@@ -577,7 +576,39 @@ mod tests {
             assert_eq!(first.len(), 1);
             mark_acknowledged(db, &first)?;
             assert!(unacknowledged_messages(db, "alice", Some(1))?.unwrap().is_empty());
-            assert_eq!(unacknowledged_messages(db, "alice", None)?.unwrap().iter().map(|&(_, id)| id).collect::<Vec<_>>(), vec![2]);
+            assert_eq!(unacknowledged_messages(db, "alice", None)?.unwrap().iter().map(|&(_, id, _)| id).collect::<Vec<_>>(), vec![2]);
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_during_ack_keeps_message_unread_and_conversation_open() {
+        let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
+        db.call(|db| {
+            activate(db, "alice")?;
+            let upsert = |db: &Connection| {
+                db.execute(
+                    "INSERT INTO private_messages(username,id,timestamp,direction,message,is_acknowledged,was_replayed)
+                     VALUES ('alice',7,'2026-01-01T00:00:00+00:00','In','hi',0,1)
+                     ON CONFLICT(username,id,timestamp) DO UPDATE
+                     SET is_acknowledged=0, was_replayed=excluded.was_replayed, revision=revision+1",
+                    [],
+                )
+            };
+            upsert(db)?;
+            let selected = unacknowledged_messages(db, "alice", None)?.unwrap();
+            // The server replays the message while the ACK is in flight.
+            upsert(db)?;
+            mark_acknowledged(db, &selected)?;
+            assert_eq!(unacknowledged_messages(db, "alice", None)?.unwrap().len(), 1);
+            deactivate(db, "alice")?;
+            assert!(exists(db, "alice", true)?);
+
+            let selected = unacknowledged_messages(db, "alice", None)?.unwrap();
+            mark_acknowledged(db, &selected)?;
+            assert!(unacknowledged_messages(db, "alice", None)?.unwrap().is_empty());
+            deactivate(db, "alice")?;
+            assert!(!exists(db, "alice", true)?);
             Ok(())
         }).await.unwrap();
     }

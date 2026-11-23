@@ -11,8 +11,13 @@ pub const RECORD_SEPARATOR: char = '\u{1e}';
 /// Highest JSON protocol version accepted in the handshake.
 pub const MAX_PROTOCOL_VERSION: u32 = 2;
 
-/// Upper bound for buffered, not yet terminated input.
-pub const MAX_BUFFERED: usize = 32 * 1024 * 1024;
+/// Upper bound for a single record, whether complete or still buffered, and for one
+/// WebSocket message/frame. Upstream slskd keeps ASP.NET Core SignalR's default
+/// `MaximumReceiveMessageSize` of 32 KiB; the largest legitimate client-to-server
+/// messages are relay agent invocations (login, file info, failure notices), which are a
+/// few hundred bytes, and our relay agent caps its own frames at 128 KiB. Share indexes and
+/// files travel over HTTP, not the hub. 1 MiB leaves ample headroom.
+pub const MAX_BUFFERED: usize = 1024 * 1024;
 
 /// Message type discriminators.
 pub mod message_type {
@@ -266,13 +271,12 @@ impl RecordBuffer {
 
     /// Appends data and returns every complete, non-empty record (separators stripped).
     pub fn push(&mut self, data: &str) -> Result<Vec<String>, String> {
+        let too_large = || format!("Message exceeds the maximum size of {MAX_BUFFERED} bytes.");
         self.buf.push_str(data);
 
         let Some(last) = self.buf.rfind(RECORD_SEPARATOR) else {
             if self.buf.len() > MAX_BUFFERED {
-                return Err(format!(
-                    "Message exceeds the maximum size of {MAX_BUFFERED} bytes."
-                ));
+                return Err(too_large());
             }
             return Ok(Vec::new());
         };
@@ -280,12 +284,21 @@ impl RecordBuffer {
         // the separator is a single byte, so `last + 1` is a char boundary
         let rest = self.buf.split_off(last + 1);
         let complete = std::mem::replace(&mut self.buf, rest);
+        if self.buf.len() > MAX_BUFFERED {
+            return Err(too_large());
+        }
 
-        Ok(complete[..last]
+        complete[..last]
             .split(RECORD_SEPARATOR)
             .filter(|record| !record.trim().is_empty())
-            .map(str::to_owned)
-            .collect())
+            .map(|record| {
+                if record.len() > MAX_BUFFERED {
+                    Err(too_large())
+                } else {
+                    Ok(record.to_owned())
+                }
+            })
+            .collect()
     }
 
     /// True when no partial record is pending.
@@ -449,6 +462,23 @@ mod tests {
         let records = buffer.push(":7}\u{1e}\u{1e}").unwrap();
         assert_eq!(records, vec!["{\"type\":7}"]);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn record_buffer_caps_records_with_and_without_separators() {
+        let big = "x".repeat(MAX_BUFFERED + 1);
+        assert!(RecordBuffer::new().push(&big).is_err());
+        assert!(RecordBuffer::new().push(&format!("{big}\u{1e}")).is_err());
+        assert!(
+            RecordBuffer::new()
+                .push(&format!("{{}}\u{1e}{big}"))
+                .is_err()
+        );
+        let fits = "x".repeat(MAX_BUFFERED);
+        assert_eq!(
+            RecordBuffer::new().push(&format!("{fits}\u{1e}")).unwrap(),
+            vec![fits]
+        );
     }
 
     #[test]

@@ -88,6 +88,20 @@ impl IpRange {
         })
     }
 
+    /// True when the range covers its whole address family (e.g. `0.0.0.0/0`, `::/0`).
+    pub fn is_full(&self) -> bool {
+        matches!(
+            self,
+            Self::V4 {
+                start: 0,
+                end: u32::MAX
+            } | Self::V6 {
+                start: 0,
+                end: u128::MAX
+            }
+        )
+    }
+
     /// True when `ip` lies in the range. IPv4-mapped IPv6 callers are matched as IPv4.
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self, ip.to_canonical()) {

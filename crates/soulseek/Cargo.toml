@@ -11,11 +11,10 @@ bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 flate2 = "1"
-rand = "0.9"
-encoding_rs = "0.8"
 futures = "0.3"
 tokio-util = "0.7"
 md-5 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+rand = "0.9"

@@ -75,7 +75,9 @@ struct Inner {
 #[derive(Default)]
 struct Runtime {
     active: HashMap<String, Active>,
-    files: [HashMap<String, HashSet<String>>; 2],
+    // Active entries per (user, filename). A count, because a finished entry
+    // can linger while a re-request for the same file is already active.
+    files: [HashMap<String, HashMap<String, usize>>; 2],
     uploads: UploadQueue,
     history: UploadHistory,
     bandwidth: Bandwidth,
@@ -141,7 +143,20 @@ impl Runtime {
     fn has(&self, direction: TransferDirection, username: &str, filename: &str) -> bool {
         self.files[direction_index(direction)]
             .get(username)
-            .is_some_and(|files| files.contains(filename))
+            .is_some_and(|files| files.contains_key(filename))
+    }
+
+    /// Like [`Self::has`], but ignores entries that already ended and are only
+    /// waiting for the progress loop to flush and drop them.
+    fn has_unfinished(&self, direction: TransferDirection, username: &str, filename: &str) -> bool {
+        self.has(direction, username, filename)
+            && self.active.values().any(|entry| {
+                let t = &entry.transfer;
+                t.direction == direction
+                    && t.ended_at.is_none()
+                    && t.username == username
+                    && t.filename == filename
+            })
     }
 
     fn insert(
@@ -154,7 +169,9 @@ impl Runtime {
         self.files[direction_index(transfer.direction)]
             .entry(transfer.username.clone())
             .or_default()
-            .insert(transfer.filename.clone());
+            .entry(transfer.filename.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
         self.active.insert(
             transfer.id.clone(),
             Active {
@@ -180,7 +197,12 @@ impl Runtime {
         };
         let users = &mut self.files[direction_index(t.direction)];
         if let Some(files) = users.get_mut(&t.username) {
-            files.remove(&t.filename);
+            if let Some(count) = files.get_mut(&t.filename) {
+                *count -= 1;
+                if *count == 0 {
+                    files.remove(&t.filename);
+                }
+            }
             if files.is_empty() {
                 users.remove(&t.username);
             }
@@ -312,12 +334,14 @@ impl TransferService {
         if self.0.core.shutdown.is_cancelled() || !matches!(*self.0.ready.borrow(), Some(Ok(()))) {
             return Err("Transfer service unavailable".into());
         }
-        if self.0.users.is_blacklisted(username, Some(endpoint.ip())) {
+        // Shared names are backslash-masked and resolved exactly, as upstream
+        // does; a '/' spelling must not alias (and re-queue) the same file.
+        if filename.contains('/') || self.0.users.is_blacklisted(username, Some(endpoint.ip())) {
             return Err("File not shared.".into());
         }
         if self
             .runtime()
-            .has(TransferDirection::Upload, username, filename)
+            .has_unfinished(TransferDirection::Upload, username, filename)
         {
             return Ok(());
         }
@@ -336,7 +360,7 @@ impl TransferService {
         let cfg = self.0.core.options.get();
         let receiver = {
             let mut runtime = self.runtime();
-            if runtime.has(TransferDirection::Upload, username, filename) {
+            if runtime.has_unfinished(TransferDirection::Upload, username, filename) {
                 return Ok(());
             }
             let group = self.0.users.group(username);
@@ -345,7 +369,9 @@ impl TransferService {
                     .active
                     .values()
                     .map(|entry| &entry.transfer)
-                    .filter(|t| t.direction == TransferDirection::Upload && is_queued(t.state)),
+                    // Upstream counts every upload that has not ended,
+                    // including in-progress ones, against the queued limits.
+                    .filter(|t| t.direction == TransferDirection::Upload && t.ended_at.is_none()),
                 &cfg.transfers,
                 &group,
                 username,
@@ -1206,7 +1232,7 @@ impl TransferService {
         direction: TransferDirection,
         id: String,
         remove: bool,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         self.ready().await?;
         let active = {
             let mut runtime = self.runtime();
@@ -1222,18 +1248,15 @@ impl TransferService {
                     entry.done.clone()
                 })
         };
+        // Upstream's TryCancel and Remove report misses as `false`, which the
+        // controller ignores: an unknown id is still `204 No Content`.
         if let Some(done) = active {
             done.cancelled().await;
-        } else if store::find(self.database(), direction, id.clone())
-            .await?
-            .is_none()
-        {
-            return Ok(false);
         }
         if remove {
             store::remove(self.database(), direction, Some(id)).await?;
         }
-        Ok(true)
+        Ok(())
     }
 
     async fn download_position(&self, t: &Transfer) -> anyhow::Result<u32> {
@@ -1382,4 +1405,38 @@ fn exception_text(error: &Error) -> String {
         _ => "TransferException",
     };
     format!("{kind}: {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upload(filename: &str) -> Transfer {
+        new_transfer(TransferDirection::Upload, "peer", filename.into(), 1, None)
+    }
+
+    #[test]
+    fn finished_entry_does_not_block_or_unindex_a_re_request() {
+        let file = r"Music\a.flac";
+        let mut runtime = Runtime::default();
+        let mut first = upload(file);
+        first.ended_at = Some(Utc::now());
+        first.state = TransferStates::COMPLETED | TransferStates::SUCCEEDED;
+        let first_id = first.id.clone();
+        runtime.insert(first, CancellationToken::new(), None, true);
+        assert!(runtime.has(TransferDirection::Upload, "peer", file));
+        assert!(!runtime.has_unfinished(TransferDirection::Upload, "peer", file));
+
+        let second = upload(file);
+        let second_id = second.id.clone();
+        runtime.insert(second, CancellationToken::new(), None, false);
+        assert!(runtime.has_unfinished(TransferDirection::Upload, "peer", file));
+
+        // Dropping the lingering finished entry keeps the live one indexed.
+        runtime.remove(&first_id);
+        assert!(runtime.has_unfinished(TransferDirection::Upload, "peer", file));
+        runtime.remove(&second_id);
+        assert!(!runtime.has(TransferDirection::Upload, "peer", file));
+        assert!(runtime.files[direction_index(TransferDirection::Upload)].is_empty());
+    }
 }

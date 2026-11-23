@@ -53,15 +53,17 @@ pub fn Selection(
         leptos::task::spawn_local(async move {
             match api::post::<_, EnqueueDownloadsResponse>(&endpoint, &requests).await {
                 Ok(response) if !response.failed.is_empty() => {
-                    message.set(Some(format!(
+                    let _ = message.try_set(Some(format!(
                         "Failed to enqueue {} file(s).",
                         response.failed.len()
                     )));
                 }
                 Ok(_) => {}
-                Err(error) => message.set(Some(error.to_string())),
+                Err(error) => {
+                    let _ = message.try_set(Some(error.to_string()));
+                }
             }
-            pending.set(false);
+            let _ = pending.try_set(false);
         });
     };
     view! {

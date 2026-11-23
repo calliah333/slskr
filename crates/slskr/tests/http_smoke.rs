@@ -173,6 +173,11 @@ async fn daemon_http_smoke() {
         .unwrap();
     assert_eq!(asset.status(), reqwest::StatusCode::OK);
     assert_eq!(asset.text().await.unwrap(), "static asset");
+    for root in ["/client", "/client/"] {
+        let index = client.get(format!("{base}{root}")).send().await.unwrap();
+        assert_eq!(index.status(), reqwest::StatusCode::OK, "{root}");
+        assert_eq!(index.text().await.unwrap(), "smoke index");
+    }
     let deep_link = client
         .get(format!("{base}/client/library/local"))
         .send()

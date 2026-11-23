@@ -1,106 +1,75 @@
-fn replace_url(url: &str) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let window_value: &wasm_bindgen::JsValue = window.as_ref();
-    let Ok(history) = js_sys::Reflect::get(window_value, &"history".into()) else {
-        return;
-    };
-    let Ok(replace) = js_sys::Reflect::get(&history, &"replaceState".into()) else {
-        return;
-    };
-    let Ok(replace) = replace.dyn_into::<js_sys::Function>() else {
-        return;
-    };
-    let _ = replace.call3(
-        &history,
-        &wasm_bindgen::JsValue::NULL,
-        &"".into(),
-        &url.into(),
-    );
-}
-
-use wasm_bindgen::JsCast;
-fn initial_username() -> String {
-    let from_query = web_sys::window().and_then(|window| {
-        let search = window.location().search().ok()?;
-        search.trim_start_matches('?').split('&').find_map(|part| {
-            let (name, value) = part.split_once('=')?;
-            (name == "username").then(|| value.replace('+', " "))
-        })
-    });
-    from_query
-        .or_else(|| {
-            web_sys::window()?
-                .session_storage()
-                .ok()
-                .flatten()?
-                .get_item("slskr.activeChat")
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_default()
-}
-
 use leptos::prelude::*;
 use leptos::task::spawn_local_scoped_with_cancellation;
-use slskr_api::conversations::Conversation;
+use leptos_router::{
+    NavigateOptions,
+    hooks::{use_navigate, use_url},
+};
+use slskr_api::conversations::{Conversation, PrivateMessage};
 use wasm_bindgen_futures::spawn_local;
 
 mod conversation;
 
+const ACTIVE_CHAT_KEY: &str = "slskr.activeChat";
+
+fn stored_username() -> Option<String> {
+    web_sys::window()?
+        .session_storage()
+        .ok()
+        .flatten()?
+        .get_item(ACTIVE_CHAT_KEY)
+        .ok()
+        .flatten()
+}
+
 #[component]
 pub fn Chat() -> impl IntoView {
+    let url = use_url();
+    // UrlSearchParams percent-decodes the query exactly once.
+    let initial = url
+        .with_untracked(|url| {
+            web_sys::UrlSearchParams::new_with_str(url.search())
+                .ok()
+                .and_then(|params| params.get("username"))
+        })
+        .or_else(stored_username)
+        .unwrap_or_default();
+    let navigate = StoredValue::new_local(use_navigate());
     let conversations = RwSignal::new(Vec::<Conversation>::new());
-    let active = RwSignal::new(initial_username());
+    let active = RwSignal::new(initial);
     let draft = RwSignal::new(String::new());
     let recipient = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
+    // Each refresh takes a ticket; only the latest one may apply its result.
+    let generation = RwSignal::new(0u64);
+    let in_flight = RwSignal::new(false);
     let refresh = move || {
         let selected = active.get_untracked();
+        let ticket = generation.get_untracked().wrapping_add(1);
+        generation.set(ticket);
+        in_flight.set(true);
+        let current = move || generation.try_get_untracked() == Some(ticket);
         spawn_local(async move {
-            match crate::services::api::get::<Vec<Conversation>>("/conversations").await {
-                Ok(mut value) => {
-                    value.retain(|conversation| conversation.username != "..");
-                    let names = value.iter().map(|c| c.username.clone()).collect::<Vec<_>>();
-                    let selected = if names.contains(&selected) {
-                        selected
-                    } else {
-                        names.first().cloned().unwrap_or_default()
-                    };
-                    if !selected.is_empty() {
-                        let path = format!(
-                            "/conversations/{}",
-                            crate::services::util::encode_uri_component(&selected)
-                        );
-                        if let Some(conversation) = value.iter().find(|c| c.username == selected) {
-                            if conversation.has_un_acknowledged_messages {
-                                if let Err(e) = crate::services::api::request_text(
-                                    gloo_net::http::Method::PUT,
-                                    &path,
-                                    None,
-                                )
-                                .await
-                                {
-                                    error.set(Some(e.to_string()));
-                                }
-                            }
-                        }
-                        match crate::services::api::get::<Conversation>(&path).await {
-                            Ok(full) => {
-                                if let Some(item) =
-                                    value.iter_mut().find(|c| c.username == selected)
-                                {
-                                    *item = full;
-                                }
-                            }
-                            Err(e) => error.set(Some(e.to_string())),
-                        }
+            let result = load_conversations(selected).await;
+            if !current() {
+                return;
+            }
+            let _ = in_flight.try_set(false);
+            match result {
+                Ok((selected, value, problem)) => {
+                    if let Some(problem) = problem {
+                        let _ = error.try_set(Some(problem));
                     }
-                    active.set(selected);
-                    conversations.set(value);
+                    if active.try_get_untracked().is_some_and(|a| a != selected) {
+                        let _ = active.try_set(selected);
+                    }
+                    // Unchanged polls must not notify, or the open conversation re-renders.
+                    if conversations.try_with_untracked(|c| *c != value) == Some(true) {
+                        let _ = conversations.try_set(value);
+                    }
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(e) => {
+                    let _ = error.try_set(Some(e));
+                }
             }
         });
     };
@@ -108,24 +77,31 @@ pub fn Chat() -> impl IntoView {
     spawn_local_scoped_with_cancellation(async move {
         loop {
             crate::services::util::sleep(5_000).await;
-            refresh();
+            if !in_flight.get_untracked() {
+                refresh();
+            }
         }
     });
 
     let select = move |username: String| {
         active.set(username.clone());
         if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
-            let _ = storage.set_item("slskr.activeChat", &username);
+            let _ = storage.set_item(ACTIVE_CHAT_KEY, &username);
         }
-        if let Some(window) = web_sys::window() {
-            let url = format!(
-                "/chat?username={}",
-                crate::services::util::encode_uri_component(&username)
-            );
-            let _ = window.history().and_then(|h| {
-                h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url))
-            });
-        }
+        // The router resolves the path under `web.url_base`.
+        navigate.with_value(|navigate| {
+            navigate(
+                &format!(
+                    "/chat?username={}",
+                    crate::services::util::encode_uri_component(&username)
+                ),
+                NavigateOptions {
+                    replace: true,
+                    scroll: false,
+                    ..Default::default()
+                },
+            )
+        });
         refresh();
     };
     let send = move |_| {
@@ -146,11 +122,15 @@ pub fn Chat() -> impl IntoView {
             );
             match crate::services::api::post_text(&path, &text).await {
                 Ok(_) => {
-                    recipient.set(String::new());
-                    active.set(username);
-                    refresh();
+                    let _ = recipient.try_set(String::new());
+                    // `try_set` returns `None` once the value was stored (component still alive).
+                    if active.try_set(username).is_none() {
+                        refresh();
+                    }
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(e) => {
+                    let _ = error.try_set(Some(e.to_string()));
+                }
             }
         });
     };
@@ -164,15 +144,31 @@ pub fn Chat() -> impl IntoView {
                 .await
             {
                 Ok(_) => {
-                    if active.get_untracked() == username {
-                        active.set(String::new());
+                    let Some(current) = active.try_get_untracked() else {
+                        return;
+                    };
+                    if current == username {
+                        let _ = active.try_set(String::new());
                     }
                     refresh();
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(e) => {
+                    let _ = error.try_set(Some(e.to_string()));
+                }
             }
         });
     };
+    let messages = Memo::new(move |_| {
+        let name = active.get();
+        conversations.with(|items| {
+            items
+                .iter()
+                .find(|c| c.username == name)
+                .and_then(|c| c.messages.clone())
+        })
+    });
+    let has_conversation = Memo::new(move |_| messages.with(Option::is_some));
+    let messages = Signal::derive(move || messages.get().unwrap_or_default());
 
     view! {
         <section class="chat">
@@ -192,7 +188,9 @@ pub fn Chat() -> impl IntoView {
             <Show when=move || error.get().is_some()><p class="error">{move || error.get().unwrap_or_default()}</p></Show>
             <div class="chat-active-card">
                 <Show when=move || !active.get().is_empty() fallback=|| view! { <p class="placeholder-segment">"Select a conversation or start a message."</p> }>
-                    {move || conversations.get().into_iter().find(|c| c.username == active.get()).map(|c| view! { <conversation::ConversationView conversation=c/> })}
+                    <Show when=move || has_conversation.get()>
+                        <conversation::ConversationView messages=messages/>
+                    </Show>
                 </Show>
                 <form class="chat-input" on:submit=move |ev| { ev.prevent_default(); send(()); }>
                     <Show when=move || active.get().is_empty()>
@@ -207,4 +205,55 @@ pub fn Chat() -> impl IntoView {
             </div>
         </section>
     }
+}
+
+/// Fetches the conversation list and the selected conversation's messages.
+/// Returns the effective selection, the list, and a non-fatal error.
+async fn load_conversations(
+    selected: String,
+) -> Result<(String, Vec<Conversation>, Option<String>), String> {
+    let mut value = crate::services::api::get::<Vec<Conversation>>("/conversations")
+        .await
+        .map_err(|e| e.to_string())?;
+    value.retain(|conversation| conversation.username != "..");
+    let selected = if value.iter().any(|c| c.username == selected) {
+        selected
+    } else {
+        value
+            .first()
+            .map(|c| c.username.clone())
+            .unwrap_or_default()
+    };
+    let mut problem = None;
+    if !selected.is_empty() {
+        let path = format!(
+            "/conversations/{}",
+            crate::services::util::encode_uri_component(&selected)
+        );
+        let unread = value
+            .iter()
+            .any(|c| c.username == selected && c.has_un_acknowledged_messages);
+        if unread
+            && let Err(e) =
+                crate::services::api::request_text(gloo_net::http::Method::PUT, &path, None).await
+        {
+            problem = Some(e.to_string());
+        }
+        match crate::services::api::get::<Conversation>(&path).await {
+            Ok(full) => {
+                if let Some(item) = value.iter_mut().find(|c| c.username == selected) {
+                    *item = full;
+                }
+            }
+            Err(e) => problem = Some(e.to_string()),
+        }
+    }
+    Ok((selected, value, problem))
+}
+
+/// Identity of the newest message, used to scroll only when the history grows.
+pub(crate) fn last_message_key(messages: &[PrivateMessage]) -> Option<(i64, i32)> {
+    messages
+        .last()
+        .map(|m| (m.timestamp.timestamp_millis(), m.id))
 }

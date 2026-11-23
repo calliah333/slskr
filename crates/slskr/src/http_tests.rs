@@ -54,6 +54,19 @@ async fn static_spa_fallback_is_scoped_to_configured_base() {
     let html = std::str::from_utf8(&body).unwrap();
     assert!(html.contains("<base href=\"/client/\" />"));
     assert!(html.contains("window.urlBase=\"/client\""));
+    for path in ["/client", "/client/"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
     let response = app
         .clone()
         .oneshot(

@@ -41,8 +41,9 @@ pub struct Search {
     pub locked_file_count: u32,
     #[serde(default)]
     pub response_count: u32,
-    /// Present only when responses were requested (`includeResponses=true`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// HTTP emits `[]` unless responses were requested (`includeResponses=true`);
+    /// hub `CREATE`/`UPDATE`/`DELETE` payloads emit `null`, as upstream does.
+    #[serde(default)]
     pub responses: Option<Vec<SearchResponse>>,
     pub search_text: String,
     #[serde(with = "time::datetime")]
@@ -276,7 +277,7 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "missing {key}");
         }
-        assert!(value.get("responses").is_none());
+        assert!(value["responses"].is_null());
     }
 
     #[test]

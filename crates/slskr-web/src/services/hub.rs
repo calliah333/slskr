@@ -172,7 +172,6 @@ struct Inner {
     reconnect_epoch: Cell<u64>,
     connection_id: RefCell<Option<String>>,
     handshake: RefCell<Option<Deferred>>,
-    close_intent: RefCell<Option<CloseIntent>>,
     timer: RefCell<Option<Interval>>,
     last_received: Cell<f64>,
     last_sent: Cell<f64>,
@@ -222,7 +221,10 @@ impl Inner {
     /// Detaches and drops the current socket (closing it if still open) and fails a pending handshake.
     fn teardown_socket(&self) {
         self.generation.set(self.generation.get() + 1);
-        self.timer.borrow_mut().take();
+        // May run inside the timer's own callback: drop it afterwards.
+        if let Some(timer) = self.timer.borrow_mut().take() {
+            spawn_local(async move { drop(timer) });
+        }
         if let Some(socket) = self.socket.borrow_mut().take() {
             socket.detach();
             let _ = socket.ws.close();
@@ -234,23 +236,16 @@ impl Inner {
         }
     }
 
-    /// Asks the socket to close; the close event then finishes according to `intent`.
-    fn close_socket(&self, intent: CloseIntent) {
-        let ws = self
-            .socket
-            .borrow()
-            .as_ref()
-            .map(|socket| socket.ws.clone());
-        match ws {
-            Some(ws) => {
-                *self.close_intent.borrow_mut() = Some(intent);
-                let _ = ws.close();
-            }
-            None => {
-                if self.state.get() == HubConnectionState::Disconnecting {
-                    self.complete_close(intent.error);
-                }
-            }
+    /// Closes the socket and finishes the close according to `intent` immediately.
+    ///
+    /// Like `@microsoft/signalr`'s `WebSocketTransport.stop()`, this does not wait for the
+    /// socket's `close` event, which can take a long time (or never arrive) on a dead
+    /// network. `teardown_socket` bumps the generation, so the late event is ignored.
+    fn close_socket(self: &Rc<Self>, intent: CloseIntent) {
+        if self.socket.borrow().is_some() {
+            self.connection_closed(intent);
+        } else if self.state.get() == HubConnectionState::Disconnecting {
+            self.complete_close(intent.error);
         }
     }
 
@@ -346,7 +341,7 @@ impl Inner {
         }
     }
 
-    fn process_message(&self, message: Value) {
+    fn process_message(self: &Rc<Self>, message: Value) {
         match message.get("type").and_then(Value::as_u64) {
             Some(MESSAGE_INVOCATION) => self.invoke_client_method(&message),
             Some(MESSAGE_COMPLETION) => {
@@ -437,15 +432,12 @@ impl Inner {
             return;
         }
 
-        let intent = self
-            .close_intent
-            .borrow_mut()
-            .take()
-            .unwrap_or(CloseIntent {
-                error: close_error,
-                reconnect: true,
-            });
-        self.connection_closed(intent);
+        // Client-initiated closes finish synchronously in `close_socket`, so a close event
+        // for the current socket always comes from the server or the network.
+        self.connection_closed(CloseIntent {
+            error: close_error,
+            reconnect: true,
+        });
     }
 
     fn connection_closed(self: &Rc<Self>, intent: CloseIntent) {
@@ -476,7 +468,6 @@ impl Inner {
             }
             let now = js_sys::Date::now();
             if now - inner.last_received.get() >= SERVER_TIMEOUT_MS {
-                inner.timer.borrow_mut().take();
                 inner.close_socket(CloseIntent {
                     error: Some(
                         "Server timeout elapsed without receiving a message from the server."
@@ -525,7 +516,6 @@ impl Inner {
 
         self.teardown_socket();
         let generation = self.generation.get();
-        self.close_intent.borrow_mut().take();
         let ws = WebSocket::new(&ws_url)?;
 
         let weak = Rc::downgrade(self);
@@ -741,7 +731,6 @@ impl HubConnection {
             reconnect_epoch: Cell::new(0),
             connection_id: RefCell::new(None),
             handshake: RefCell::new(None),
-            close_intent: RefCell::new(None),
             timer: RefCell::new(None),
             last_received: Cell::new(0.0),
             last_sent: Cell::new(0.0),

@@ -368,3 +368,145 @@ async fn stalled_download_uses_the_transfer_socket_idle_timeout() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn re_offer_for_an_active_download_is_not_rejected() {
+    with_peer(|client, peer, reverse| async move {
+        let enqueued = Notify::new();
+        let downloader = async {
+            let output = DownloadOutput::Stream(Box::new(|| {
+                Box::pin(async {
+                    Ok(Box::new(Cursor::new(Vec::<u8>::new()))
+                        as Box<dyn crate::client::TransferOutput>)
+                })
+            }));
+            let handle = client
+                .enqueue_download(
+                    PEER,
+                    FILE,
+                    output,
+                    Some(3),
+                    0,
+                    Some(100),
+                    TransferOptions::default(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            enqueued.notify_one();
+            let transfer = handle.wait().await.unwrap();
+            assert_eq!(transfer.state, State::COMPLETED | State::SUCCEEDED);
+            assert_eq!(transfer.remote_token, Some(42));
+        };
+        let remote = async {
+            let mut message = accept_init(&peer, "P").await;
+            let incoming = request(&mut message).await;
+            message
+                .write_all(&TransferResponse::rejected(incoming.token, "Queued").to_bytes())
+                .await
+                .unwrap();
+            enqueued.notified().await;
+            let offer = |token| {
+                TransferRequest {
+                    direction: Direction::Upload,
+                    token,
+                    filename: FILE.into(),
+                    file_size: 3,
+                }
+                .to_bytes()
+            };
+            message.write_all(&offer(42)).await.unwrap();
+            assert!(matches!(
+                PeerIncoming::decode(read_frame(&mut message).await).unwrap(),
+                PeerIncoming::TransferResponse(response) if response == TransferResponse::allowed(42, Some(3))
+            ));
+            // A re-offer under a new token while the download is still wanted must not be
+            // answered with "Cancelled" (upstream only rejects unknown downloads).
+            message.write_all(&offer(43)).await.unwrap();
+            reverse.send(()).unwrap();
+            let mut file = peer.accept().await;
+            assert_eq!(
+                InitIncoming::decode(read_frame(&mut file).await).unwrap(),
+                InitIncoming::PierceFirewall(PierceFirewall {
+                    token: FIREWALL_TOKEN
+                })
+            );
+            file.write_all(&42_u32.to_le_bytes()).await.unwrap();
+            assert_eq!(file.read_u64_le().await.unwrap(), 0);
+            file.write_all(b"abc").await.unwrap();
+            assert!(
+                timeout(Duration::from_millis(200), message.read(&mut [0; 1]))
+                    .await
+                    .is_err(),
+                "no reply may be sent for the re-offer"
+            );
+        };
+        tokio::join!(downloader, remote);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn download_slot_is_held_from_before_the_request() {
+    with_peer(|client, peer, _| async move {
+        client
+            .inner
+            .options
+            .write()
+            .unwrap()
+            .maximum_concurrent_downloads = 1;
+        let output = || {
+            DownloadOutput::Stream(Box::new(|| {
+                Box::pin(async {
+                    Ok(Box::new(Cursor::new(Vec::<u8>::new()))
+                        as Box<dyn crate::client::TransferOutput>)
+                })
+            }))
+        };
+        let first = client.enqueue_download(
+            PEER,
+            FILE,
+            output(),
+            Some(3),
+            0,
+            Some(100),
+            TransferOptions::default(),
+            CancellationToken::new(),
+        );
+        let remote = async {
+            let mut message = accept_init(&peer, "P").await;
+            let incoming = request(&mut message).await;
+            message
+                .write_all(&TransferResponse::rejected(incoming.token, "Queued").to_bytes())
+                .await
+                .unwrap();
+            message
+        };
+        let (first, mut message) = tokio::join!(first, remote);
+        let _first = first.unwrap();
+        // The remotely queued download holds the only slot, so the next one is not requested.
+        let cancel = CancellationToken::new();
+        let second = client.enqueue_download(
+            PEER,
+            "share\\other.bin",
+            output(),
+            Some(3),
+            0,
+            Some(101),
+            TransferOptions::default(),
+            cancel.clone(),
+        );
+        let probe = async {
+            assert!(
+                timeout(Duration::from_millis(200), message.read(&mut [0; 1]))
+                    .await
+                    .is_err(),
+                "the second download must wait for a slot before requesting"
+            );
+            cancel.cancel();
+        };
+        let (second, ()) = tokio::join!(second, probe);
+        assert!(matches!(second, Err(Error::Cancelled)));
+    })
+    .await;
+}

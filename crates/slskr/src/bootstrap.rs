@@ -337,7 +337,8 @@ async fn build(
         metrics: Hub::new("metrics"),
         relay: Hub::new("relay"),
     };
-    let auth = Auth::new(config::auth_config(startup, startup_key)?);
+    let auth =
+        Auth::new(config::auth_config(startup, startup_key)?).with_url_base(&startup.web.url_base);
     for hub in [&hubs.application, &hubs.search, &hubs.metrics] {
         hub.set_authorizer(auth.hub_authorizer(Role::ReadOnly));
     }
@@ -430,7 +431,21 @@ fn router(app: &AppState) -> Router {
         router = router.merge(http::static_router(path.clone(), base));
     }
     if web.logging {
-        router = router.layer(tower_http::trace::TraceLayer::new_for_http());
+        use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
+        // Log at INFO like slskd request logging; the span records the path only so query
+        // strings (SignalR `access_token`) never reach the logs.
+        router = router.layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(tracing::Level::INFO))
+                .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
+        );
     }
     router
 }
@@ -466,9 +481,14 @@ fn discover_content(exe: &Path, configured: &str) -> Option<PathBuf> {
         if installed.join("index.html").is_file() {
             return Some(installed);
         }
-        let dist = Path::new("dist");
-        if dist.join("index.html").is_file() {
-            return Some(dist.to_owned());
+        // Development convenience for `cargo run` after `trunk build`; release builds rely on
+        // the packaged layout or SLSKR_CONTENT_PATH.
+        #[cfg(debug_assertions)]
+        {
+            let dist = Path::new("dist");
+            if dist.join("index.html").is_file() {
+                return Some(dist.to_owned());
+            }
         }
     }
     None
@@ -526,6 +546,7 @@ struct UnixListener {
 impl UnixListener {
     fn bind(path: &str) -> Result<Self> {
         let path = std::path::absolute(path)?;
+        remove_stale_socket(&path);
         let socket = tokio::net::UnixListener::bind(&path)
             .with_context(|| format!("binding {}", path.display()))?;
         Ok(Self { socket, path })
@@ -561,9 +582,26 @@ impl Listener for UnixListener {
     }
 }
 
+/// Removes a socket file left behind by a crashed daemon (nothing accepts on it). Other
+/// file types and live sockets are left alone so binding reports the conflict.
+#[cfg(unix)]
+fn remove_stale_socket(path: &Path) {
+    use std::os::unix::fs::FileTypeExt;
+    let is_socket = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket());
+    if is_socket
+        && std::os::unix::net::UnixStream::connect(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+    {
+        tracing::info!(path = %path.display(), "removing stale Unix socket");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Unix socket peers have no IP address; the unspecified address tells auth the caller is
+/// unknown, so CIDR-restricted API keys are refused (slskd sees a null RemoteIpAddress).
 #[cfg(unix)]
 fn unix_peer_addr() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
 }
 
 #[cfg(test)]
@@ -598,6 +636,24 @@ mod tests {
             2
         );
         assert!(Cli::try_parse_from(["slskr", "--set", "missing-value"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_bind_replaces_only_stale_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        assert!(stale.exists());
+        let listener = UnixListener::bind(stale.to_str().unwrap()).unwrap();
+        // A live socket is not removed.
+        assert!(UnixListener::bind(stale.to_str().unwrap()).is_err());
+        drop(listener);
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, "keep").unwrap();
+        assert!(UnixListener::bind(regular.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read_to_string(&regular).unwrap(), "keep");
+        assert!(unix_peer_addr().ip().is_unspecified());
     }
 
     #[test]

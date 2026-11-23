@@ -94,15 +94,16 @@ pub fn static_router(content_path: impl Into<PathBuf>, url_base: &str) -> Router
         root: Arc::new(content_path.into()),
         url_base: base.clone(),
     };
-    let router = Router::new()
-        .route("/", get(serve_index))
-        .route("/{*path}", get(serve_path))
-        .with_state(files);
-    if base.is_empty() {
+    // Register prefixed routes directly: a nested `/{*path}` would not match `{base}/`.
+    let router = Router::new().route(&format!("{base}/"), get(serve_index));
+    let router = if base.is_empty() {
         router
     } else {
-        Router::new().nest(&base, router)
-    }
+        router.route(&base, get(serve_index))
+    };
+    router
+        .route(&format!("{base}/{{*path}}"), get(serve_path))
+        .with_state(files)
 }
 
 fn normalize_base(base: &str) -> String {

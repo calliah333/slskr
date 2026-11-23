@@ -1,30 +1,91 @@
 //! Dispatch of complete frames from an identified peer message connection.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::SoulseekClient;
+use crate::error::Error;
 use crate::events::Event;
 use crate::model::{BrowseResponse, SearchQuery, UserInfo};
+use crate::net::connection::{FrameObserver, FrameProgress};
 use crate::net::message_connection::MessageConnection;
 use crate::net::waiter::WaitKey;
 use crate::protocol::codes::PeerCode;
 use crate::protocol::peer::{FolderContentsResponse, PeerIncoming};
 use crate::resolvers::Resolvers;
 
-pub(super) fn browse_key(id: u64) -> WaitKey {
-    WaitKey("peer.browse", id.to_string())
+/// Requests answered concurrently per connection; further requests wait for a slot.
+const MAX_CONCURRENT_ANSWERS: usize = 4;
+
+// Responses are keyed by user, not socket: a peer may answer on another connection.
+
+pub(super) fn browse_key(username: &str) -> WaitKey {
+    WaitKey("peer.browse", username.to_owned())
 }
 
-pub(super) fn directory_key(id: u64, token: u32) -> WaitKey {
-    WaitKey("peer.directory", format!("{id}:{token}"))
+/// Completed with the body length once a browse response starts arriving.
+pub(super) fn browse_start_key(username: &str) -> WaitKey {
+    WaitKey("peer.browse.start", username.to_owned())
 }
 
-pub(super) fn info_key(id: u64) -> WaitKey {
-    WaitKey("peer.info", id.to_string())
+pub(super) fn directory_key(username: &str, token: u32) -> WaitKey {
+    WaitKey("peer.directory", format!("{token}:{username}"))
+}
+
+pub(super) fn info_key(username: &str) -> WaitKey {
+    WaitKey("peer.info", username.to_owned())
+}
+
+/// Browse responses read (or being read) on one connection, in frame order;
+/// `true` when the frame's start was claimed by a waiting [`SoulseekClient::browse`].
+#[derive(Default)]
+pub(super) struct BrowseTracking {
+    frames: VecDeque<bool>,
+    current: bool,
+}
+
+pub(super) type Tracking = Arc<Mutex<BrowseTracking>>;
+
+fn lock(tracking: &Tracking) -> std::sync::MutexGuard<'_, BrowseTracking> {
+    tracking.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Observes frames as the reader receives them, so a browse can stop its response
+/// timeout as soon as the response starts and report progress while it streams.
+pub(super) fn observer(client: &SoulseekClient, username: &str) -> (FrameObserver, Tracking) {
+    let weak = Arc::downgrade(client.inner());
+    let username = username.to_owned();
+    let tracking = Tracking::default();
+    let state = tracking.clone();
+    let observer: FrameObserver = Arc::new(move |progress: &FrameProgress| {
+        if progress.code != PeerCode::BrowseResponse as u32 {
+            return;
+        }
+        let Some(inner) = weak.upgrade() else { return };
+        let mut state = lock(&state);
+        if progress.first {
+            let claimed = inner
+                .waiter
+                .complete(&browse_start_key(&username), progress.total as u64);
+            state.frames.push_back(claimed);
+            state.current = claimed;
+        }
+        let report = state.current && progress.received < progress.total;
+        drop(state);
+        if report {
+            // The completed size is reported by browse() once the response is decoded.
+            inner.emit(Event::BrowseProgressUpdated {
+                username: username.clone(),
+                bytes_transferred: progress.received as u64,
+                size: progress.total as u64,
+            });
+        }
+    });
+    (observer, tracking)
 }
 
 pub(super) fn spawn(
@@ -33,11 +94,15 @@ pub(super) fn spawn(
     connection: MessageConnection,
     mut incoming: mpsc::Receiver<Bytes>,
     session: CancellationToken,
+    tracking: Tracking,
 ) {
     let weak = Arc::downgrade(client.inner());
     tokio::spawn(async move {
         let id = connection.id();
         let remote = connection.remote();
+        // Answers run beside the read loop and end with this connection or the session.
+        let answers = session.child_token();
+        let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_ANSWERS));
         loop {
             // Drain frames already read before EOF, but not after a session disconnect.
             let frame = tokio::select! {
@@ -53,13 +118,17 @@ pub(super) fn spawn(
             let inner = client.inner();
             let size = frame.len() as u64;
             let code = frame.first_chunk::<4>().copied().map(u32::from_le_bytes);
+            let code = code.and_then(|code| PeerCode::try_from(code).ok());
+            if code == Some(PeerCode::BrowseResponse) {
+                lock(&tracking).frames.pop_front();
+            }
             let message = match PeerIncoming::decode(frame) {
                 Ok(message) => message,
                 Err(error) => {
                     tracing::debug!(%username, %remote, %error, "Invalid peer message");
-                    let key = match code.and_then(|code| PeerCode::try_from(code).ok()) {
-                        Some(PeerCode::BrowseResponse) => Some(browse_key(id)),
-                        Some(PeerCode::InfoResponse) => Some(info_key(id)),
+                    let key = match code {
+                        Some(PeerCode::BrowseResponse) => Some(browse_key(&username)),
+                        Some(PeerCode::InfoResponse) => Some(info_key(&username)),
                         _ => None,
                     };
                     if let Some(key) = key {
@@ -70,15 +139,18 @@ pub(super) fn spawn(
             };
             match message {
                 PeerIncoming::BrowseResponse(response) => {
-                    inner.waiter.complete(&browse_key(id), (response, size));
-                }
-                PeerIncoming::InfoResponse(response) => {
-                    inner.waiter.complete(&info_key(id), response);
-                }
-                PeerIncoming::FolderContentsResponse(response) => {
                     inner
                         .waiter
-                        .complete(&directory_key(id, response.token), response.directories);
+                        .complete(&browse_key(&username), (response, size));
+                }
+                PeerIncoming::InfoResponse(response) => {
+                    inner.waiter.complete(&info_key(&username), response);
+                }
+                PeerIncoming::FolderContentsResponse(response) => {
+                    inner.waiter.complete(
+                        &directory_key(&username, response.token),
+                        response.directories,
+                    );
                 }
                 PeerIncoming::SearchResponse(response) => {
                     inner.searches.handle_search_response(&client, response);
@@ -109,17 +181,45 @@ pub(super) fn spawn(
                     };
                     let events = inner.events.clone();
                     drop(client);
-                    tokio::select! {
+                    let slot = tokio::select! {
                         biased;
                         _ = session.cancelled() => break,
-                        _ = connection.closed() => {},
-                        _ = answer(resolvers.as_ref(), &username, &connection, request, local_username, &events) => {},
-                    }
+                        // Nothing can be sent; keep draining what was already read.
+                        _ = connection.closed() => continue,
+                        slot = slots.clone().acquire_owned() => slot.expect("answer slots are never closed"),
+                    };
+                    let connection = connection.clone();
+                    let username = username.clone();
+                    let cancel = answers.clone();
+                    tokio::spawn(async move {
+                        let _slot = slot;
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {},
+                            _ = connection.closed() => {},
+                            _ = answer(resolvers.as_ref(), &username, &connection, request, local_username, &events) => {},
+                        }
+                    });
                 }
             }
         }
+        answers.cancel();
         connection.close();
         if let Some(inner) = weak.upgrade() {
+            // A browse response cut off mid-frame must not leave its caller waiting.
+            let interrupted = lock(&tracking)
+                .frames
+                .drain(..)
+                .filter(|&claimed| claimed)
+                .count();
+            for _ in 0..interrupted {
+                inner.waiter.throw(
+                    &browse_key(&username),
+                    Error::Connection(format!(
+                        "Peer connection to {username} ({remote}) closed while receiving a browse response"
+                    )),
+                );
+            }
             inner.peers.forget_message(&username, id);
         }
     });

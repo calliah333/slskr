@@ -396,6 +396,8 @@ struct Inner {
     decoding: DecodingKey,
     validation: Validation,
     credentials: RwLock<Credentials>,
+    /// `web.url_base` without a trailing slash; empty at the root.
+    url_base: String,
 }
 
 /// Authentication service; cheap to clone.
@@ -432,17 +434,24 @@ fn bearer_token(parts: &Parts) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-/// slskd only reads `access_token` (and bearer API keys) for SignalR hub paths.
-fn is_hub_request(parts: &Parts) -> bool {
+/// slskd only reads `access_token` (and bearer API keys) for SignalR hub paths: after
+/// `UsePathBase` strips `url_base`, the path must start with the `/hub` segment.
+fn is_hub_request(parts: &Parts, url_base: &str) -> bool {
     let path = parts
         .extensions
         .get::<OriginalUri>()
         .map_or_else(|| parts.uri.path(), |uri| uri.0.path());
-    path.contains("/hub/") || path.ends_with("/hub")
+    let path = match path.strip_prefix(url_base) {
+        Some(rest) if !url_base.is_empty() && (rest.is_empty() || rest.starts_with('/')) => rest,
+        _ => path,
+    };
+    path == "/hub" || path.starts_with("/hub/")
 }
 
 /// Caller address from axum's `ConnectInfo`; unspecified when the server was not
-/// started with `into_make_service_with_connect_info`.
+/// started with `into_make_service_with_connect_info`. An unspecified address means
+/// the caller is unknown (e.g. a Unix socket peer) and never satisfies a CIDR-restricted
+/// API key.
 pub fn remote_addr(parts: &Parts) -> SocketAddr {
     parts
         .extensions
@@ -468,8 +477,16 @@ impl Auth {
                 decoding: DecodingKey::from_secret(&config.jwt_key),
                 validation,
                 credentials: RwLock::new(Credentials::from_config(&config)),
+                url_base: String::new(),
             }),
         }
+    }
+
+    /// Sets the `web.url_base` stripped before matching hub paths. Call before cloning.
+    pub fn with_url_base(mut self, url_base: &str) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("Auth configured before sharing");
+        inner.url_base = url_base.trim_end_matches('/').to_owned();
+        self
     }
 
     /// Applies hot-reloadable settings (username, password, API keys). JWT key/TTL and
@@ -582,7 +599,14 @@ impl Auth {
             .ok_or(ApiKeyError::Unknown)?;
 
         let remote = remote.to_canonical();
-        if !record.ranges.iter().any(|range| range.contains(remote)) {
+        // An unspecified address marks an unknown caller (Unix socket). slskd rejects a null
+        // address outright; keys open to a whole address family still accept it here.
+        let allowed = if remote.is_unspecified() {
+            record.ranges.iter().any(IpRange::is_full)
+        } else {
+            record.ranges.iter().any(|range| range.contains(remote))
+        };
+        if !allowed {
             return Err(ApiKeyError::OutOfRange {
                 ip: remote,
                 name: record.name.clone(),
@@ -607,7 +631,7 @@ impl Auth {
     }
 
     fn jwt_scheme(&self, parts: &Parts, remote: IpAddr) -> Option<Principal> {
-        if is_hub_request(parts) {
+        if is_hub_request(parts, &self.inner.url_base) {
             // SignalR: `access_token` query parameter wins; a bearer value may also be an API key
             let query = Query::<HashMap<String, String>>::try_from_uri(&parts.uri).ok();
             if let Some(token) = query.as_ref().and_then(|q| q.0.get("access_token")) {
@@ -1040,6 +1064,72 @@ mod tests {
             &[("authorization", "Bearer anywhere-key-0123456789")],
         );
         assert!(auth.authenticate(&p, local).is_none());
+    }
+
+    #[test]
+    fn hub_paths_are_matched_after_url_base() {
+        let auth = Auth::new(config()).with_url_base("/apps/hub/");
+        let token = auth.issue_token("admin", Role::Administrator).token;
+        let local = addr("127.0.0.1");
+        let bearer_key = [("authorization", "Bearer anywhere-key-0123456789")];
+        for path in [
+            "/apps/hub/api/v0/options",
+            "/api/v0/hubs",
+            "/apps/hubx/logs",
+        ] {
+            assert!(
+                auth.authenticate(&parts(path, &bearer_key), local)
+                    .is_none(),
+                "{path}"
+            );
+            let query = format!("{path}?access_token={token}");
+            assert!(
+                auth.authenticate(&parts(&query, &[]), local).is_none(),
+                "{path}"
+            );
+        }
+        for path in ["/apps/hub/hub/logs", "/apps/hub/hub", "/hub/logs/negotiate"] {
+            assert_eq!(
+                auth.authenticate(&parts(path, &bearer_key), local)
+                    .map(|p| p.method),
+                Some(AuthMethod::ApiKey),
+                "{path}"
+            );
+            let query = format!("{path}?access_token={token}");
+            assert_eq!(
+                auth.authenticate(&parts(&query, &[]), local)
+                    .map(|p| p.method),
+                Some(AuthMethod::Jwt),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_caller_only_matches_unrestricted_keys() {
+        let auth = Auth::new(config());
+        let unknown = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert!(matches!(
+            auth.authenticate_api_key("local-key-0123456789", unknown),
+            Err(ApiKeyError::OutOfRange { .. })
+        ));
+        assert!(
+            auth.authenticate_api_key("anywhere-key-0123456789", unknown)
+                .is_ok()
+        );
+        let auth = Auth::new(AuthConfig {
+            api_keys: vec![ApiKey {
+                name: "zero".into(),
+                key: "zero-net-key-0123456789".into(),
+                role: Role::ReadOnly,
+                cidr: "0.0.0.0/8".into(),
+            }],
+            ..config()
+        });
+        assert!(
+            auth.authenticate_api_key("zero-net-key-0123456789", unknown)
+                .is_err()
+        );
     }
 
     #[test]

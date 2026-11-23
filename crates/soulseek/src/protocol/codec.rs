@@ -189,16 +189,14 @@ impl MessageReader {
         Ok(self.buf.get_u64_le())
     }
 
-    /// Reads a length-prefixed string; UTF-8 with Windows-1252 fallback.
+    /// Reads a length-prefixed string; UTF-8 with ISO-8859-1 fallback (each byte maps
+    /// to the code point of the same value), matching Soulseek.NET.
     pub fn string(&mut self) -> Result<String, ProtocolError> {
         let len = self.u32()? as usize;
         let raw = self.bytes(len)?;
         Ok(match std::str::from_utf8(&raw) {
             Ok(s) => s.to_owned(),
-            Err(_) => {
-                let (s, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(&raw);
-                s.into_owned()
-            }
+            Err(_) => raw.iter().map(|&b| char::from(b)).collect(),
         })
     }
 
@@ -321,6 +319,9 @@ mod tests {
         assert_eq!(r.string().unwrap(), "é");
         let mut r = MessageReader::new(Bytes::from_static(&[0, 0, 0, 0]));
         assert_eq!(r.string().unwrap(), "");
+        // ISO-8859-1, not Windows-1252: 0x80-0x9F decode to C1 controls.
+        let mut r = MessageReader::new(Bytes::from_static(&[3, 0, 0, 0, 0x80, 0x9F, 0xFF]));
+        assert_eq!(r.string().unwrap(), "\u{80}\u{9F}\u{FF}");
     }
 
     #[test]

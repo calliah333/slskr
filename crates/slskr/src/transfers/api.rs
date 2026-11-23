@@ -226,14 +226,10 @@ async fn cancel(
     Query(query): Query<Remove>,
 ) -> ApiResult<StatusCode> {
     require_non_agent(&app)?;
-    if !app
-        .services
+    app.services
         .transfers
         .cancel(direction, canonical_id(&id)?, query.remove)
-        .await?
-    {
-        return Err(not_found());
-    }
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -269,6 +265,36 @@ async fn download_position(
         .await
         .map(Json)
         .map_err(|error| ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+/// Item of the plain `POST /transfers/downloads/{username}` body. slskd binds
+/// `Size` as a signed `long`, so negative values must deserialize.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlainDownloadRequest {
+    filename: String,
+    #[serde(default)]
+    size: i64,
+}
+
+/// The plain enqueue route only applies slskd's `[Required]` filename and
+/// path-traversal checks; the stricter shape checks are batch-only.
+fn validate_plain_files(files: &[PlainDownloadRequest]) -> ApiResult<()> {
+    if files.is_empty() {
+        return Err(bad_request("At least one file is required"));
+    }
+    if files.iter().any(|file| file.filename.trim().is_empty()) {
+        return Err(bad_request("At least one filename is empty or invalid"));
+    }
+    if files
+        .iter()
+        .any(|file| destination::traverses(&file.filename))
+    {
+        return Err(bad_request(
+            "One or more files in the request contain a dangerous path traversal segment",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_files<T>(files: &[T], item: impl Fn(&T) -> (&str, Option<u64>)) -> ApiResult<()> {
@@ -324,7 +350,7 @@ async fn enqueue_downloads(
     _: RequireReadWrite,
     State(app): State<AppState>,
     Path(username): Path<String>,
-    request: Result<Json<Option<Vec<Option<QueueDownloadRequest>>>>, JsonRejection>,
+    request: Result<Json<Option<Vec<Option<PlainDownloadRequest>>>>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<EnqueueDownloadsResponse>)> {
     require_non_agent(&app)?;
     let files = body(request)?
@@ -332,13 +358,33 @@ async fn enqueue_downloads(
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| bad_request("One or more files in the request are null"))?;
-    validate_files(&files, |file| (&file.filename, Some(file.size)))?;
+    validate_plain_files(&files)?;
     let transfers = &app.services.transfers;
     let _permit = transfers.request_permit().ok_or_else(throttled)?;
+    let internal = |message: String| ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, message);
     check_peer(&app, &username)
         .await
-        .map_err(|error| ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        .map_err(|error| internal(error.to_string()))?;
+    // Upstream's download service rejects repeats after the endpoint lookup,
+    // and the controller turns that into a 500 with the exception message.
+    let mut distinct = HashSet::with_capacity(files.len());
+    if !files
+        .iter()
+        .all(|file| distinct.insert(file.filename.as_str()))
+    {
+        return Err(internal(
+            "Two or more files in request are duplicated (Parameter 'files')".into(),
+        ));
+    }
     connect_peer(&app, &username).await?;
+    let files = files
+        .into_iter()
+        .map(|file| QueueDownloadRequest {
+            filename: file.filename,
+            // slskd's `long Size` defaults to 0; anything non-positive is unknown.
+            size: file.size.max(0) as u64,
+        })
+        .collect();
     let response = transfers
         .enqueue_downloads(username, files, DownloadContext::default())
         .await?;
@@ -449,5 +495,35 @@ mod tests {
         assert_eq!(users[0].directories[0].file_count, 2);
         assert_eq!(users[0].directories[1].directory, "a");
         assert_eq!(users[1].username, "second");
+    }
+
+    #[test]
+    fn plain_enqueue_accepts_slskd_shapes_and_rejects_only_required_and_traversal() {
+        let files: Vec<PlainDownloadRequest> = serde_json::from_str(
+            r#"[{"filename":"Music\\a.flac","size":-5},{"filename":"Music\\dir\\"},
+                {"filename":"Music\\a.flac","size":3}]"#,
+        )
+        .unwrap();
+        assert_eq!(files[0].size, -5);
+        assert_eq!(files[1].size, 0);
+        // Repeats and trailing separators are not shape errors on this route.
+        assert!(validate_plain_files(&files).is_ok());
+
+        let reject = |json: &str| {
+            let files: Vec<PlainDownloadRequest> = serde_json::from_str(json).unwrap();
+            validate_plain_files(&files).unwrap_err()
+        };
+        assert!(matches!(reject("[]"), ApiError::BadRequest(_)));
+        assert!(matches!(
+            reject(r#"[{"filename":"  "}]"#),
+            ApiError::BadRequest(_)
+        ));
+        assert!(matches!(
+            reject(r#"[{"filename":"Music\\..\\secret"}]"#),
+            ApiError::BadRequest(m) if m.contains("traversal")
+        ));
+        // The batch route keeps its stricter validator.
+        let batch = [("a", Some(1)), ("a", Some(1))];
+        assert!(validate_files(&batch, |file| (file.0, file.1)).is_err());
     }
 }

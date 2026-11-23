@@ -57,6 +57,13 @@ impl TelemetryService {
         let transfers = self.transfers.clone();
         let metrics_hub = self.metrics_hub.clone();
         let shutdown = core.shutdown.clone();
+        // Like upstream MetricsHub.OnConnectedAsync, send current metrics on connect.
+        let current = transfers.clone();
+        metrics_hub.on_connected(move || {
+            serde_json::to_value(current.metrics())
+                .map(|value| vec![(hub_methods::UPDATE.to_owned(), vec![value])])
+                .unwrap_or_default()
+        });
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

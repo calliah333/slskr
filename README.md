@@ -33,6 +33,8 @@ SLSKR_CONTENT_PATH="$PWD/dist" cargo run --locked -p slskr -- --app-dir ./data
 
 Protocol and transfer tests use loopback fixtures and do not require a public
 Soulseek account. See [architecture](docs/ARCHITECTURE.md) for the crate layout.
+For repository conventions, upstream references, and targeted checks, see
+[AGENTS.md](AGENTS.md).
 
 ## Attribution
 

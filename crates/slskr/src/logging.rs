@@ -10,9 +10,10 @@ use std::{
 };
 
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use slskr_api::{
+    files::FilesystemFile,
     logs::{LogRecord, hub_methods},
     options::Options,
 };
@@ -230,7 +231,7 @@ async fn live(_admin: RequireAdmin, State(state): State<AppState>) -> Json<Vec<L
 async fn list_files(
     _admin: RequireAdmin,
     State(state): State<AppState>,
-) -> ApiResult<Json<Vec<String>>> {
+) -> ApiResult<Json<Vec<FilesystemFile>>> {
     let dir = &state.core.paths.logs_dir;
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -239,23 +240,41 @@ async fn list_files(
         }
         Err(e) => return Err(ApiError::Internal(e.into())),
     };
-    let mut names = Vec::new();
+    let mut files = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(anyhow::Error::from)?;
-        let ty = entry.file_type().map_err(anyhow::Error::from)?;
-        let name = entry.file_name();
-        if ty.is_file()
-            && !ty.is_symlink()
-            && name
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .ends_with(".log")
+        // Like upstream's IgnoreInaccessible, skip entries that cannot be inspected.
+        let Ok(entry) = entry else { continue };
+        let Ok(ty) = entry.file_type() else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Upstream skips hidden and reparse-point (symlink) entries.
+        if !ty.is_file()
+            || ty.is_symlink()
+            || name.starts_with('.')
+            || !name.to_ascii_lowercase().ends_with(".log")
         {
-            names.push(name.to_string_lossy().into_owned());
+            continue;
         }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        files.push(FilesystemFile {
+            full_name: name.clone(),
+            name,
+            length: metadata.len(),
+            attributes: Default::default(),
+            created_at: file_date(metadata.created()),
+            modified_at: file_date(metadata.modified()),
+        });
     }
-    names.sort();
-    Ok(Json(names))
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(files))
+}
+
+fn file_date(value: io::Result<std::time::SystemTime>) -> DateTime<Utc> {
+    value
+        .ok()
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(Utc::now)
 }
 
 async fn get_file(

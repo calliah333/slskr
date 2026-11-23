@@ -23,6 +23,23 @@ const COMPLETED_STATES: &str = "16, 48, 80, 144, 272, 528, 1040";
 const GENESIS: DateTime<Utc> = utc(1_609_309_320, 0);
 const MIN_TIME: DateTime<Utc> = utc(-62_135_596_800, 0);
 const MAX_TIME: DateTime<Utc> = utc(253_402_300_799, 999_999_999);
+/// Upper bound on histogram buckets. Upstream caps `buckets` at 1000 but leaves
+/// `interval` unbounded; a small interval over a huge window would otherwise
+/// allocate one map entry per interval.
+const MAX_HISTOGRAM_BUCKETS: i64 = 10_000;
+
+/// First bucket start, snapped to the Unix epoch like the SQL bucket formula.
+fn histogram_begin(start: DateTime<Utc>, seconds: i64) -> i64 {
+    start.timestamp() / seconds * seconds
+}
+
+/// Number of `seconds`-wide buckets that start before `end`.
+fn histogram_bucket_count(start: DateTime<Utc>, end: DateTime<Utc>, seconds: i64) -> i64 {
+    let seconds = seconds.max(1);
+    let end = end.timestamp() + i64::from(end.timestamp_subsec_nanos() > 0);
+    let span = (end - histogram_begin(start, seconds)).max(0);
+    (span + seconds - 1) / seconds
+}
 
 const fn utc(seconds: i64, nanos: u32) -> DateTime<Utc> {
     match DateTime::from_timestamp(seconds, nanos) {
@@ -123,17 +140,22 @@ impl ReportsService {
     ) -> anyhow::Result<TransferHistogram> {
         anyhow::ensure!(start < end, "End time must be later than start time");
         let seconds = interval_seconds.max(1);
-        let begin = start.timestamp() / seconds * seconds;
+        anyhow::ensure!(
+            histogram_bucket_count(start, end, seconds) <= MAX_HISTOGRAM_BUCKETS,
+            "Histogram would exceed {MAX_HISTOGRAM_BUCKETS} buckets"
+        );
+        let begin = histogram_begin(start, seconds);
         let (start_text, end_text) = (timestamp(start), timestamp(end));
         let direction = direction.map(str::to_owned);
         let username = username.map(str::to_owned);
+        // Build the gapless empty buckets before taking the database connection.
+        let mut histogram = TransferHistogram::new();
+        let mut bucket = begin;
+        while let Some(at) = DateTime::from_timestamp(bucket, 0).filter(|&at| at < end) {
+            histogram.insert(at, empty_summary());
+            bucket += seconds;
+        }
         self.database.call(move |db| {
-            let mut histogram = TransferHistogram::new();
-            let mut bucket = begin;
-            while let Some(at) = DateTime::from_timestamp(bucket, 0).filter(|&at| at < end) {
-                histogram.insert(at, empty_summary());
-                bucket += seconds;
-            }
             let mut stmt = db.prepare(&format!(
                 "SELECT (CAST(strftime('%s', ended_at) AS INTEGER) / ?1) * ?1, direction, state,
                     SUM(size), COUNT(*), COUNT(DISTINCT username),
@@ -519,14 +541,14 @@ async fn histogram(
             .map_err(fail)?
             .unwrap_or(GENESIS);
     }
+    let seconds = size.seconds(start, end);
+    if histogram_bucket_count(start, end, seconds) > MAX_HISTOGRAM_BUCKETS {
+        return Err(bad_request(&format!(
+            "Histogram would exceed {MAX_HISTOGRAM_BUCKETS} buckets; use a larger interval or a shorter window"
+        )));
+    }
     reports
-        .histogram(
-            start,
-            end,
-            size.seconds(start, end),
-            direction,
-            q.username(),
-        )
+        .histogram(start, end, seconds, direction, q.username())
         .await
         .map(Json)
         .map_err(fail)
@@ -673,6 +695,36 @@ mod tests {
             ..Window::default()
         };
         assert_eq!(query.histogram_size().unwrap().seconds(START, END), 24);
+    }
+
+    #[tokio::test]
+    async fn histogram_rejects_unbounded_bucket_counts() {
+        assert_eq!(histogram_bucket_count(START, END, 120), 2);
+        assert_eq!(
+            histogram_bucket_count(START, START + Duration::minutes(4), 120),
+            2
+        );
+        // interval=2 (minutes) up to year 9999 would be billions of buckets.
+        let uri = "/?interval=2&start=2021-01-01T00:00:00Z&end=9999-12-31T00:00:00Z"
+            .parse()
+            .unwrap();
+        let Query(query) = Query::<Window>::try_from_uri(&uri).unwrap();
+        let (start, end) = query.recent_bounds().unwrap();
+        let seconds = query.histogram_size().unwrap().seconds(start, end);
+        assert!(histogram_bucket_count(start, end, seconds) > MAX_HISTOGRAM_BUCKETS);
+        assert!(
+            fixture()
+                .histogram(start, end, seconds, None, None)
+                .await
+                .is_err()
+        );
+        // The buckets path stays within the cap even across the widest window.
+        let query = Window {
+            buckets: Some(1000),
+            ..Window::default()
+        };
+        let seconds = query.histogram_size().unwrap().seconds(MIN_TIME, MAX_TIME);
+        assert!(histogram_bucket_count(MIN_TIME, MAX_TIME, seconds) <= MAX_HISTOGRAM_BUCKETS);
     }
 
     fn fixture() -> ReportsService {

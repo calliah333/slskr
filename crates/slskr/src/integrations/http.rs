@@ -56,6 +56,8 @@ impl HttpIntegrations {
                     tracing::warn!(webhook = name, status = %response.status(), attempt = attempt + 1, "webhook returned failure status")
                 }
                 Err(error) => {
+                    // The configured URL may embed credentials or tokens; never log it.
+                    let error = error.without_url();
                     tracing::warn!(webhook = name, %error, attempt = attempt + 1, "webhook request failed")
                 }
             }
@@ -94,6 +96,7 @@ impl HttpIntegrations {
                     tracing::warn!(status = %response.status(), attempt = attempt + 1, "Pushbullet returned failure status")
                 }
                 Err(error) => {
+                    let error = error.without_url();
                     tracing::warn!(%error, attempt = attempt + 1, "Pushbullet request failed")
                 }
             }
@@ -124,12 +127,15 @@ fn recently_sent(key: &str, cooldown_ms: u64) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
-    if let Some(sent) = recent.get(key) {
-        if now.duration_since(*sent) < Duration::from_millis(cooldown_ms) {
-            return false;
-        }
+    let cooldown = Duration::from_millis(cooldown_ms);
+    if let Some(sent) = recent.get(key)
+        && now.duration_since(*sent) < cooldown
+    {
+        return false;
     }
-    recent.retain(|_, sent| now.duration_since(*sent) < Duration::from_secs(3600));
+    // Keep entries at least as long as the cooldown so long cooldowns are honored.
+    let retention = cooldown.max(Duration::from_secs(3600));
+    recent.retain(|_, sent| now.duration_since(*sent) < retention);
     recent.insert(key.to_owned(), now);
     true
 }

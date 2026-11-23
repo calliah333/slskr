@@ -187,12 +187,12 @@ impl Resolvers for AppResolvers {
                 }
             }
             let shares = app.services.shares.clone();
+            let limit = usize::try_from(incoming.response_file_limit).ok()?;
             let (files, _permit) =
-                tokio::task::spawn_blocking(move || (shares.search(&query), permit))
+                tokio::task::spawn_blocking(move || (shares.search(&query, limit), permit))
                     .await
                     .ok()?;
-            let mut files = files.ok()?;
-            files.truncate(usize::try_from(incoming.response_file_limit).ok()?);
+            let files = files.ok()?;
             if files.is_empty() {
                 return None;
             }
