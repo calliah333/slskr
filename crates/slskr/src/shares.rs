@@ -307,7 +307,7 @@ impl ShareService {
             .await?
     }
 
-    fn launch_scan(&self, cancel: CancellationToken) -> Option<JoinHandle<Result<()>>> {
+    pub(crate) fn launch_scan(&self, cancel: CancellationToken) -> Option<JoinHandle<Result<()>>> {
         let mut active = self.0.active.lock().unwrap();
         if active.is_some() {
             return None;

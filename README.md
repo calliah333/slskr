@@ -10,12 +10,12 @@ started as a port of [slskd](https://github.com/slskd/slskd).
 ### Docker Compose
 
 ```sh
-echo 'SLSKR_WEB_PASSWORD=choose-a-password' > .env
 docker compose up -d
+docker compose logs slskr   # shows the setup code
 ```
 
-Open <http://localhost:5030>, sign in as `admin`, and enter your Soulseek account under
-System → Options. Settings, databases and downloads live in the `slskr-data` volume
+Open <http://localhost:5030/setup> and complete [first-run setup](#first-run) with the
+setup code from the log. Settings, databases and downloads live in the `slskr-data` volume
 (`/data`). To share music, uncomment the bind mount in
 [`docker-compose.yml`](docker-compose.yml) and add `/music` to the shares. Forward port
 50300 on your router so other users can connect to you.
@@ -26,8 +26,8 @@ System → Options. Settings, databases and downloads live in the `slskr-data` v
 nix run . -- --data-dir ~/.local/share/slskr
 ```
 
-`nix build .#slskr` puts the same single binary in `result/bin/slskr`. Before the first
-start, put web credentials in `~/.local/share/slskr/slskr.toml` (see below).
+`nix build .#slskr` puts the same single binary in `result/bin/slskr`. On the first start
+it prints the setup URL; see [First run](#first-run).
 
 ### From source
 
@@ -39,6 +39,19 @@ Needs Rust, the `wasm32-unknown-unknown` target, [trunk](https://trunkrs.dev) an
 SLSKR_EMBED_UI="$PWD/dist" cargo build --release -p slskr
 ./target/release/slskr --help
 ```
+
+## First run
+
+A fresh install has no web password, so nobody can sign in yet and the API answers
+`503 setup required`. The daemon prints a one-time setup code and the setup URL
+(`http://<web.listen><web.url_base>/setup`) to its log and stderr. Open the URL, choose
+the web username and password, and optionally enter your Soulseek account and the
+directories to share. From the daemon's own machine no code is needed; from anywhere else
+(including a browser outside a Docker container) enter the code. Wrong codes are
+rate-limited. Testing a Soulseek login with an unused username registers that account.
+
+Setting `web.password` in `slskr.toml` or `SLSKR_WEB_PASSWORD` skips setup; so does
+`web.auth = false`. See [docs/API.md](docs/API.md#first-run-setup) for the details.
 
 ## Configuration
 

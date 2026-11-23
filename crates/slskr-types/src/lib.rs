@@ -19,6 +19,7 @@ pub mod search;
 pub mod server;
 pub mod session;
 pub mod settings;
+pub mod setup;
 pub mod shares;
 pub mod telemetry;
 pub mod transfers;

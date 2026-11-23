@@ -86,7 +86,11 @@ fn install_theme() -> RwSignal<bool> {
 enum Session {
     Checking,
     Login,
-    Authenticated { passthrough: bool },
+    /// No web password is set: first-run setup comes first.
+    SetupRequired,
+    Authenticated {
+        passthrough: bool,
+    },
     Error(String),
 }
 
@@ -100,9 +104,11 @@ async fn check_token() -> Result<bool, api::ApiError> {
 }
 
 async fn check_session() -> Result<Session, api::ApiError> {
-    let passthrough = !api::get::<slskr_types::session::AuthInfo>("/auth")
-        .await?
-        .enabled;
+    let auth = api::get::<slskr_types::session::AuthInfo>("/auth").await?;
+    if auth.setup_required {
+        return Ok(Session::SetupRequired);
+    }
+    let passthrough = !auth.enabled;
     Ok(if check_token().await? {
         Session::Authenticated { passthrough }
     } else {
@@ -120,6 +126,23 @@ fn ConnectionError(message: String, retry: Callback<()>) -> impl IntoView {
         <div class="ui negative message view" role="alert">
             <div class="header">"Could not connect to slskr"</div>
             <p>{message}</p>
+            <button type="button" class="ui button" on:click=move |_| retry.run(())>"Retry"</button>
+        </div>
+    }
+}
+
+/// Placeholder until the setup wizard exists: the daemon has no web password yet.
+#[component]
+fn SetupRequired(retry: Callback<()>) -> impl IntoView {
+    let setup = format!("{}/setup", config::url_base());
+    view! {
+        <div class="ui warning message view" role="alert">
+            <div class="header">"Setup required — open "{setup.clone()}</div>
+            <p>
+                "No web password is set yet. Complete first-run setup at "
+                <a href=setup.clone()>{setup.clone()}</a>
+                "; from another machine you need the setup code printed in the daemon's log."
+            </p>
             <button type="button" class="ui button" on:click=move |_| retry.run(())>"Retry"</button>
         </div>
     }
@@ -151,6 +174,7 @@ fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
     move || match session.get() {
         Session::Checking => loading().into_any(),
         Session::Login => view! { <LoginForm on_login=retry/> }.into_any(),
+        Session::SetupRequired => view! { <SetupRequired retry/> }.into_any(),
         Session::Error(message) => view! { <ConnectionError message retry/> }.into_any(),
         Session::Authenticated { passthrough } => view! {
             <AuthenticatedApp dark=dark passthrough=passthrough logout=logout retry=retry/>

@@ -144,6 +144,7 @@ fn release_number(version: &str) -> anyhow::Result<[u32; 3]> {
 async fn auth_info(State(app): State<AppState>) -> Json<AuthInfo> {
     Json(AuthInfo {
         enabled: app.options.startup().web.auth,
+        setup_required: crate::setup::required(&app),
     })
 }
 
@@ -298,7 +299,7 @@ async fn delete_api_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn settings_error(error: SettingsError) -> ApiError {
+pub(crate) fn settings_error(error: SettingsError) -> ApiError {
     match error {
         SettingsError::Pinned(message) | SettingsError::Conflict(message) => {
             ApiError::Conflict(message)

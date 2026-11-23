@@ -7,6 +7,7 @@ use std::{
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
     time::{sleep, timeout},
 };
@@ -14,6 +15,9 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Error as WsError, Message as WsMessage, client::IntoClientRequest},
 };
+
+/// The web password chosen during first-run setup.
+const PASSWORD: &str = "smoke-secret";
 
 struct Daemon(Child);
 
@@ -43,7 +47,7 @@ async fn daemon_http_smoke() {
     let share_path = serde_json::to_string(&shares_dir.to_string_lossy()).unwrap();
     // JSON string escaping is valid TOML basic-string escaping.
     let config = format!(
-        "[soulseek]\nconnect = false\n\n[shares]\ndirectories = [{share_path}]\n\n[web]\nlisten = \"127.0.0.1:{port}\"\nurl_base = \"/client\"\nusername = \"smoke\"\npassword = \"secret\"\n"
+        "[soulseek]\nconnect = false\n\n[shares]\ndirectories = [{share_path}]\n\n[web]\nlisten = \"127.0.0.1:{port}\"\nurl_base = \"/client\"\nusername = \"smoke\"\n"
     );
     std::fs::write(data_dir.path().join("slskr.toml"), &config).unwrap();
 
@@ -56,10 +60,11 @@ async fn daemon_http_smoke() {
         .env_remove("SLSKR_CONFIG")
         .kill_on_drop(true)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut daemon = Daemon(child);
+    let mut stderr = BufReader::new(daemon.0.stderr.take().unwrap()).lines();
     let base = format!("http://127.0.0.1:{port}");
     // The session cookie's path is the url_base, so use the prefixed API.
     let api = format!("{base}/client/api");
@@ -88,6 +93,98 @@ async fn daemon_http_smoke() {
     .await
     .expect("slskr HTTP listener did not become ready");
 
+    // First run: no web password anywhere, so the API waits for setup.
+    let gated = client
+        .get(format!("{api}/application"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gated.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let gated: Value = gated.json().await.unwrap();
+    assert_eq!(gated, serde_json::json!({"error": "setup required"}));
+    let auth: Value = client
+        .get(format!("{api}/auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        auth,
+        serde_json::json!({"enabled": true, "setup_required": true})
+    );
+    // The setup code and URL are printed on stderr.
+    let (code, url) = timeout(Duration::from_secs(10), async {
+        let (mut code, mut url) = (None, None);
+        while code.is_none() || url.is_none() {
+            let line = stderr.next_line().await.unwrap().expect("setup banner");
+            if let Some(rest) = line.split("Setup code").nth(1) {
+                code = rest.rsplit(' ').next().map(str::to_owned);
+            }
+            if let Some(rest) = line.split("Open ").nth(1) {
+                url = rest.split(' ').next().map(str::to_owned);
+            }
+        }
+        (code.unwrap(), url.unwrap())
+    })
+    .await
+    .expect("the setup banner was printed");
+    assert_eq!(url, format!("{base}/client/setup"));
+    // Keep draining stderr so the daemon never blocks on it.
+    tokio::spawn(async move { while let Ok(Some(_)) = stderr.next_line().await {} });
+
+    // Through a (pretend) reverse proxy the caller is not local and needs the code.
+    let setup_status = |proxied: bool| {
+        let mut request = client.get(format!("{api}/setup"));
+        if proxied {
+            request = request.header("x-forwarded-for", "192.0.2.7");
+        }
+        request.send()
+    };
+    let status: Value = setup_status(true).await.unwrap().json().await.unwrap();
+    assert_eq!(status["required"], true);
+    assert_eq!(status["code_required"], true);
+    assert_eq!(status["web_username_pinned"], true);
+    let status: Value = setup_status(false).await.unwrap().json().await.unwrap();
+    assert_eq!(status["code_required"], false);
+    let setup = |code: &str| {
+        client
+            .post(format!("{api}/setup"))
+            .header("x-forwarded-for", "192.0.2.7")
+            .json(&serde_json::json!({
+                "code": code,
+                "web": {"username": "smoke", "password": PASSWORD},
+            }))
+            .send()
+    };
+    let wrong = setup("AAAA-AAAA-AAAA").await.unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::FORBIDDEN);
+    let done = setup(&code).await.unwrap();
+    assert_eq!(done.status(), reqwest::StatusCode::CREATED);
+    assert!(
+        done.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .starts_with("slskr_session=")
+    );
+    // The setup cookie signs in; setup is over.
+    let session = client.get(format!("{api}/session")).send().await.unwrap();
+    assert_eq!(session.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        setup(&code).await.unwrap().status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let store = std::fs::read_to_string(data_dir.path().join("settings.json")).unwrap();
+    assert!(store.contains("$argon2id$") && !store.contains(PASSWORD));
+    client
+        .delete(format!("{api}/session"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
     let anonymous = client.get(format!("{api}/session")).send().await.unwrap();
     assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
 
@@ -103,7 +200,7 @@ async fn daemon_http_smoke() {
 
     let login = client
         .post(format!("{api}/session"))
-        .json(&serde_json::json!({"username": "smoke", "password": "secret"}))
+        .json(&serde_json::json!({"username": "smoke", "password": PASSWORD}))
         .send()
         .await
         .unwrap();
@@ -260,17 +357,18 @@ async fn daemon_http_smoke() {
         "soulseek.connect",
         "shares.directories",
         "web.listen",
-        "web.password",
         "web.url_base",
         "web.username",
     ] {
         assert!(pinned.contains(&key), "{key} not in {pinned:?}");
     }
     assert!(!pinned.contains(&"uploads.slots"));
+    // Set during first-run setup: stored as a hash, not pinned.
+    assert!(!pinned.contains(&"web.password"));
     assert_eq!(settings["secrets_set"], serde_json::json!(["web.password"]));
     assert!(settings["values"]["web"].get("password").is_none());
     assert_eq!(settings["values"]["web"]["username"], "smoke");
-    assert!(!settings.to_string().contains("\"secret\""), "{settings}");
+    assert!(!settings.to_string().contains(PASSWORD), "{settings}");
     assert_eq!(settings["pending_restart"], false);
 
     let patch = |body: Value| client.patch(format!("{api}/settings")).json(&body).send();
@@ -572,7 +670,7 @@ async fn daemon_http_smoke() {
     let forged = client
         .post(format!("{api}/session"))
         .header("origin", "http://evil.example")
-        .json(&serde_json::json!({"username": "smoke", "password": "secret"}))
+        .json(&serde_json::json!({"username": "smoke", "password": PASSWORD}))
         .send()
         .await
         .unwrap();

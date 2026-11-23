@@ -24,12 +24,14 @@ keeps it in step with the router.
   was (the body lists `enqueued` and `failed` files).
 - **Errors**: every error is `{"error": "<message>"}` with a 4xx or 5xx status: `400`
   malformed JSON, query or path, or an invalid value; `401` not signed in; `403` role too
-  low or a cross-site request; `404` no such route or resource; `405` method not allowed;
-  `409` conflicting state (already exists, not logged in to Soulseek, a pinned setting);
-  `413` body too large; `415` missing JSON content type; `422` well-formed JSON of the
-  wrong shape; `429` another enqueue request is running; `500` an unexpected failure;
-  `503` the server connection dropped while a room request was pending; `504` a peer or
-  the server did not answer in time.
+  low, a cross-site request, or a missing or wrong setup code; `404` no such route or
+  resource; `405` method not allowed; `409` conflicting state (already exists, not logged
+  in to Soulseek, a pinned setting); `413` body too large; `415` missing JSON content type;
+  `422` well-formed JSON of the wrong shape; `429` another enqueue request or login test is
+  running, or too many wrong setup codes (with `Retry-After`); `500` an unexpected failure;
+  `503` first-run setup is required (`{"error": "setup required"}`, see
+  [below](#first-run-setup)), or the server connection dropped while a room request was
+  pending; `504` a peer or the server did not answer in time.
 
 ## Authentication
 
@@ -46,13 +48,65 @@ A request is authenticated by one of:
 Roles, lowest first: `readonly` (read everything except logs and settings), `readwrite`
 (also act: search, download, chat, connect), `admin` (also logs). Routes marked
 **admin session** need a signed-in administrator and refuse API keys. **none** routes
-need no authentication.
+need no authentication. **admin or setup** routes need an administrator (session or API
+key) once setup is done, and before that a [setup caller](#first-run-setup).
+
+## First-run setup
+
+While `web.auth` is enabled and no web password is set anywhere (no password set from the
+UI, none in `slskr.toml` or `SLSKR_WEB_PASSWORD`), nobody can sign in. Until setup is
+completed, every API route except `GET /api/auth`, `/api/setup`,
+`/api/soulseek/test-login` and `/api/fs/dirs` answers `503 {"error": "setup required"}`
+(`/health` and the web UI keep working). `GET /api/auth` and `GET /api/setup` say whether
+setup is required.
+
+The daemon then logs a one-time **setup code** (`XXXX-XXXX-XXXX`, at WARN and on stderr)
+with the URL of the setup page. It lives in memory only; a new one is made whenever setup
+becomes required again. A *setup caller* is either on the daemon's machine (loopback peer
+address, `Host` naming `localhost` or a loopback address, and no `Forwarded`,
+`X-Forwarded-For`, `X-Forwarded-Host` or `X-Real-IP` header) or sends the code: as `code`
+in `POST /api/setup`, or in an `X-Setup-Code` header on any setup route. Codes are
+case-insensitive and may contain spaces. A wrong code is answered after 500 ms with `403`;
+after 10 wrong codes in a minute from one address (IPv6: one /64) the address gets `429`
+with `Retry-After`, even for the right code. Requests other than `GET` must be same-origin.
+A reverse proxy on the same machine must pass the original `Host` or `X-Forwarded-For`,
+otherwise remote callers look local.
+
+`POST /api/setup` validates everything before saving anything and answers `400` naming
+every problem: `web.username` not blank, `web.password` at least 8 characters, Soulseek
+username not blank, without leading or trailing spaces and at most 30 characters, Soulseek
+password not blank, and every share an existing, readable, absolute directory. It saves the
+values like `PATCH /api/settings` (the web password as an argon2id hash; a pinned key may
+only be sent with its current value, otherwise `409`), forgets the code, signs the caller
+in like `POST /api/session`, starts a share scan when shares were given, and connects to
+Soulseek when Soulseek credentials were given and `soulseek.connect` is true.
+
+`POST /api/soulseek/test-login` logs in to `soulseek.server` with the given credentials on
+a separate short-lived connection (no listener, no distributed network) and disconnects;
+the running session is untouched. It answers `200 {"ok": true, "reason": null, "message":
+null}` or `200 {"ok": false, "reason": ..., "message": "<server or connection message>"}`
+with `reason` one of `invalid_password`, `invalid_username`, `server_full`,
+`server_private`, `invalid_version`, `rejected`, `unreachable`, `timeout` (10 s) or
+`error`. It answers `409` when `soulseek.connect` is false or the client is already
+connected under that username (testing would disconnect it), and `429` while another test
+runs. **Logging in with an unused username registers that account** on the Soulseek
+server, with the given password.
+
+`GET /api/fs/dirs` lists the subdirectories of an absolute local path (default: the
+daemon's home directory) for choosing shares: no files, sorted by name, symlinks to
+directories included, unreadable entries skipped, at most 1000 (`truncated` says when more
+exist). It reveals local directory names to administrators and setup callers; that is its
+purpose, so keep administrator access to trusted people.
 
 ## Routes
 
 | Method | Path | Role | Request | Response |
 | --- | --- | --- | --- | --- |
-| GET | `/api/auth` | none | | `AuthInfo` `{enabled}` |
+| GET | `/api/auth` | none | | `AuthInfo` `{enabled, setup_required}` |
+| GET | `/api/setup` | none | | `SetupStatus` `{required, code_required, web_username_pinned, web_password_pinned, soulseek_configured, soulseek_pinned}` |
+| POST | `/api/setup` | setup | `SetupRequest` `{code?, web: {username, password}, soulseek?: {username, password}, shares?: [path]}` | 201 `Session`, sets the cookie; 409 once setup is done |
+| POST | `/api/soulseek/test-login` | admin or setup | `Credentials` `{username, password}` | `LoginTestResult` `{ok, reason, message}`; 409 with `soulseek.connect = false` |
+| GET | `/api/fs/dirs` | admin or setup | `?path=<absolute directory>` (default: home) | `DirectoryListing` `{path, parent, dirs: [{name, path}], truncated}` |
 | GET | `/api/session` | readonly | | `Session` `{username, role}` |
 | POST | `/api/session` | none | `LoginRequest` `{username, password}` | 201 `Session`, sets the cookie |
 | DELETE | `/api/session` | none | | 204, clears the cookie |
@@ -159,6 +213,7 @@ Outside `/api`: `GET {url_base}/health` answers `200` without authentication, an
 | `MessageDirection` | `in`, `out` |
 | `EventType` | `download_file_complete`, `download_directory_complete`, `upload_file_complete`, `private_message_received`, `room_message_received`, `server_connected`, `server_disconnected` |
 | `Role` | `readonly`, `readwrite`, `admin` |
+| `LoginTestFailure` | `invalid_password`, `invalid_username`, `server_full`, `server_private`, `invalid_version`, `rejected`, `unreachable`, `timeout`, `error` |
 
 Transfer reports key their maps by direction and then by final `TransferState`
 (`{"upload": {"succeeded": {...}}}`).

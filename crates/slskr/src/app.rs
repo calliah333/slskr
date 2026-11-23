@@ -79,6 +79,8 @@ pub struct Services {
 pub struct AppInner {
     pub core: Core,
     pub services: Services,
+    /// First-run setup: the one-time setup code and its attempt limits.
+    pub setup: crate::setup::Setup,
     connection: watch::Sender<ConnectionDirective>,
     restart: AtomicBool,
     pub(crate) search_filters: RwLock<Vec<regex::Regex>>,
@@ -110,6 +112,7 @@ impl AppInner {
         Self {
             core,
             services,
+            setup: crate::setup::Setup::new(),
             connection: watch::channel(ConnectionDirective {
                 enabled,
                 revision: 0,
@@ -207,6 +210,7 @@ impl AppState {
             .spawn_publisher(self.bus.clone(), self.shutdown.clone());
         crate::logging::start_retention(&self.core);
         self.auth.sessions().spawn_pruner(self.shutdown.clone());
+        crate::setup::sync(self);
         self.services.users.start(self.clone());
         self.services.shares.start();
         self.services.files.start(self.clone());
@@ -465,6 +469,7 @@ impl AppState {
             }
             let current = receiver.borrow_and_update().clone();
             self.auth.update(&crate::config::auth_config(&current));
+            crate::setup::sync(&self);
             if previous.search.ignore_queries != current.search.ignore_queries {
                 *self
                     .search_filters

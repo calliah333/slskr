@@ -300,6 +300,12 @@ impl ConfigStore {
         self.view(&layers, &self.get())
     }
 
+    /// Dotted keys set by the file, the environment or the command line.
+    pub async fn pinned(&self) -> BTreeSet<String> {
+        let layers = self.0.layers.lock().await;
+        self.0.sources.pinned(&layers.file).into_keys().collect()
+    }
+
     fn view(&self, layers: &Layers, config: &Config) -> Settings {
         let web = &config.web;
         let api_keys = web

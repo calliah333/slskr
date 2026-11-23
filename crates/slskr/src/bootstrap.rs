@@ -1,12 +1,6 @@
 //! Command line, application construction and HTTP server lifetime.
 
-use std::{
-    ffi::OsString,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{ffi::OsString, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -31,7 +25,7 @@ use crate::{
     logging, messaging,
     realtime::{self, EventBus},
     resolvers::AppResolvers,
-    search, shares,
+    search, setup, shares,
     state::StateStore,
     telemetry, transfers, users, web,
 };
@@ -152,12 +146,10 @@ async fn build(
         web_dir,
         data_dir,
     };
-    tokio::fs::create_dir_all(&paths.db_dir).await?;
-    tokio::fs::create_dir_all(&startup.downloads.directory).await?;
-    tokio::fs::create_dir_all(&startup.downloads.incomplete_directory).await?;
+    create_dirs(&paths, startup).await?;
     let bus = EventBus::new();
     let logs = logging::init(startup, &paths, bus.clone())?;
-    warn_about_web_access(startup, &paths.config_file);
+    warn_about_web_access(startup);
     match &paths.web_dir {
         Some(dir) => tracing::info!(dir = %dir.display(), "serving the web UI from a directory"),
         None if !web::EMBEDDED => tracing::warn!(
@@ -165,6 +157,24 @@ async fn build(
         ),
         None => {}
     }
+    assemble(paths, options, bus, logs).await
+}
+
+async fn create_dirs(paths: &Paths, startup: &Config) -> Result<()> {
+    tokio::fs::create_dir_all(&paths.db_dir).await?;
+    tokio::fs::create_dir_all(&startup.downloads.directory).await?;
+    tokio::fs::create_dir_all(&startup.downloads.incomplete_directory).await?;
+    Ok(())
+}
+
+/// Builds the core handles and every service (after logging is set up).
+async fn assemble(
+    paths: Paths,
+    options: ConfigStore,
+    bus: EventBus,
+    logs: logging::LogBuffer,
+) -> Result<AppState> {
+    let startup = options.startup();
     let current = options.get();
     let sessions = SessionStore::open(
         &paths.db_dir.join("sessions.db"),
@@ -233,6 +243,7 @@ fn rest_routes() -> Routes {
         .merge(telemetry::routes())
         .merge(search::routes())
         .merge(messaging::routes())
+        .merge(setup::routes())
 }
 
 fn socket_routes() -> Routes {
@@ -252,7 +263,7 @@ async fn events_socket(State(app): State<AppState>, request: Request) -> Respons
     .await
 }
 
-fn router(app: &AppState) -> Router {
+pub(crate) fn router(app: &AppState) -> Router {
     use tower_http::compression::{CompressionLayer, CompressionLevel};
     let not_found = || async { http::error_response(StatusCode::NOT_FOUND, "") };
     // Compress JSON responses cheaply; the WebSocket is merged in after the layer.
@@ -272,7 +283,12 @@ fn router(app: &AppState) -> Router {
             socket_routes()
                 .into_router()
                 .layer(axum::middleware::from_fn(http::json_errors)),
-        );
+        )
+        // Until first-run setup is done, only the setup routes answer.
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            setup::gate,
+        ));
     let mut endpoints = Router::new()
         .merge(api)
         .route("/health", get(|| async { StatusCode::OK }));
@@ -334,7 +350,9 @@ fn default_data_dir() -> Result<PathBuf> {
         .join("slskr"))
 }
 
-fn warn_about_web_access(config: &Config, file: &Path) {
+/// Warns when authentication is disabled. A missing web password is announced by
+/// first-run setup (`setup::sync`), with the setup code.
+fn warn_about_web_access(config: &Config) {
     let web = &config.web;
     if !web.auth {
         // Process logs only go to the log buffer and files, so say this on stderr as well.
@@ -353,11 +371,6 @@ fn warn_about_web_access(config: &Config, file: &Path) {
                 "web.auth is disabled on a non-loopback address: anyone on the network has full control of this daemon"
             );
         }
-    } else if web.password.is_empty() && web.password_hash.is_empty() {
-        tracing::warn!(
-            file = %file.display(),
-            "web.password is not set; web sign-in is disabled until it is configured"
-        );
     }
 }
 
@@ -403,9 +416,36 @@ fn serve<L: Listener<Addr = SocketAddr>>(
     });
 }
 
+/// An application on `data_dir` with `file` as `slskr.toml` and `env` as `SLSKR_*`
+/// variables, without global logging or background tasks, for router tests.
+#[cfg(test)]
+pub(crate) async fn test_app(
+    data_dir: &std::path::Path,
+    file: &str,
+    env: &[(&str, &str)],
+) -> Result<AppState> {
+    let config_file = data_dir.join(config::FILE_NAME);
+    std::fs::write(&config_file, file)?;
+    let vars = env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned()));
+    let sources = Sources::new(data_dir.into(), vars, Overrides::default())?;
+    let options = ConfigStore::load(config_file.clone(), sources).await?;
+    let paths = Paths {
+        config_file,
+        db_dir: data_dir.join("db"),
+        logs_dir: data_dir.join("logs"),
+        web_dir: None,
+        data_dir: data_dir.into(),
+    };
+    create_dirs(&paths, options.startup()).await?;
+    let bus = EventBus::new();
+    let logs = logging::LogBuffer::new(bus.clone());
+    assemble(paths, options, bus, logs).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn parse_command_line() {

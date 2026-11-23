@@ -63,7 +63,7 @@ prevent startup. Do not edit `settings.json` by hand; it is replaced on every ch
 | `web.listen` | `"127.0.0.1:5030"` | `SLSKR_WEB_LISTEN` | yes | Address of the web UI and API. |
 | `web.url_base` | `"/"` | `SLSKR_WEB_URL_BASE` | yes | Path prefix behind a reverse proxy, e.g. `"/slskr"`. |
 | `web.username` | `"admin"` | `SLSKR_WEB_USERNAME` | | Web sign-in name. Changing it signs out every browser. |
-| `web.password` | `""` | `SLSKR_WEB_PASSWORD` | | Web sign-in password; empty disables sign-in. Changing it signs out every browser. |
+| `web.password` | `""` | `SLSKR_WEB_PASSWORD` | | Web sign-in password; while no password is set anywhere, the daemon waits for first-run setup (see below). Changing it signs out every browser. |
 | `web.auth` | `true` | `SLSKR_WEB_AUTH` | yes | `false` disables authentication: loopback or development only. |
 | `web.session_ttl` | `"30d"` | `SLSKR_WEB_SESSION_TTL` | | How long a browser stays signed in; each use extends it (5m–365d). |
 | `web.log_requests` | `false` | `SLSKR_WEB_LOG_REQUESTS` | yes | Log every HTTP request at info level. |
@@ -73,6 +73,18 @@ slskr serves plain HTTP. Terminate TLS at a reverse proxy, have it send
 `X-Forwarded-Proto: https` (the session cookie is then marked `Secure`) and pass the
 original `Host` header (browser requests that change state or open a WebSocket are refused
 when their `Origin` differs from `Host`).
+
+**First-run setup.** With `web.auth` enabled and no `web.password` in any layer (none set
+from the UI, in the file or in the environment), nobody can sign in: the API answers
+`503 setup required` and the daemon logs a one-time setup code and the URL
+`http://<web.listen><web.url_base>/setup`. Setup saves the web username and password (as
+a hash in `settings.json`), and optionally `soulseek.username`, `soulseek.password` and
+`shares.directories`, like the settings API: a key pinned by the file or the environment
+can only be sent with its current value. To skip setup, set `web.password` in
+`slskr.toml` or `SLSKR_WEB_PASSWORD` (do not set it to an empty string: that pins an empty
+password, and setup can not replace it). Behind a reverse proxy on the same machine, pass
+the original `Host` or `X-Forwarded-For`, or every visitor counts as local and needs no
+setup code. See [the API reference](API.md#first-run-setup).
 
 API keys are created in the UI (`POST /api/api-keys`), which shows the key
 once and stores only its SHA-256, or written in `slskr.toml` (pinned; they can not be

@@ -16,6 +16,7 @@ pub mod messaging;
 pub mod realtime;
 pub mod resolvers;
 pub mod search;
+pub mod setup;
 pub mod shares;
 pub mod state;
 pub mod telemetry;

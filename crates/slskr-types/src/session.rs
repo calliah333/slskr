@@ -2,7 +2,7 @@
 //!
 //! `POST /api/session` signs in with [`LoginRequest`] and sets the `slskr_session` cookie;
 //! `GET` returns the caller's [`Session`]; `DELETE` signs out. `GET /api/auth` says whether
-//! authentication is enabled at all.
+//! authentication is enabled at all, and whether first-run setup has to happen first.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,10 @@ pub struct Session {
 pub struct AuthInfo {
     /// False when `web.auth = false`: every request acts as an administrator.
     pub enabled: bool,
+    /// True until a web password is set: nobody can sign in, and the API answers 503 until
+    /// first-run setup (`/api/setup`) is completed.
+    #[serde(default)]
+    pub setup_required: bool,
 }
 
 #[cfg(test)]

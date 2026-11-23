@@ -3,7 +3,8 @@
 //! Paths are relative to [`api_base_url`], e.g. `api::get::<State>("/application")`.
 //! Every request carries `Content-Type: application/json` and, being same-origin, the
 //! `HttpOnly` session cookie; the UI never sees the token. A 401 from any route other than
-//! `/session`, `/server` and `/application` reloads the page, which shows the sign-in form.
+//! `/session`, `/server` and `/application` reloads the page, which shows the sign-in form;
+//! so does a `503 {"error": "setup required"}`, which then shows the setup notice.
 
 use std::fmt;
 
@@ -92,6 +93,11 @@ pub async fn request_text(
         .ok()
         .filter(|message| !message.is_empty())
         .unwrap_or_else(|| format!("Request failed with status code {status}"));
+    // The daemon lost its web password (first-run setup): the reloaded page shows the
+    // setup notice (`/auth` is never gated).
+    if status == 503 && message == slskr_types::setup::SETUP_REQUIRED {
+        reload();
+    }
     Err(ApiError { status, message })
 }
 

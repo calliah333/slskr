@@ -16,6 +16,7 @@ src/http.rs           ApiError, Json/Path/Query extractors, json_errors middlewa
 src/web.rs            web UI: embedded files (build.rs) or --web-dir, caching, SPA fallback, urlBase
 build.rs              embeds the trunk output named by SLSKR_EMBED_UI (or a placeholder page)
 src/core_api.rs       /application, /auth, /session, /server, /config, /settings, /api-keys routes
+src/setup.rs          first-run setup: setup code, the 503 gate, /setup, /soulseek/test-login, /fs/dirs routes
 src/auth/             Auth (sessions, API keys, Origin checks, extractors); session.rs: SessionStore, sessions.db
 src/resolvers.rs      impl soulseek::Resolvers by delegating to services
 src/logging.rs        tracing setup, LogBuffer (ring buffer, "log" events), /logs routes, file logs
@@ -162,6 +163,61 @@ requests skip it; with `web.auth = false` cross-site requests are refused too.
 `RequireAdminSession` refuses API keys (shutdown, restart, `/settings`, `/api-keys`). The events socket
 authenticates its upgrade with `Auth::authenticate_request` and re-checks the same
 credentials on every ping.
+
+### First run (`setup.rs`)
+Setup is required while `web.auth` is enabled and the merged configuration has neither a
+plaintext `web.password` nor `web.password_hash` (`setup::required`). `AppInner.setup`
+(`setup::Setup`) holds the one-time setup code and the wrong-code counters, in memory only.
+`setup::sync(app)` aligns them with the configuration: it runs at startup
+(`AppState::start`), after every configuration change (`watch_options`) and on the setup
+routes. When setup becomes required it generates a code (12 characters from
+`ABCDEFGHJKMNPQRSTUVWXYZ23456789`, `rand::rng()`, shown as `XXXX-XXXX-XXXX`) and announces
+it with `http://<web.listen><url_base>/setup` at WARN and on stderr (process logs do not
+reach stderr; containers show it); when setup is no longer required it forgets both.
+
+`setup::gate` is layered over the whole API router (REST and events socket) and answers
+`503 {"error": "setup required"}` for every path but `/api/auth`, `/api/setup`,
+`/api/soulseek/test-login` and `/api/fs/dirs` (paths as seen below `url_base`). 503 rather
+than 401 keeps "nobody can sign in yet" apart from "you are not signed in": the UI's 401
+handling (reload, sign-in form) and `POST /api/session` (500 `Misconfigured` without a
+password) would otherwise loop or mislead; `GET /api/auth` carries `setup_required` for the
+UI to branch on.
+
+`setup::Caller::local` treats a request as coming from the daemon's machine when the
+`ConnectInfo` peer is loopback, the `Host` (or URI authority) is `localhost` or a loopback
+literal (defeats DNS rebinding), and none of `Forwarded`, `X-Forwarded-For`,
+`X-Forwarded-Host`, `X-Real-IP` is present (a local reverse proxy makes every caller
+loopback). Others must present the code (`SetupRequest.code` or `X-Setup-Code`), compared
+in constant time after uppercasing and removing spaces and dashes. `Setup::check` keeps a
+fixed one-minute window per address (IPv6 per /64): after 10 wrong codes the address gets
+429 with `Retry-After`, also for the right code; at most 4096 addresses are tracked, and
+when they are all in a window new addresses are refused too. A wrong code is answered
+after a 500 ms async sleep. Non-GET setup requests are refused cross-site like sign-in.
+`setup::SetupAccess` (login test, directory picker) applies this rule while setup is
+required and `Auth::authorize(.., Administrator, Policy::Any)` afterwards.
+
+`POST /api/setup` holds a mutex, re-checks that setup is required (409 otherwise),
+checks the caller, validates the whole request (blocking checks of share paths on a
+blocking thread) and answers 400 with every problem joined by `; `. It then applies one
+`ConfigStore::patch` (pinned keys are left out when unchanged, otherwise the patch refuses
+them with 409), updates `Auth`, calls `setup::sync` (clearing the code), creates a session
+with `SessionStore::create` and sets the cookie like `POST /api/session`. Given shares are
+appended to `shares.directories` and scanned (`ShareService::launch_scan`, retried every
+500 ms while another scan runs); given Soulseek credentials trigger `AppState::connect`
+when `soulseek.connect` is true.
+
+`POST /api/soulseek/test-login` builds a second `SoulseekClient` from
+`config::client_options` with the listener, distributed network and diagnostics off,
+connects to `soulseek.server` under a 10 s timeout and disconnects; the running client is
+not touched. It refuses (409) when `soulseek.connect` is false or the running client is
+connected under the same username (the server would kick that session), and allows one
+test at a time (429). `LoginRejected` messages map to `invalid_password` (`INVALIDPASS`,
+`EMPTYPASSWORD`), `invalid_username`, `server_full`, `server_private`, `invalid_version` or
+`rejected`; address, connection and I/O failures to `unreachable`; timeouts to `timeout`.
+The password is never logged. `GET /api/fs/dirs` lists subdirectories on a blocking thread:
+absolute paths without `..`, `stat` semantics (symlinks to directories are listed), entries
+that can not be read or are not UTF-8 skipped, at most 20 000 entries read and 1000
+returned.
 
 ### Routes
 Each service module exposes `pub fn routes() -> http::Routes`, built with

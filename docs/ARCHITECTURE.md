@@ -127,7 +127,8 @@ The request and response types of the HTTP API and the live events. JSON is `sna
 plain enums (`TransferState`, `SearchState`, `ConnectionState`); the daemon converts the
 `soulseek` crate's bit flags at its boundary. Modules: `application` (State, version),
 `config` (the merged configuration, as in `slskr.toml`), `settings` (`/api/settings` view:
-values, pinned keys, secrets set, API keys), `error` (`{"error"}` body), `session`,
+values, pinned keys, secrets set, API keys), `setup` (first-run setup, login test,
+directory picker), `error` (`{"error"}` body), `session`,
 `server`, `logs`, `events`, `telemetry`, `search`, `transfers`, `users`, `conversations`,
 `rooms`, `shares`, `files`, `realtime` (live event protocol). No I/O, compiles to wasm.
 
