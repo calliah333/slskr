@@ -22,6 +22,11 @@ pub struct Settings {
     pub values: Config,
     /// Dotted keys set by `slskr.toml`, the environment or the command line, sorted.
     pub pinned: Vec<String>,
+    /// Dotted keys saved in `settings.json` (changed from the UI), sorted. Lists are one
+    /// key (`shares.directories`). `DELETE /api/settings/{key}` returns such a key to its
+    /// default; keys not listed here already have their default or a pinned value.
+    #[serde(default)]
+    pub stored: Vec<String>,
     /// Dotted secret keys that have a value.
     pub secrets_set: Vec<String>,
     /// True when a changed setting only takes effect after a restart.
@@ -73,6 +78,7 @@ mod tests {
     fn values_leave_secrets_out_and_round_trip() {
         let mut settings = Settings {
             pinned: vec!["web.listen".into()],
+            stored: vec!["uploads.slots".into()],
             secrets_set: vec!["web.password".into()],
             ..Default::default()
         };
@@ -81,6 +87,7 @@ mod tests {
         assert!(json["values"]["web"].get("password").is_none());
         assert_eq!(json["values"]["web"]["listen"], "127.0.0.1:5030");
         assert_eq!(json["pinned"][0], "web.listen");
+        assert_eq!(json["stored"][0], "uploads.slots");
         let back: Settings = serde_json::from_value(json).unwrap();
         assert_eq!(back.values.web.password, "");
         assert_eq!(back.secrets_set, ["web.password"]);

@@ -537,9 +537,10 @@ async fn pinned_keys_must_not_change() {
     );
     assert!(required(&h.app));
 
-    // The pinned value itself is fine.
-    let done = h.post("/api/setup", LOCAL, &[], setup_body("admin")).await;
+    // The pinned value itself is fine, and so is leaving it blank.
+    let done = h.post("/api/setup", LOCAL, &[], setup_body("")).await;
     assert_eq!(done.status, StatusCode::CREATED, "{}", done.error());
+    assert_eq!(done.body["username"], "admin");
     let saved: Value = serde_json::from_str(&h.store()).unwrap();
     assert_eq!(saved["settings"], json!({}));
 }

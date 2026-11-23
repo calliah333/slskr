@@ -6,6 +6,7 @@ mod controls;
 mod divider;
 mod dropdown;
 mod flag;
+pub mod form;
 mod header;
 mod icon;
 mod image;

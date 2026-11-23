@@ -5,4 +5,5 @@
 
 pub mod api;
 pub mod events;
+pub mod forms;
 pub mod util;

@@ -2,7 +2,7 @@ use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use leptos_router::{
     NavigateOptions,
     components::{A, Redirect, Route, Router, Routes},
-    hooks::use_location,
+    hooks::{use_location, use_navigate},
     path,
 };
 use slskr_types::{
@@ -13,7 +13,8 @@ use wasm_bindgen::{JsCast, closure::Closure};
 
 use super::{
     app_footer::AppFooter, browse::Browse, chat::Chat, dashboard::Dashboard, login_form::LoginForm,
-    rooms::Rooms, search::Searches, system::System, transfers::Transfers, users::Users,
+    rooms::Rooms, search::Searches, setup::SetupWizard, system::System, transfers::Transfers,
+    users::Users,
 };
 use crate::{
     config,
@@ -29,6 +30,16 @@ pub struct AppContext {
     pub state: RwSignal<State>,
     pub dark: RwSignal<bool>,
 }
+
+/// Lets pages end or re-check the session (e.g. after the web password changed).
+#[derive(Clone, Copy)]
+pub struct SessionControl {
+    /// Checks the session again: shows the sign-in form when it ended.
+    pub recheck: Callback<()>,
+}
+
+/// Session storage key of the page to open once first-run setup is complete.
+const SETUP_RETURN_KEY: &str = "slskr-setup-return";
 
 const THEME_KEY: &str = "slskd-theme";
 
@@ -90,15 +101,21 @@ enum Session {
     SetupRequired,
     Authenticated {
         passthrough: bool,
+        admin: bool,
     },
     Error(String),
 }
 
 /// True while the session cookie (or passthrough) authenticates; false on 401.
 async fn check_token() -> Result<bool, api::ApiError> {
-    match api::get_text("/session").await {
-        Ok(_) => Ok(true),
-        Err(error) if error.status == 401 => Ok(false),
+    Ok(session_info().await?.is_some())
+}
+
+/// The signed-in session; `None` on 401.
+async fn session_info() -> Result<Option<slskr_types::session::Session>, api::ApiError> {
+    match api::get::<slskr_types::session::Session>("/session").await {
+        Ok(session) => Ok(Some(session)),
+        Err(error) if error.status == 401 => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -109,10 +126,12 @@ async fn check_session() -> Result<Session, api::ApiError> {
         return Ok(Session::SetupRequired);
     }
     let passthrough = !auth.enabled;
-    Ok(if check_token().await? {
-        Session::Authenticated { passthrough }
-    } else {
-        Session::Login
+    Ok(match session_info().await? {
+        Some(session) => Session::Authenticated {
+            passthrough,
+            admin: passthrough || session.role == slskr_types::session::Role::Admin,
+        },
+        None => Session::Login,
     })
 }
 
@@ -131,27 +150,69 @@ fn ConnectionError(message: String, retry: Callback<()>) -> impl IntoView {
     }
 }
 
-/// Placeholder until the setup wizard exists: the daemon has no web password yet.
+fn session_storage() -> Option<web_sys::Storage> {
+    window().session_storage().ok().flatten()
+}
+
+/// First-run setup: shows the wizard at `/setup`, remembering the page that was opened so
+/// it opens once setup is complete.
 #[component]
-fn SetupRequired(retry: Callback<()>) -> impl IntoView {
-    let setup = format!("{}/setup", config::url_base());
-    view! {
-        <div class="ui warning message view" role="alert">
-            <div class="header">"Setup required — open "{setup.clone()}</div>
-            <p>
-                "No web password is set yet. Complete first-run setup at "
-                <a href=setup.clone()>{setup.clone()}</a>
-                "; from another machine you need the setup code printed in the daemon's log."
-            </p>
-            <button type="button" class="ui button" on:click=move |_| retry.run(())>"Retry"</button>
-        </div>
+fn SetupGate(on_done: Callback<()>) -> impl IntoView {
+    let navigate = use_navigate();
+    let location = use_location();
+    let base = config::url_base().trim_end_matches('/').to_owned();
+    let path = location.pathname.get_untracked();
+    let relative = path
+        .strip_prefix(base.as_str())
+        .unwrap_or(&path)
+        .trim_end_matches('/')
+        .to_owned();
+    if relative != "/setup" {
+        if !relative.is_empty()
+            && let Some(storage) = session_storage()
+        {
+            let target = format!("{relative}{}", location.search.get_untracked());
+            let target = if target.starts_with('?') {
+                format!("/{target}")
+            } else {
+                target
+            };
+            let _ = storage.set_item(SETUP_RETURN_KEY, &target);
+        }
+        navigate(
+            "/setup",
+            NavigateOptions {
+                replace: true,
+                ..Default::default()
+            },
+        );
     }
+    let done = Callback::new(move |()| {
+        let target = session_storage()
+            .and_then(|storage| {
+                let target = storage.get_item(SETUP_RETURN_KEY).ok().flatten();
+                let _ = storage.remove_item(SETUP_RETURN_KEY);
+                target
+            })
+            .filter(|target| target.starts_with('/') && !target.starts_with("/setup"))
+            .unwrap_or_else(|| "/dashboard".to_owned());
+        navigate(
+            &target,
+            NavigateOptions {
+                replace: true,
+                ..Default::default()
+            },
+        );
+        on_done.run(());
+    });
+    view! { <SetupWizard on_done=done/> }
 }
 
 #[component]
 fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
     let session = RwSignal::new(Session::Checking);
     let retry = Callback::new(move |()| session.set(Session::Checking));
+    provide_context(SessionControl { recheck: retry });
     Effect::new(move |_| {
         if session.get() == Session::Checking {
             spawn_local_scoped_with_cancellation(async move {
@@ -171,15 +232,17 @@ fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
             session.set(Session::Login);
         });
     });
-    move || match session.get() {
+    move || {
+        match session.get() {
         Session::Checking => loading().into_any(),
         Session::Login => view! { <LoginForm on_login=retry/> }.into_any(),
-        Session::SetupRequired => view! { <SetupRequired retry/> }.into_any(),
+        Session::SetupRequired => view! { <SetupGate on_done=retry/> }.into_any(),
         Session::Error(message) => view! { <ConnectionError message retry/> }.into_any(),
-        Session::Authenticated { passthrough } => view! {
-            <AuthenticatedApp dark=dark passthrough=passthrough logout=logout retry=retry/>
+        Session::Authenticated { passthrough, admin } => view! {
+            <AuthenticatedApp dark=dark passthrough=passthrough admin=admin logout=logout retry=retry/>
         }
         .into_any(),
+    }
     }
 }
 
@@ -187,13 +250,14 @@ fn SessionView(dark: RwSignal<bool>) -> impl IntoView {
 fn AuthenticatedApp(
     dark: RwSignal<bool>,
     passthrough: bool,
+    admin: bool,
     logout: Callback<()>,
     retry: Callback<()>,
 ) -> impl IntoView {
     let state = RwSignal::new(State::default());
     let options = RwSignal::new(Config::default());
     let metrics = RwSignal::new(CurrentMetrics::default());
-    // The live configuration is loaded (and gates readiness) but no view reads it yet.
+    // The live configuration gates readiness; the onboarding banner reads it.
     provide_context(AppContext { state, dark });
 
     let events = Events::start();
@@ -254,7 +318,56 @@ fn AuthenticatedApp(
             ().into_any()
         }}
         <Show when=move || ready.get()>
-            <AppShell metrics=metrics passthrough=passthrough logout=logout/>
+            <AppShell metrics=metrics options=options passthrough=passthrough admin=admin logout=logout/>
+        </Show>
+    }
+}
+
+const ONBOARDING_DISMISSED_KEY: &str = "slskr-dismiss-soulseek-onboarding";
+
+/// "Connect your Soulseek account" while no Soulseek credentials are set (and they are not
+/// pinned), until dismissed.
+#[component]
+fn SoulseekOnboarding(options: RwSignal<Config>) -> impl IntoView {
+    let dismissed = RwSignal::new(
+        local_storage()
+            .and_then(|storage| storage.get_item(ONBOARDING_DISMISSED_KEY).ok().flatten())
+            .is_some(),
+    );
+    let pinned = RwSignal::new(true);
+    spawn_local_scoped_with_cancellation(async move {
+        match api::get::<slskr_types::setup::SetupStatus>("/setup").await {
+            Ok(status) => pinned.set(status.soulseek_pinned),
+            Err(error) => leptos::logging::warn!("Could not read the setup status: {error}"),
+        }
+    });
+    // The live configuration has secrets masked, so a set password is non-empty.
+    let configured = Memo::new(move |_| {
+        options.with(|c| !c.soulseek.username.is_empty() && !c.soulseek.password.is_empty())
+    });
+    let dismiss = move |_| {
+        if let Some(storage) = local_storage() {
+            let _ = storage.set_item(ONBOARDING_DISMISSED_KEY, "1");
+        }
+        dismissed.set(true);
+    };
+    let base = config::url_base().trim_end_matches('/').to_owned();
+    view! {
+        <Show when=move || !dismissed.get() && !pinned.get() && !configured.get()>
+            <div class="ui info message onboarding-banner" role="region" aria-label="Soulseek account">
+                <button type="button" class="link-button onboarding-dismiss" style="float:right"
+                    aria-label="Dismiss" on:click=dismiss>
+                    <i class="close icon" aria-hidden="true"></i>
+                </button>
+                <div class="header">"Connect your Soulseek account"</div>
+                <p>
+                    "slskr is not connected to the Soulseek network yet. "
+                    <A href=format!("{base}/system/settings?section=soulseek") attr:class="onboarding-link">
+                        "Add your Soulseek username and password in Settings"
+                    </A>
+                    "."
+                </p>
+            </div>
         </Show>
     }
 }
@@ -267,7 +380,9 @@ fn HomeRedirect() -> impl IntoView {
 #[component]
 fn AppShell(
     metrics: RwSignal<CurrentMetrics>,
+    options: RwSignal<Config>,
     passthrough: bool,
+    admin: bool,
     logout: Callback<()>,
 ) -> impl IntoView {
     let state = expect_context::<AppContext>().state;
@@ -275,6 +390,7 @@ fn AppShell(
         <div class="ui pushable segment app">
             <Navigation passthrough logout/>
             <main class="pusher app-content">
+                {admin.then(|| view! { <SoulseekOnboarding options/> })}
                 <div class="app-content-body">
                     <Routes fallback=HomeRedirect>
                         <Route path=path!("/dashboard") view=|| view! {

@@ -127,7 +127,7 @@ The request and response types of the HTTP API and the live events. JSON is `sna
 plain enums (`TransferState`, `SearchState`, `ConnectionState`); the daemon converts the
 `soulseek` crate's bit flags at its boundary. Modules: `application` (State, version),
 `config` (the merged configuration, as in `slskr.toml`), `settings` (`/api/settings` view:
-values, pinned keys, secrets set, API keys), `setup` (first-run setup, login test,
+values, pinned and stored keys, secrets set, API keys), `setup` (first-run setup, login test,
 directory picker), `error` (`{"error"}` body), `session`,
 `server`, `logs`, `events`, `telemetry`, `search`, `transfers`, `users`, `conversations`,
 `rooms`, `shares`, `files`, `realtime` (live event protocol). No I/O, compiles to wasm.
@@ -166,6 +166,16 @@ in `assets/static/media`), so UI components must emit the same DOM/class names a
 semantic-ui-react.
 `src/ui/` holds semantic-ui-react equivalents; `src/services/` ports `src/lib/*.js`;
 `src/components/` ports `src/components/**`.
+
+The setup wizard (`components/setup.rs`, route `/setup`) and System → Settings
+(`components/system/settings*`) are slskr's own. They build their forms only from the
+components in `src/ui/form.rs` (`Section`, `Field`, `TextInput`, `Toggle`, `ListEditor`,
+`SaveBar`, …), which carry no logic and are styled by `assets/static/css/forms.css`; a new
+look for forms means restyling those two files. `Field` provides the control's `id`,
+`aria-describedby` and lock state as context. The settings page keeps a sparse draft of
+changed dotted keys (`settings/model.rs`) and saves it with one `PATCH /api/settings`.
+While first-run setup is required, every route shows the wizard at `/setup` and returns
+to the requested page afterwards.
 
 ## Build and packaging
 

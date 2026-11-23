@@ -41,7 +41,7 @@ A request is authenticated by one of:
   `GET`/`HEAD`/`OPTIONS` that carry the cookie must be same-origin: an `Origin` header
   naming another host is refused with `403`.
 - an API key in the `X-API-Key` header (scripts). Keys are created in the web UI (System →
-  Options) or with `POST /api/api-keys`, or configured in `slskr.toml`
+  Settings) or with `POST /api/api-keys`, or configured in `slskr.toml`
   (`[[web.api_keys]]`); see [configuration](CONFIGURATION.md#web).
 - nothing, when `web.auth = false`: every request acts as an administrator.
 
@@ -73,7 +73,8 @@ A reverse proxy on the same machine must pass the original `Host` or `X-Forwarde
 otherwise remote callers look local.
 
 `POST /api/setup` validates everything before saving anything and answers `400` naming
-every problem: `web.username` not blank, `web.password` at least 8 characters, Soulseek
+every problem (messages joined with `; `, each starting with the dotted key or `shares`):
+`web.username` not blank (it may be blank when it is pinned: the pinned name is kept), `web.password` at least 8 characters, Soulseek
 username not blank, without leading or trailing spaces and at most 30 characters, Soulseek
 password not blank, and every share an existing, readable, absolute directory. It saves the
 values like `PATCH /api/settings` (the web password as an argon2id hash; a pinned key may
@@ -119,7 +120,7 @@ purpose, so keep administrator access to trusted people.
 | POST | `/api/server/connect` | readwrite | | 204; 409 when no Soulseek credentials are set |
 | POST | `/api/server/disconnect` | readwrite | optional `{message}` | 204 |
 | GET | `/api/config` | readonly | | `Config`, the effective configuration with secrets as `*****` |
-| GET | `/api/settings` | admin session | | `Settings` |
+| GET | `/api/settings` | admin session | | `Settings` `{values, pinned, stored, secrets_set, pending_restart, api_keys}` |
 | PATCH | `/api/settings` | admin session | sparse configuration object; `null` resets a key | `Settings` |
 | DELETE | `/api/settings/{key}` | admin session | | `Settings`; `{key}` is dotted, e.g. `uploads.slots` |
 | GET | `/api/api-keys` | admin session | | `[ApiKeyInfo]` |
@@ -240,7 +241,7 @@ resubscribe), `1001` shutdown. See [daemon internals](DAEMON.md#live-events-srcr
 ## Example
 
 ```sh
-key=...   # created in System → Options → API keys
+key=...   # created in System → Settings → API keys
 api=http://127.0.0.1:5030/api
 curl -s -H "X-API-Key: $key" -H 'Content-Type: application/json' \
   -d '{"query": "artist album"}' "$api/searches"

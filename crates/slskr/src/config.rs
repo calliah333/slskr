@@ -327,6 +327,14 @@ impl ConfigStore {
         Settings {
             values: config.clone(),
             pinned: self.0.sources.pinned(&layers.file).into_keys().collect(),
+            stored: {
+                let mut stored: Vec<String> = store::leaves(&layers.store.settings)
+                    .into_iter()
+                    .map(|(path, _)| path.join("."))
+                    .collect();
+                stored.sort();
+                stored
+            },
             secrets_set: config.secrets_set(),
             pending_restart: restart_required(self.startup(), config),
             api_keys,
@@ -1665,6 +1673,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(settings.values.uploads.slots, 4);
+        assert_eq!(
+            settings.stored,
+            [
+                "downloads.directory",
+                "groups.friends.members",
+                "groups.friends.priority",
+                "uploads.limits.daily_files",
+                "uploads.slots"
+            ]
+        );
         assert!(settings.pending_restart, "uploads.slots needs a restart");
         assert_eq!(settings.pinned, ["web.listen"]);
         assert!(updates.has_changed().unwrap());

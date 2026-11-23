@@ -497,7 +497,11 @@ async fn complete(
     let code = request.code.as_deref().or(caller.header_code());
     authorize_code(&app, &caller, code).await?;
 
-    let username = request.web.username.trim().to_owned();
+    // A pinned username can be left blank: the pinned name is kept.
+    let mut username = request.web.username.trim().to_owned();
+    if username.is_empty() && app.options.pinned().await.contains("web.username") {
+        username = app.options.get().web.username.clone();
+    }
     let mut errors = web_errors(&username, &request.web.password);
     if let Some(soulseek) = &request.soulseek {
         errors.extend(soulseek_errors(soulseek));

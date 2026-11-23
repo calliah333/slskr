@@ -1,0 +1,58 @@
+/* Forms: setup wizard and settings (src/ui/form.rs). Restyle here for a new look. */
+.form-section{margin-bottom:1.5em!important}
+.form-section-help{color:var(--slskd-color-subtle,#666);margin-top:-.5em}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:0 1.5em}
+.ui.form .form-field{margin-bottom:1.25em}
+.form-field-head{align-items:center;display:flex;flex-wrap:wrap;gap:.5em;margin-bottom:.3em}
+.ui.form .form-field-head .form-label{display:inline;margin:0}
+.form-field-actions{margin-left:auto}
+.form-field-actions .ui.button{margin:0 0 0 .25em}
+.form-help,.form-locked{color:var(--slskd-color-subtle,#666);font-size:.9em;margin:.35em 0 0}
+.form-locked .icon{margin-right:.35em}
+.ui.form .form-field.locked input,.ui.form .form-field.locked textarea,.ui.form .form-field.locked select{opacity:.7}
+.ui.form .form-error{margin-top:.5em!important}
+.form-toggle{margin-top:.3em}
+.list-editor-items{list-style:none;margin:0;padding:0}
+.list-editor-item{margin-bottom:.4em}
+.list-editor-add{align-items:center;display:flex;gap:.5em}
+.list-editor-add>.ui.input{flex:1 1 auto}
+.form-secret{align-items:center;display:flex;flex-wrap:wrap;gap:.5em}
+.form-secret .ui.label{margin:0}
+/* Fixed above the app footer: the app's .pusher clips overflow, so sticky would not stick. */
+.save-bar{align-items:center;background:var(--smui-modal-background,#fff);border:1px solid rgba(34,36,38,.15);border-radius:.3rem;bottom:52px;box-shadow:0 2px 12px rgba(0,0,0,.3);display:flex;flex-wrap:wrap;gap:1em;left:50%;padding:.75em 1em;position:fixed;transform:translateX(-50%);width:min(960px,calc(100% - 32px));z-index:100}
+.settings{padding-bottom:5em}
+.save-bar-problem{color:#db2828}
+.save-bar-buttons{margin-left:auto}
+.settings-layout{align-items:flex-start;display:flex;gap:1.5em}
+.settings-nav.ui.vertical.menu{flex:0 0 auto;position:sticky;top:1em;width:11em}
+.settings-sections{flex:1 1 auto;min-width:0}
+@media (max-width:767px){.settings-layout{display:block}.settings-nav.ui.vertical.menu{position:static;width:100%}}
+.api-key-created input{font-family:monospace}
+.setup{margin:3em auto;max-width:760px;padding:0 16px}
+.setup-title{font-family:monospace}
+.setup-steps.ui.steps{display:flex;margin:0 0 1em;padding:0;width:100%}
+.setup-steps.ui.steps .step{flex:1 1 0;padding:.8em 1em}
+.setup-step.ui.form.segment{width:100%}
+.setup-actions{display:flex;gap:.5em;justify-content:flex-end;margin-top:1.5em}
+.setup-actions .setup-back{margin-right:auto}
+.setup-review dt{font-weight:700;margin-top:.75em}
+.setup-review dd{margin:.2em 0 0}
+.directory-picker-path{align-items:center;display:flex;flex-wrap:wrap;gap:.5em;margin-bottom:1em}
+.directory-list{max-height:50vh;overflow:auto}
+.link-button{background:none;border:0;color:var(--smui-site-link-color,#4183c4);cursor:pointer;font:inherit;padding:0;text-align:left}
+.link-button:hover{text-decoration:underline}
+.onboarding-banner{margin:1em!important}
+.visually-hidden{border:0;clip:rect(0 0 0 0);height:1px;margin:-1px;overflow:hidden;padding:0;position:absolute;white-space:nowrap;width:1px}
+.form-actions{align-items:center;display:flex;flex-wrap:wrap;gap:1em}
+.form-subsection{border-top:1px solid rgba(34,36,38,.15);margin-top:1.5em;padding-top:1em}
+.form-subsection>.ui.header .button{margin-left:1em;vertical-align:middle}
+.form-details{margin-bottom:1em}
+.form-details>summary{cursor:pointer;margin-bottom:.75em}
+.api-key-create{margin-top:1.5em}
+.pending-restart{align-items:center;display:flex;flex-wrap:wrap;gap:1em}
+.pending-restart p{margin:0}
+.form-confirm-label{display:block;font-weight:700;margin-top:.75em}
+.form-secret+.form-input,.form-secret~input{margin-top:.5em!important}
+/* Semantic hides state messages inside .ui.form unless the form has that state. */
+.ui.form .ui.message.form-message,.ui.form .ui.message.api-key-created{display:block}
+.settings .form-input,.settings select,.settings input{scroll-margin:6em 0 9em}

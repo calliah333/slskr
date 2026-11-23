@@ -202,7 +202,7 @@ async fn server(_: Authenticated, State(app): State<AppState>) -> Json<ServerSta
 async fn connect(_: RequireReadWrite, State(app): State<AppState>) -> ApiResult<StatusCode> {
     if crate::app::credentials(&app.options.get()).is_none() {
         return Err(ApiError::Conflict(
-            "Soulseek credentials are not configured; set them in System → Options".into(),
+            "Soulseek credentials are not configured; set them in System → Settings".into(),
         ));
     }
     app.connect().await?;

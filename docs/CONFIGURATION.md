@@ -1,7 +1,7 @@
 # Configuration reference
 
 Every setting slskr understands. Most people change these in the web UI (System →
-Options), which saves them to `settings.json` in the data directory. To keep a setting
+Settings), which saves them to `settings.json` in the data directory. To keep a setting
 in a file instead, put it in `slskr.toml` (see [`slskr.example.toml`](../slskr.example.toml));
 for containers and service managers, use the environment variable shown.
 
@@ -233,10 +233,11 @@ Not configuration keys, so never pinned (`slskr --help` lists them):
 
 All routes require an administrator signed in to the web UI (API keys are refused).
 
-- `GET /api/settings` returns `{values, pinned, secrets_set, pending_restart,
+- `GET /api/settings` returns `{values, pinned, stored, secrets_set, pending_restart,
   api_keys}`: the merged configuration without secrets or API keys, the pinned dotted
-  keys, the secrets that have a value, whether a restart is pending, and the API keys as
-  `{name, role, allow, pinned}`.
+  keys, the dotted keys saved in `settings.json` (those `DELETE` can return to their
+  default; a list is one key), the secrets that have a value, whether a restart is
+  pending, and the API keys as `{name, role, allow, pinned}`.
 - `PATCH /api/settings` takes any subset of `values`, e.g.
   `{"uploads": {"slots": 5}}`, and returns the same body as `GET`. Objects are merged,
   other values replace; `null` resets a key. An absent secret is unchanged;

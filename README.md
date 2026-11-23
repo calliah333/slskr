@@ -44,9 +44,9 @@ SLSKR_EMBED_UI="$PWD/dist" cargo build --release -p slskr
 
 A fresh install has no web password, so nobody can sign in yet and the API answers
 `503 setup required`. The daemon prints a one-time setup code and the setup URL
-(`http://<web.listen><web.url_base>/setup`) to its log and stderr. Open the URL, choose
-the web username and password, and optionally enter your Soulseek account and the
-directories to share. From the daemon's own machine no code is needed; from anywhere else
+(`http://<web.listen><web.url_base>/setup`) to its log and stderr. Open the URL (any page
+of the UI leads there while setup is required), choose the web username and password, and
+optionally enter your Soulseek account and the directories to share. From the daemon's own machine no code is needed; from anywhere else
 (including a browser outside a Docker container) enter the code. Wrong codes are
 rate-limited. Testing a Soulseek login with an unused username registers that account.
 
@@ -55,7 +55,7 @@ Setting `web.password` in `slskr.toml` or `SLSKR_WEB_PASSWORD` skips setup; so d
 
 ## Configuration
 
-Most settings are changed in the web UI (System → Options). Things you want to keep in a
+Most settings are changed in the web UI (System → Settings). Things you want to keep in a
 file or set before the first start (web credentials, the listen address, the URL base
 behind a reverse proxy) go in `slskr.toml` in the data directory or in
 `SLSKR_<SECTION>_<KEY>` environment variables; anything set there is locked in the UI.

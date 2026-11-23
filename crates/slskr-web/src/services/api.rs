@@ -4,9 +4,11 @@
 //! Every request carries `Content-Type: application/json` and, being same-origin, the
 //! `HttpOnly` session cookie; the UI never sees the token. A 401 from any route other than
 //! `/session`, `/server` and `/application` reloads the page, which shows the sign-in form;
-//! so does a `503 {"error": "setup required"}`, which then shows the setup notice.
+//! so does a `503 {"error": "setup required"}`, which then shows the setup wizard. While
+//! the wizard holds a setup code ([`set_setup_code`]), every request carries it in the
+//! `X-Setup-Code` header.
 
-use std::fmt;
+use std::{cell::RefCell, fmt};
 
 use gloo_net::http::{Method, RequestBuilder};
 use serde::{Serialize, de::DeserializeOwned};
@@ -17,12 +19,23 @@ use crate::config::api_base_url;
 /// Routes whose 401 responses do not trigger a logout.
 const UNAUTHORIZED_EXEMPT: [&str; 3] = ["/session", "/server", "/application"];
 
+thread_local! {
+    static SETUP_CODE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Sends `code` as the first-run setup code with every request (`None` stops).
+pub fn set_setup_code(code: Option<String>) {
+    SETUP_CODE.with(|cell| *cell.borrow_mut() = code.filter(|code| !code.trim().is_empty()));
+}
+
 /// A failed request: HTTP status (0 for network/serialization failures) and the error message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiError {
     pub status: u16,
     /// The `error` of the JSON error body, or a generic description.
     pub message: String,
+    /// Seconds from the `Retry-After` header (429).
+    pub retry_after: Option<u32>,
 }
 
 impl ApiError {
@@ -30,6 +43,7 @@ impl ApiError {
         Self {
             status: 0,
             message: message.to_string(),
+            retry_after: None,
         }
     }
 }
@@ -66,10 +80,13 @@ pub async fn request_text(
     body: Option<String>,
 ) -> Result<String, ApiError> {
     let url = format!("{}{}", api_base_url(), path);
-    let builder = RequestBuilder::new(&url)
+    let mut builder = RequestBuilder::new(&url)
         .method(method)
         .credentials(RequestCredentials::SameOrigin)
         .header("Content-Type", "application/json");
+    if let Some(code) = SETUP_CODE.with(|cell| cell.borrow().clone()) {
+        builder = builder.header(slskr_types::setup::SETUP_CODE_HEADER, &code);
+    }
 
     let response = match body {
         Some(body) => builder.body(body).map_err(ApiError::local)?.send().await,
@@ -78,6 +95,10 @@ pub async fn request_text(
     .map_err(ApiError::local)?;
 
     let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.trim().parse().ok());
     let text = response.text().await.unwrap_or_default();
 
     if response.ok() {
@@ -98,7 +119,11 @@ pub async fn request_text(
     if status == 503 && message == slskr_types::setup::SETUP_REQUIRED {
         reload();
     }
-    Err(ApiError { status, message })
+    Err(ApiError {
+        status,
+        message,
+        retry_after,
+    })
 }
 
 /// Sends a request and deserializes the JSON response.

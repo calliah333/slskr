@@ -1,6 +1,6 @@
 # slskr.toml: optional settings you want to keep in a file.
 #
-# Most settings live in the web UI (System -> Options) and are saved to settings.json in
+# Most settings live in the web UI (System -> Settings) and are saved to settings.json in
 # the data directory. Anything set here, or with an SLSKR_<SECTION>_<KEY> environment
 # variable, overrides the UI and is shown there as locked. Leave a key out to manage it
 # from the UI. Every key is listed in docs/CONFIGURATION.md.

@@ -1,10 +1,11 @@
-pub mod config;
 pub mod files;
 pub mod logs;
+pub mod settings;
 pub mod shares;
 
 use leptos::prelude::*;
-use leptos_router::components::A;
+use leptos_router::NavigateOptions;
+use leptos_router::components::{A, Redirect};
 use leptos_router::hooks::use_params_map;
 
 #[component]
@@ -23,7 +24,7 @@ pub fn System() -> impl IntoView {
     let base = base.trim_end_matches('/');
     let tabs = [
         ("info", "Info"),
-        ("options", "Options"),
+        ("settings", "Settings"),
         ("shares", "Shares"),
         ("files", "Files"),
         ("logs", "Logs"),
@@ -40,7 +41,11 @@ pub fn System() -> impl IntoView {
                 </nav>
                 <div class="ui bottom attached segment">
                     {move || match tab.read().as_str() {
-                        "options" => view! { <crate::components::system::config::Config/> }.into_any(),
+                        "settings" => view! { <settings::SettingsPage/> }.into_any(),
+                        // The tab's former name.
+                        "options" => view! {
+                            <Redirect path="/system/settings" options=NavigateOptions { replace: true, ..Default::default() }/>
+                        }.into_any(),
                         "shares" => view! { <crate::components::system::shares::Shares/> }.into_any(),
                         "files" => view! { <crate::components::system::files::Files/> }.into_any(),
                         "logs" => view! { <crate::components::system::logs::Logs/> }.into_any(),
