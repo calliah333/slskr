@@ -220,7 +220,7 @@ impl SessionStore {
 
     /// A store that keeps sessions in memory only (tests, tools).
     pub fn memory(ttl: Duration) -> Self {
-        Self::with(HashMap::new(), ttl, rand::random(), None)
+        Self::with(HashMap::new(), ttl, crate::random(), None)
     }
 
     /// Opens (or creates) the sessions database and loads unexpired sessions. Sessions
@@ -246,7 +246,7 @@ impl SessionStore {
                 let salt: [u8; 16] = match stored_salt.and_then(|salt| salt.try_into().ok()) {
                     Some(salt) => salt,
                     None => {
-                        let salt: [u8; 16] = rand::random();
+                        let salt: [u8; 16] = crate::random();
                         transaction.execute(
                             "INSERT OR REPLACE INTO meta (key, value) VALUES ('salt', ?1)",
                             params![&salt[..]],
@@ -369,7 +369,7 @@ impl SessionStore {
         role: Role,
         now: DateTime<Utc>,
     ) -> anyhow::Result<String> {
-        let raw: [u8; TOKEN_BYTES] = rand::random();
+        let raw: [u8; TOKEN_BYTES] = crate::random();
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
         let hash: TokenHash = Sha256::digest(raw).into();
         let record = SessionRecord {

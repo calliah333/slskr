@@ -11,11 +11,11 @@ use axum::{
     routing::{any, get},
     serve::{Listener, ListenerExt},
 };
-use clap::Parser;
 use slskr_types::config::Config;
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::cli::Cli;
 use crate::{
     app::{AppInner, AppState, Core, Paths, Services},
     auth::{self, Auth, SessionStore},
@@ -29,33 +29,6 @@ use crate::{
     state::StateStore,
     telemetry, transfers, users, web,
 };
-
-/// Command line. Everything else is configured in the web UI, `slskr.toml` or
-/// `SLSKR_<SECTION>_<KEY>` variables.
-#[derive(Debug, Parser)]
-#[command(
-    name = "slskr",
-    version,
-    about = "Soulseek client daemon with a web UI",
-    after_help = "Most settings are changed in the web UI. Keys set in <DATA_DIR>/slskr.toml or as \
-                  SLSKR_<SECTION>_<KEY> environment variables (e.g. SLSKR_WEB_LISTEN=0.0.0.0:5031) \
-                  override it; see docs/CONFIGURATION.md."
-)]
-pub struct Cli {
-    /// Data directory: configuration, databases, logs and downloads
-    /// [default: $XDG_DATA_HOME/slskr or ~/.local/share/slskr]
-    #[arg(long, value_name = "DIR", env = "SLSKR_DATA_DIR")]
-    pub data_dir: Option<PathBuf>,
-    /// Configuration file [default: <DATA_DIR>/slskr.toml]
-    #[arg(long, value_name = "FILE", env = "SLSKR_CONFIG")]
-    pub config: Option<PathBuf>,
-    /// Do not connect to the Soulseek server (overrides soulseek.connect)
-    #[arg(long)]
-    pub no_connect: bool,
-    /// Serve the web UI from DIR (e.g. the trunk output dist/) instead of the built-in copy
-    #[arg(long, value_name = "DIR", env = "SLSKR_WEB_DIR")]
-    pub web_dir: Option<PathBuf>,
-}
 
 pub async fn run(cli: Cli) -> Result<()> {
     let data_dir = std::path::absolute(cli.data_dir.map_or_else(default_data_dir, Ok)?)?;
@@ -450,33 +423,6 @@ pub(crate) async fn test_app(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn parse_command_line() {
-        let cli = Cli::try_parse_from([
-            "slskr",
-            "--data-dir",
-            "/tmp/slskr",
-            "--config",
-            "/etc/slskr.toml",
-            "--no-connect",
-            "--web-dir",
-            "dist",
-        ])
-        .unwrap();
-        assert_eq!(cli.data_dir.as_deref(), Some(Path::new("/tmp/slskr")));
-        assert_eq!(cli.config.as_deref(), Some(Path::new("/etc/slskr.toml")));
-        assert!(cli.no_connect);
-        assert_eq!(cli.web_dir.as_deref(), Some(Path::new("dist")));
-        for removed in [
-            &["slskr", "--app-dir", "/x"][..],
-            &["slskr", "--set", "a=b"],
-            &["slskr", "-g"],
-        ] {
-            assert!(Cli::try_parse_from(removed).is_err(), "{removed:?}");
-        }
-    }
 
     /// `docs/API.md` is the route reference for script authors: it must list exactly the
     /// routes the router serves.

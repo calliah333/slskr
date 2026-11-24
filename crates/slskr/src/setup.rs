@@ -216,11 +216,20 @@ impl Setup {
 }
 
 fn generate_code() -> String {
-    use rand::Rng as _;
-    let mut rng = rand::rng();
-    let raw: String = (0..CODE_GROUPS * CODE_GROUP)
-        .map(|_| char::from(CODE_ALPHABET[rng.random_range(0..CODE_ALPHABET.len())]))
-        .collect();
+    // Rejection sampling keeps every character equally likely: bytes at or above the
+    // largest multiple of the alphabet size are drawn again.
+    let limit = 256 - 256 % CODE_ALPHABET.len();
+    let mut raw = String::with_capacity(CODE_GROUPS * CODE_GROUP);
+    while raw.len() < CODE_GROUPS * CODE_GROUP {
+        let bytes: [u8; 32] = crate::random();
+        raw.extend(
+            bytes
+                .iter()
+                .filter(|&&byte| usize::from(byte) < limit)
+                .map(|&byte| char::from(CODE_ALPHABET[usize::from(byte) % CODE_ALPHABET.len()]))
+                .take(CODE_GROUPS * CODE_GROUP - raw.len()),
+        );
+    }
     format_code(&raw)
 }
 

@@ -43,7 +43,7 @@ COPY . .
 COPY --from=ui /src/dist /ui
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=slskr-daemon-target \
-    SLSKR_EMBED_UI=/ui cargo build --release --locked -p slskr \
+    SLSKR_EMBED_UI=/ui cargo build --release --locked -p slskr --features embed-ui \
     && install -D target/release/slskr /out/slskr \
     && mkdir -p /out/data
 

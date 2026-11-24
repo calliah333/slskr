@@ -5,6 +5,7 @@
 pub mod app;
 pub mod auth;
 pub mod bootstrap;
+pub mod cli;
 pub mod config;
 pub mod core_api;
 pub mod db;
@@ -24,4 +25,13 @@ pub mod transfers;
 pub mod users;
 pub mod web;
 
-pub use bootstrap::{Cli, run};
+pub use bootstrap::run;
+pub use cli::Cli;
+
+/// `N` bytes from the operating system's random number generator, for salts, tokens and
+/// secrets.
+pub(crate) fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    getrandom::fill(&mut bytes).expect("the operating system's random number generator");
+    bytes
+}

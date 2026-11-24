@@ -4,7 +4,8 @@ Module ownership and the contracts between modules. The HTTP routes themselves a
 in [API.md](API.md).
 
 ```
-src/main.rs           CLI entry (clap), calls slskr::run()
+src/main.rs           CLI entry, calls slskr::run()
+src/cli.rs            command line flags (hand-parsed; four flags and their env vars)
 src/lib.rs            module declarations, pub async fn run(cli) (bootstrap)
 src/app.rs            AppState / Core / Services / Paths (contract), Snapshots for the events socket
 src/bootstrap.rs      CLI (--data-dir, --config, --no-connect, --web-dir), build + run(): load config, build core + services, api_routes() (every route), router, bind HTTP
@@ -233,8 +234,9 @@ router (`web.rs`) is merged beside it and never answers `{url_base}/api/...` wit
 `index.html`.
 
 ### Web UI (`web.rs`, `build.rs`)
-`build.rs` embeds the trunk output named by `SLSKR_EMBED_UI` at compile time: every file
-with its content type, a SHA-256 ETag and brotli/gzip variants when they save at least 10%.
+`build.rs` embeds the trunk output named by `SLSKR_EMBED_UI` at compile time (with the
+`embed-ui` feature, which brings in the compressors): every file with its content type, a
+SHA-256 ETag and brotli/gzip variants when they save at least 10%.
 Without the variable the binary embeds a placeholder page explaining how to build the UI,
 so `cargo build` and `cargo test` need no wasm toolchain. `--web-dir DIR` serves a
 directory instead (UI development; paths are confined to the directory, symlinks

@@ -2,11 +2,7 @@
 //! distributed network, and restart/shutdown.
 
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
-use slskr_types::{
-    application::State,
-    config::Config,
-    server::ConnectionState,
-};
+use slskr_types::{application::State, config::Config, server::ConnectionState};
 
 use super::format;
 use crate::{

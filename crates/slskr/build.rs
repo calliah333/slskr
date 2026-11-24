@@ -10,7 +10,6 @@ use std::{
     env,
     fmt::Write as _,
     fs,
-    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -30,6 +29,9 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let (files, built) = match env::var_os(ENV).filter(|value| !value.is_empty()) {
         Some(dir) => {
+            if cfg!(not(feature = "embed-ui")) {
+                panic!("{ENV} is set: build with `--features embed-ui` to embed the web UI");
+            }
             let dir = manifest_dir.join("../..").join(dir);
             let dir = fs::canonicalize(&dir).unwrap_or_else(|error| {
                 panic!("{ENV}={}: {error}", dir.display());
@@ -64,12 +66,7 @@ fn main() {
         // index.html is rewritten for `web.url_base` at startup, so precompressing it is
         // pointless; it is small anyway.
         let compress = built && path != "index.html" && meta::is_compressible(content_type);
-        let br = compress
-            .then(|| brotli(&bytes))
-            .and_then(|data| write_variant(&variants, index, "br", &bytes, data));
-        let gzip = compress
-            .then(|| gzip(&bytes))
-            .and_then(|data| write_variant(&variants, index, "gz", &bytes, data));
+        let (br, gzip) = compressed_variants(&variants, index, &bytes, compress);
         writeln!(
             code,
             "    Embedded {{ path: {path:?}, content_type: {content_type:?}, etag: {etag:?}, \
@@ -121,6 +118,36 @@ fn etag(bytes: &[u8]) -> String {
     format!("\"{hex}\"")
 }
 
+/// The brotli and gzip variants of a file, each kept only when it is enough smaller.
+#[cfg(feature = "embed-ui")]
+fn compressed_variants(
+    dir: &Path,
+    index: usize,
+    bytes: &[u8],
+    compress: bool,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    if !compress {
+        return (None, None);
+    }
+    (
+        write_variant(dir, index, "br", bytes, brotli(bytes)),
+        write_variant(dir, index, "gz", bytes, gzip(bytes)),
+    )
+}
+
+/// Without `embed-ui` only the placeholder page is embedded, which is never compressed.
+#[cfg(not(feature = "embed-ui"))]
+fn compressed_variants(
+    _: &Path,
+    _: usize,
+    _: &[u8],
+    compress: bool,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    assert!(!compress, "compression needs the embed-ui feature");
+    (None, None)
+}
+
+#[cfg(feature = "embed-ui")]
 fn brotli(bytes: &[u8]) -> Vec<u8> {
     let params = brotli::enc::BrotliEncoderParams {
         quality: 11,
@@ -132,13 +159,16 @@ fn brotli(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "embed-ui")]
 fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(bytes).expect("gzip compression");
     encoder.finish().expect("gzip compression")
 }
 
 /// Keeps a compressed variant only when it saves at least a tenth of the size.
+#[cfg(feature = "embed-ui")]
 fn write_variant(
     dir: &Path,
     index: usize,

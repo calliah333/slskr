@@ -36,7 +36,7 @@ Needs Rust, the `wasm32-unknown-unknown` target, [trunk](https://trunkrs.dev) an
 
 ```sh
 (cd crates/slskr-web && trunk build --release)
-SLSKR_EMBED_UI="$PWD/dist" cargo build --release -p slskr
+SLSKR_EMBED_UI="$PWD/dist" cargo build --release -p slskr --features embed-ui
 ./target/release/slskr --help
 ```
 

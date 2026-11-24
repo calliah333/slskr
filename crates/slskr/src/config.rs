@@ -449,8 +449,7 @@ impl ConfigStore {
                 "an API key named {name:?} already exists"
             )));
         }
-        let key =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(crate::random::<32>());
         let mut next = layers.store.clone();
         next.api_keys.push(ManagedApiKey {
             name: name.clone(),

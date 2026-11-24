@@ -7,7 +7,7 @@ default-members = ["crates/soulseek", "crates/slskr-types", "crates/slskr"]
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 soulseek = { path = "crates/soulseek" }

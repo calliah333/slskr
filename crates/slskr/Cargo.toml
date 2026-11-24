@@ -19,15 +19,14 @@ bytes.workspace = true
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "trace"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "1"
 rusqlite = { version = "0.37", features = ["bundled", "limits"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-rand = "0.9"
 walkdir = "2"
-lofty = { version = "0.22", default-features = false }
-futures = "0.3"
+lofty = "0.25"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = "0.4"
 tokio-util = "0.7"
 base64 = "0.22"
 sha1 = "0.10"
@@ -39,13 +38,19 @@ cap-fs-ext = "3"
 
 [dev-dependencies]
 flate2 = "1"
+rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
 tokio = { workspace = true, features = ["process"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 tokio-tungstenite = "0.29"
 
+[features]
+# Precompress the UI named by SLSKR_EMBED_UI (brotli and gzip variants). Release builds
+# that embed the UI enable it; plain dev builds skip compiling the compressors.
+embed-ui = ["dep:brotli", "dep:flate2"]
+
 [build-dependencies]
-brotli = "8"
-flate2 = "1"
+brotli = { version = "8", optional = true }
+flate2 = { version = "1", optional = true }
 sha2 = "0.10"

@@ -177,7 +177,7 @@ pub fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
 /// argon2id PHC hash of `password` with a random salt.
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     use argon2::{PasswordHasher, password_hash::SaltString};
-    let salt = SaltString::encode_b64(&rand::random::<[u8; 16]>())
+    let salt = SaltString::encode_b64(&crate::random::<16>())
         .map_err(|e| anyhow::anyhow!("password salt: {e}"))?;
     Ok(argon2::Argon2::default()
         .hash_password(password.as_bytes(), &salt)

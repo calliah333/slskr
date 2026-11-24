@@ -107,6 +107,7 @@
               "soulseek"
             ];
             doCheck = false;
+            buildFeatures = [ "embed-ui" ];
             env.SLSKR_EMBED_UI = "${slskr-web}";
             # nixpkgs' cargo setup hook sets LIBSQLITE3_SYS_USE_PKG_CONFIG=1, so the package
             # links this SQLite rather than rusqlite's bundled copy (Docker still bundles it).
