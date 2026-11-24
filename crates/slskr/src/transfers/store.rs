@@ -36,6 +36,9 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
     include_str!("migrations/chart.sql"),
     // Lets `MIN(requested_at)` (the reports' earliest date) read one index entry.
     "CREATE INDEX ix_transfers_requested_at ON transfers(requested_at);",
+    // No query filters on `state` alone (they use the partial and report indexes), but
+    // every state change had to update it.
+    "DROP INDEX ix_transfers_state;",
 ];
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
