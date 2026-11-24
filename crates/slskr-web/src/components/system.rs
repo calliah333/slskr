@@ -10,9 +10,9 @@ pub mod maintenance;
 pub mod settings;
 pub mod shares;
 
+use super::app::RouteRedirect;
 use leptos::prelude::*;
-use leptos_router::NavigateOptions;
-use leptos_router::components::{A, Redirect};
+use leptos_router::components::A;
 use leptos_router::hooks::{use_location, use_params_map};
 
 use crate::ui::{Icon, PageHeader};
@@ -26,13 +26,6 @@ const TABS: [(&str, &str, &str); 6] = [
     ("events", "Events", "history"),
     ("maintenance", "Maintenance", "hard-drive"),
 ];
-
-fn replace() -> NavigateOptions {
-    NavigateOptions {
-        replace: true,
-        ..Default::default()
-    }
-}
 
 #[component]
 pub fn System() -> impl IntoView {
@@ -75,9 +68,9 @@ pub fn System() -> impl IntoView {
                     } else {
                         format!("/settings?{}", search.trim_start_matches('?'))
                     };
-                    view! { <Redirect path options=replace()/> }.into_any()
+                    view! { <RouteRedirect path/> }.into_any()
                 }
-                "data" => view! { <Redirect path="/system/maintenance" options=replace()/> }.into_any(),
+                "data" => view! { <RouteRedirect path="/system/maintenance"/> }.into_any(),
                 "shares" => view! { <shares::Shares/> }.into_any(),
                 "files" => view! { <files::Files/> }.into_any(),
                 "logs" => view! { <logs::Logs/> }.into_any(),

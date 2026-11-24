@@ -1,7 +1,7 @@
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use leptos_router::{
     NavigateOptions,
-    components::{A, Redirect, Route, Router, Routes},
+    components::{A, Route, Router, Routes},
     hooks::{use_location, use_navigate},
     path,
 };
@@ -378,8 +378,23 @@ fn SoulseekOnboarding(options: RwSignal<Config>) -> impl IntoView {
 }
 
 #[component]
+pub(super) fn RouteRedirect(#[prop(into)] path: String) -> impl IntoView {
+    let navigate = use_navigate();
+    // Route rendering can hold the URL read lock. Navigate after it returns.
+    Effect::new(move |_| {
+        navigate(
+            &path,
+            NavigateOptions {
+                replace: true,
+                ..Default::default()
+            },
+        );
+    });
+}
+
+#[component]
 fn HomeRedirect() -> impl IntoView {
-    view! { <Redirect path="/overview" options=NavigateOptions { replace: true, ..Default::default() }/> }
+    view! { <RouteRedirect path="/overview"/> }
 }
 
 #[component]
@@ -414,7 +429,7 @@ fn AppShell(
                     <Route path=path!("/system/settings") view=|| {
                         let search = use_location().search.get_untracked();
                         let query = if search.is_empty() || search.starts_with('?') { search } else { format!("?{search}") };
-                        view! { <Redirect path=format!("/settings{query}") options=NavigateOptions { replace: true, ..Default::default() }/> }
+                        view! { <RouteRedirect path=format!("/settings{query}")/> }
                     }/>
                     <Route path=path!("/system/files/:root") view=System/>
                     <Route path=path!("/system/:tab?") view=System/>
