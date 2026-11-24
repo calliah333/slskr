@@ -401,9 +401,11 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         });
     });
 
-    const UPLOAD_PAGE: u32 = 500;
-    let upload_limit = RwSignal::new(UPLOAD_PAGE);
-    let more_uploads = RwSignal::new(false);
+    // Every active transfer is listed, but only this many of the newest finished ones,
+    // more on request: retention keeps finished transfers forever by default.
+    const PAGE: u32 = 500;
+    let limit = RwSignal::new(PAGE);
+    let more = RwSignal::new(false);
     let history_revision = RwSignal::new(0_u64);
 
     // Actions run in the page's owner, not the clicked control's: a menu, the selection
@@ -430,14 +432,11 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         fetches.set_value(ticket);
         let include_removed = history.get_untracked();
         let revision = history_revision.get_untracked();
-        let limit = upload_limit.get_untracked();
-        let mut url = format!(
-            "{}?include_removed={include_removed}",
+        let limit = limit.get_untracked();
+        let url = format!(
+            "{}?include_removed={include_removed}&recent_completed={limit}",
             collection(direction)
         );
-        if !is_download {
-            url.push_str(&format!("&recent_completed={limit}"));
-        }
         let etag = validator.with_value(|validator| {
             validator
                 .as_ref()
@@ -454,12 +453,10 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                 }
                 match snapshot {
                     Ok(Some((list, etag))) => {
-                        if !is_download {
-                            more_uploads.set(
-                                list.iter().filter(|file| file.state.is_complete()).count()
-                                    >= limit as usize,
-                            );
-                        }
+                        more.set(
+                            list.iter().filter(|file| file.state.is_complete()).count()
+                                >= limit as usize,
+                        );
                         live.update_value(|live| live.finish_fetch(list));
                         render();
                         validator.set_value(etag.map(|etag| (url, revision, etag)));
@@ -491,7 +488,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     // The first load, and again when the view changes.
     Effect::new(move |_| {
         history_revision.track();
-        upload_limit.track();
+        limit.track();
         fetch();
     });
     let events = use_events();
@@ -623,13 +620,13 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     disabled=move || busy.get() || counts.with(|c| c.succeeded == 0)
                     on:click=move |_| change.run((Operation::Remove,
                         page.targets(Operation::Remove, None, |entry| entry.state == State::Succeeded)))>
-                    <Icon name="circle-check"/>{if is_download { "Clear succeeded" } else { "Clear shown succeeded" }}
+                    <Icon name="circle-check"/>"Clear shown succeeded"
                 </button>
                 <button type="button" class="menu__item" role="menuitem"
                     disabled=move || busy.get() || counts.with(|c| c.failed + c.cancelled == 0)
                     on:click=move |_| change.run((Operation::Remove,
                         page.targets(Operation::Remove, None, |entry| entry.state.is_failed())))>
-                    <Icon name="circle-alert"/>{if is_download { "Clear failed and cancelled" } else { "Clear shown failed and cancelled" }}
+                    <Icon name="circle-alert"/>"Clear shown failed and cancelled"
                 </button>
                 <div class="menu__separator"></div>
                 <button type="button" class="menu__item" role="menuitem"
@@ -721,7 +718,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                             history_revision.update(|revision| *revision = revision.wrapping_add(1));
                             loading.set(true);
                             apply_snapshot(&[], rows, index, speed);
-                            more_uploads.set(false);
+                            more.set(false);
                             load_error.set(None);
                         }/>
                         <span class="switch__track" aria-hidden="true"></span>
@@ -773,12 +770,12 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     }/>
             </div>
 
-            <Show when=move || more_uploads.get()>
+            <Show when=move || more.get()>
                 <div class="row">
-                    <Button text="Load older uploads" on_click=Callback::new(move |_| {
-                        upload_limit.update(|limit| *limit = limit.saturating_add(UPLOAD_PAGE));
+                    <Button text=format!("Load older {noun}s") on_click=Callback::new(move |_| {
+                        limit.update(|limit| *limit = limit.saturating_add(PAGE));
                     })/>
-                    <span class="muted text-sm">"Filters apply to the uploads loaded here."</span>
+                    <span class="muted text-sm">{format!("Filters and actions apply to the {noun}s loaded here.")}</span>
                 </div>
             </Show>
             <SelectionBar page/>

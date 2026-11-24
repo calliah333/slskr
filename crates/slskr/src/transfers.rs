@@ -19,7 +19,10 @@ use std::{
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -64,6 +67,9 @@ struct Inner {
     shares: ShareService,
     db: Database,
     list_epoch: Uuid,
+    /// Per direction, bumped after every write to that direction's stored transfers (see
+    /// [`TransferService::wrote`]), so a write to one list does not invalidate the other's ETag.
+    list_revisions: [AtomicU64; 2],
     runtime: Mutex<Runtime>,
     writes: tokio::sync::Mutex<()>,
     ready: watch::Sender<Option<Result<(), String>>>,
@@ -213,6 +219,7 @@ impl TransferService {
             shares: shares.clone(),
             db: Database::open(&path, store::MIGRATIONS)?,
             list_epoch: Uuid::new_v4(),
+            list_revisions: Default::default(),
             runtime: Mutex::default(),
             writes: tokio::sync::Mutex::new(()),
             ready: watch::channel(None).0,
@@ -223,7 +230,10 @@ impl TransferService {
     pub fn start(&self, app: AppState) {
         let service = self.clone();
         tokio::spawn(async move {
-            match store::initialize(service.database()).await {
+            let initialized = store::initialize(service.database()).await;
+            service.wrote(TransferDirection::Download);
+            service.wrote(TransferDirection::Upload);
+            match initialized {
                 Ok((history, downloads)) => {
                     service.recover(&app, history, downloads).await;
                     service.0.ready.send_replace(Some(Ok(())));
@@ -247,7 +257,10 @@ impl TransferService {
                     _ = retention.tick() => {
                         service.runtime().history.prune();
                         let cfg = service.0.core.options.get();
-                        match store::prune(service.database(), &cfg.retention).await {
+                        let pruned = store::prune(service.database(), &cfg.retention).await;
+                        service.wrote(TransferDirection::Download);
+                        service.wrote(TransferDirection::Upload);
+                        match pruned {
                             Ok(removed) => service.publish_removed(removed),
                             Err(error) => tracing::warn!(%error, "could not apply transfer retention"),
                         }
@@ -513,7 +526,9 @@ impl TransferService {
             if response.enqueued.is_empty() {
                 return Ok(response);
             }
-            match store::insert(service.database(), response.enqueued.clone()).await {
+            let inserted = store::insert(service.database(), response.enqueued.clone()).await;
+            service.wrote(TransferDirection::Download);
+            match inserted {
                 Ok(superseded) => service.publish_removed(superseded),
                 Err(error) => {
                     let mut runtime = service.runtime();
@@ -558,7 +573,9 @@ impl TransferService {
         slot: oneshot::Receiver<()>,
     ) {
         let id = &transfer.id;
-        match store::insert(self.database(), vec![transfer.clone()]).await {
+        let inserted = store::insert(self.database(), vec![transfer.clone()]).await;
+        self.wrote(transfer.direction);
+        match inserted {
             Ok(superseded) => self.publish_removed(superseded),
             Err(error) => {
                 tracing::warn!(%error, %id, "could not persist queued upload");
@@ -1075,13 +1092,14 @@ impl TransferService {
     async fn flush_with(&self, all: bool) {
         let _write = self.0.writes.lock().await;
         let mut finished = Vec::new();
-        let updates = {
+        let (updates, directions) = {
             let mut runtime = self.runtime();
             let bus = &self.0.core.bus;
             let publish = bus.wants(Topic::Transfers);
             let (instant, now) = (Instant::now(), Utc::now());
             let mut changed = Vec::new();
             let mut updates = Vec::new();
+            let mut directions = [false; 2];
             for entry in runtime.active.values_mut() {
                 if !entry.stored {
                     continue;
@@ -1106,6 +1124,7 @@ impl TransferService {
                 if transfer.state.is_complete() {
                     finished.push(transfer.id.clone());
                 }
+                directions[direction_index(transfer.direction)] = true;
                 updates.push(Snapshot::new(transfer, entry.offset));
             }
             if !changed.is_empty() {
@@ -1115,12 +1134,18 @@ impl TransferService {
                     .sort_unstable_by(|a, b| (a.requested_at, &a.id).cmp(&(b.requested_at, &b.id)));
                 bus.publish(&LiveEvent::TransferUpdated(changed));
             }
-            updates
+            (updates, directions)
         };
         if updates.is_empty() {
             return;
         }
-        if let Err(error) = store::save(self.database(), updates).await {
+        let saved = store::save(self.database(), updates).await;
+        for direction in [TransferDirection::Download, TransferDirection::Upload] {
+            if directions[direction_index(direction)] {
+                self.wrote(direction);
+            }
+        }
+        if let Err(error) = saved {
             tracing::warn!(%error, "could not persist transfer updates");
             let mut runtime = self.runtime();
             for id in finished {
@@ -1191,6 +1216,12 @@ impl TransferService {
         }
     }
 
+    /// Records a write to the stored `direction` list. Call it after every store write, even
+    /// one that failed: a list read that raced the write is then not tagged as current.
+    fn wrote(&self, direction: TransferDirection) {
+        self.0.list_revisions[direction_index(direction)].fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Live rows need fresh elapsed time, progress and queue positions on each poll.
     fn idle_list_revision(&self, direction: TransferDirection, user: Option<&str>) -> Option<u64> {
         let runtime = self.runtime();
@@ -1198,7 +1229,7 @@ impl TransferService {
             entry.transfer.direction == direction
                 && user.is_none_or(|user| entry.transfer.username == user)
         });
-        (!live).then(|| self.database().changes())
+        (!live).then(|| self.0.list_revisions[direction_index(direction)].load(Ordering::SeqCst))
     }
 
     async fn list(
@@ -1274,7 +1305,9 @@ impl TransferService {
             done.cancelled().await;
         }
         if remove {
-            let removed = store::remove(self.database(), direction, Some(id)).await?;
+            let removed = store::remove(self.database(), direction, Some(id)).await;
+            self.wrote(direction);
+            let removed = removed?;
             self.publish_removed(removed);
         }
         Ok(())
@@ -1313,7 +1346,9 @@ impl TransferService {
             entry.transfer.place_in_queue = Some(pos);
             entry.touch();
         }
-        store::set_position(self.database(), t.id.clone(), pos).await?;
+        let saved = store::set_position(self.database(), t.id.clone(), pos).await;
+        self.wrote(t.direction);
+        saved?;
         Ok(pos)
     }
 }
@@ -1473,6 +1508,50 @@ mod tests {
             }
         }
         batches
+    }
+
+    #[tokio::test]
+    async fn writes_change_only_their_own_list_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::bootstrap::test_app(dir.path(), "[soulseek]\nconnect = false\n", &[])
+            .await
+            .unwrap();
+        let service = app.services.transfers.clone();
+        service.0.ready.send_replace(Some(Ok(())));
+        let revision =
+            |direction| service.0.list_revisions[direction_index(direction)].load(Ordering::SeqCst);
+        let (download, upload) = (TransferDirection::Download, TransferDirection::Upload);
+
+        // A persisted download change bumps only the downloads list.
+        let transfer = new_transfer(download, "peer", r"album\one.flac".into(), 100, None);
+        store::insert(service.database(), vec![transfer.clone()])
+            .await
+            .unwrap();
+        let id = transfer.id.clone();
+        service
+            .runtime()
+            .insert(transfer, CancellationToken::new(), None, true);
+        service.runtime().active.get_mut(&id).unwrap().touch();
+        let before = (revision(download), revision(upload));
+        service.flush().await;
+        assert_eq!(
+            (revision(download), revision(upload)),
+            (before.0 + 1, before.1)
+        );
+
+        // Removing a stored upload bumps only the uploads list, and changes its tag.
+        let finished = new_transfer(upload, "peer", r"album\two.flac".into(), 100, None);
+        store::insert(service.database(), vec![finished.clone()])
+            .await
+            .unwrap();
+        let tag = service.idle_list_revision(upload, None);
+        let before = (revision(download), revision(upload));
+        service.cancel(upload, finished.id, true).await.unwrap();
+        assert_eq!(
+            (revision(download), revision(upload)),
+            (before.0, before.1 + 1)
+        );
+        assert_ne!(service.idle_list_revision(upload, None), tag);
     }
 
     #[tokio::test]

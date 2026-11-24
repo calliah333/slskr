@@ -206,8 +206,9 @@ many completed transfers, newest first by end time.
 Transfer lists include a weak `ETag` when the snapshot is stable. Clients that still
 hold that snapshot can send the tag as `If-None-Match` on the same list URL and keep
 the snapshot on a bodyless `304`. Lists with live transfers or changing elapsed time
-return a fresh snapshot without a tag. The daemon tracks writes on its own SQLite
-connection. Stop the daemon before editing its transfer database directly.
+return a fresh snapshot without a tag. The daemon tracks its own writes to each list
+(downloads and uploads separately), so a change to one list leaves the other's tag valid.
+Stop the daemon before editing its transfer database directly.
 
 ### Query parameters
 

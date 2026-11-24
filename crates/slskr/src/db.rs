@@ -2,10 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -26,7 +23,6 @@ pub struct Database {
 
 struct Inner {
     connection: Mutex<Connection>,
-    changes: AtomicU64,
     /// The database file; `None` in memory, where a second connection would be another
     /// database.
     path: Option<PathBuf>,
@@ -80,7 +76,6 @@ impl Database {
         }
         Ok(Self {
             inner: Arc::new(Inner {
-                changes: AtomicU64::new(connection.total_changes()),
                 connection: Mutex::new(connection),
                 path: (!in_memory).then(|| path.to_owned()),
             }),
@@ -101,16 +96,10 @@ impl Database {
         tune(&connection)?;
         Ok(Self {
             inner: Arc::new(Inner {
-                changes: AtomicU64::new(0),
                 connection: Mutex::new(connection),
                 path: Some(path.clone()),
             }),
         })
-    }
-
-    /// Rows changed through this connection, without acquiring the SQLite lock.
-    pub fn changes(&self) -> u64 {
-        self.inner.changes.load(Ordering::Acquire)
     }
 
     /// Run a synchronous SQLite operation away from the async executor.
@@ -125,12 +114,7 @@ impl Database {
                 .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let result = f(&mut connection);
-            // Publish under the lock, even when a call writes and then returns an error.
-            inner
-                .changes
-                .store(connection.total_changes(), Ordering::Release);
-            result.map_err(anyhow::Error::from)
+            f(&mut connection).map_err(anyhow::Error::from)
         })
         .await
         .map_err(anyhow::Error::from)?
