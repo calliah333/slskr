@@ -106,6 +106,7 @@
               "-p"
               "soulseek"
             ];
+            doCheck = false;
             env.SLSKR_EMBED_UI = "${slskr-web}";
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [
@@ -127,6 +128,12 @@
           default = slskr;
         }
       );
+
+      checks = forAllSystems (pkgs: {
+        slskr = self.packages.${pkgs.stdenv.hostPlatform.system}.slskr.overrideAttrs (_: {
+          doCheck = true;
+        });
+      });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {

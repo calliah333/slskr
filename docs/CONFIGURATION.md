@@ -60,7 +60,7 @@ prevent startup. Do not edit `settings.json` by hand; it is replaced on every ch
 
 | Key | Default | Environment | Restart | Description |
 | --- | --- | --- | --- | --- |
-| `web.listen` | `"127.0.0.1:5030"` | `SLSKR_WEB_LISTEN` | yes | Address of the web UI and API. |
+| `web.listen` | `"127.0.0.1:5031"` | `SLSKR_WEB_LISTEN` | yes | Address of the web UI and API. |
 | `web.url_base` | `"/"` | `SLSKR_WEB_URL_BASE` | yes | Path prefix behind a reverse proxy, e.g. `"/slskr"`. |
 | `web.username` | `"admin"` | `SLSKR_WEB_USERNAME` | | Web sign-in name. Changing it signs out every browser. |
 | `web.password` | `""` | `SLSKR_WEB_PASSWORD` | | Web sign-in password; while no password is set anywhere, the daemon waits for first-run setup (see below). Changing it signs out every browser. |

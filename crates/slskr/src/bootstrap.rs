@@ -38,7 +38,7 @@ use crate::{
     version,
     about = "Soulseek client daemon with a web UI",
     after_help = "Most settings are changed in the web UI. Keys set in <DATA_DIR>/slskr.toml or as \
-                  SLSKR_<SECTION>_<KEY> environment variables (e.g. SLSKR_WEB_LISTEN=0.0.0.0:5030) \
+                  SLSKR_<SECTION>_<KEY> environment variables (e.g. SLSKR_WEB_LISTEN=0.0.0.0:5031) \
                   override it; see docs/CONFIGURATION.md."
 )]
 pub struct Cli {
@@ -265,6 +265,7 @@ async fn events_socket(State(app): State<AppState>, request: Request) -> Respons
 
 pub(crate) fn router(app: &AppState) -> Router {
     use tower_http::compression::{CompressionLayer, CompressionLevel};
+    use tower_http::decompression::RequestDecompressionLayer;
     let not_found = || async { http::error_response(StatusCode::NOT_FOUND, "") };
     // Compress JSON responses cheaply; the WebSocket is merged in after the layer.
     let compression = CompressionLayer::new()
@@ -277,6 +278,11 @@ pub(crate) fn router(app: &AppState) -> Router {
         .into_router()
         .route("/api", any(not_found))
         .route("/api/{*unknown}", any(not_found))
+        .layer(RequestDecompressionLayer::new())
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            telemetry::reports::cache_response,
+        ))
         .layer(axum::middleware::from_fn(http::json_errors))
         .layer(compression)
         .merge(

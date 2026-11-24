@@ -22,7 +22,7 @@
   background: hsl(var(--primary) / 0.12);
   color: hsl(var(--primary));
 }
-.transfers-history { margin-left: auto; white-space: nowrap; }
+.transfers-history { margin-left: auto; padding-inline: var(--space-2) var(--space-3); white-space: nowrap; }
 @media (max-width: 639px) {
   .transfers-toolbar .input-icon { flex-basis: 100%; }
   .transfers-history { margin-left: 0; }
@@ -79,8 +79,9 @@
 
 /* Directory sub-header rows. */
 .transfer-dir__row,
-.table tbody tr.transfer-dir__row:hover { background: hsl(var(--secondary) / 0.6); }
+.table tbody tr.transfer-dir__row:hover { background: hsl(var(--secondary) / 0.4); }
 .transfer-dir__row > td { padding-top: 0.375rem; padding-bottom: 0.375rem; }
+.transfer-dir__row > td[colspan] { padding-inline-start: calc(var(--space-3) + var(--transfer-indent)); }
 .transfer-dir__toggle {
   display: flex;
   align-items: center;
@@ -98,7 +99,6 @@
 }
 .transfer-dir__toggle:hover .transfer-dir__path { text-decoration: underline; text-underline-offset: 2px; }
 .transfer-dir__icon { color: hsl(var(--warning)); flex-shrink: 0; }
-.transfer-dir__path { direction: rtl; text-align: left; unicode-bidi: plaintext; }
 .transfer-dir__count { margin-left: auto; flex-shrink: 0; font-weight: 400; }
 
 /* File rows. */
@@ -106,7 +106,7 @@
 .transfer-table thead .check-col,
 .transfer-row .check-col,
 .transfer-dir__row .check-col { padding-left: var(--space-4); }
-.transfer-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+.transfer-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; margin-inline-start: calc(var(--transfer-indent) + 2ch); }
 .transfer-name__icon { flex-shrink: 0; color: hsl(var(--muted-foreground)); }
 .transfer-name > .truncate { flex: 0 1 auto; }
 .transfer-name > .badge { flex-shrink: 0; }

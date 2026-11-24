@@ -4,11 +4,12 @@ use std::collections::HashSet;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use slskr_types::transfers::{
     Batch, CreateBatch, CreatedBatch, DownloadFile, EnqueueDownloads, EnqueueDownloadsRequest,
     EnqueueFolder, EnqueuedDownloads, QueuePosition, Transfer, TransferDirection,
@@ -19,7 +20,7 @@ use super::{DownloadContext, destination, folder, store};
 use crate::{
     app::AppState,
     auth::{Authenticated, RequireReadWrite},
-    http::{ApiError, ApiResult, Json, Path, Query, Routes},
+    http::{ApiError, ApiResult, Json, Path, Query, Routes, if_none_match},
     users::convert_directory,
 };
 
@@ -64,6 +65,7 @@ const fn direction<const UPLOAD: bool>() -> TransferDirection {
 struct ListQuery {
     username: Option<String>,
     include_removed: bool,
+    recent_completed: Option<u32>,
 }
 
 fn bad_request(message: &str) -> ApiError {
@@ -98,14 +100,53 @@ async fn list<const UPLOAD: bool>(
     _: Authenticated,
     State(app): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<Json<Vec<Transfer>>> {
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let transfers = &app.services.transfers;
+    transfers.ready().await?;
+    let direction = direction::<UPLOAD>();
     let username = query.username.filter(|name| !name.is_empty());
-    Ok(Json(
-        app.services
-            .transfers
-            .list(direction::<UPLOAD>(), username, query.include_removed)
-            .await?,
-    ))
+    let revision = transfers.idle_list_revision(direction, username.as_deref());
+    // A weak tag works across compression variants. Scope it to this list and daemon instance.
+    let tag = revision.map(|revision| {
+        let user = Sha256::digest(username.as_deref().unwrap_or_default().as_bytes());
+        format!(
+            "W/\"{}-{revision}-{UPLOAD}-{}-{}-{user:x}\"",
+            transfers.0.list_epoch,
+            query.include_removed,
+            query.recent_completed.map_or(-1, i64::from)
+        )
+    });
+    let (mut response, tag) = if if_none_match(&headers, tag.as_deref()) {
+        (StatusCode::NOT_MODIFIED.into_response(), tag)
+    } else {
+        let snapshot = transfers
+            .list(
+                direction,
+                username.clone(),
+                query.include_removed,
+                query.recent_completed,
+            )
+            .await?;
+        // The SQL read and live overlay are separate. Only tag stable snapshots.
+        let stable = revision.is_some()
+            && revision == transfers.idle_list_revision(direction, username.as_deref())
+            && snapshot
+                .iter()
+                .all(|t| t.started_at.is_none() || t.ended_at.is_some());
+        (Json(snapshot).into_response(), tag.filter(|_| stable))
+    };
+    if let Some(tag) = tag {
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&tag).expect("ASCII ETag"),
+        );
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
 }
 
 async fn get_one<const UPLOAD: bool>(

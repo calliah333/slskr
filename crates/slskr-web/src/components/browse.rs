@@ -184,7 +184,22 @@ pub fn Browse() -> impl IntoView {
     // work while the page is open.
     Effect::new(move |_| {
         let name = query_user.get();
-        if !name.is_empty() && name != username.get_untracked() {
+        if name == username.get_untracked() {
+            return;
+        }
+        if name.is_empty() {
+            generation.update(|ticket| *ticket = ticket.wrapping_add(1));
+            actions.menu.set(None);
+            actions.notice.set(None);
+            username.set(String::new());
+            input.set(String::new());
+            browsed.set(String::new());
+            selected.set(None);
+            results.set(None);
+            progress.set(None);
+            loading.set(false);
+            error.set(None);
+        } else {
             start(name);
         }
     });

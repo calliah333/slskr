@@ -217,21 +217,61 @@ async fn daemon_http_smoke() {
     }
     assert!(!cookie.contains("Secure"), "{cookie}");
 
-    // JSON responses are compressed when the client asks for it.
-    for (accept, expected) in [
-        ("br", Some("br")),
-        ("gzip", Some("gzip")),
-        ("identity", None),
+    // Gzip is decoded before validating the JSON, and the limit applies after decoding.
+    let downloads = format!("{api}/transfers/downloads");
+    let gzip = |input: &[u8]| {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(input).unwrap();
+        encoder.finish().unwrap()
+    };
+    for (encoding, body, status, message) in [
+        (
+            "gzip",
+            gzip(br#"{"username":"peer","files":[]}"#),
+            400,
+            Some("At least one file is required"),
+        ),
+        ("gzip", gzip(&vec![b' '; 2 * 1024 * 1024 + 1]), 413, None),
+        ("br", vec![0], 415, None),
     ] {
         let response = client
-            .get(format!("{api}/application"))
-            .header("accept-encoding", accept)
+            .post(&downloads)
+            .header("content-type", "application/json")
+            .header("content-encoding", encoding)
+            .body(body)
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let encoding = response.headers().get("content-encoding");
-        assert_eq!(encoding.map(|v| v.to_str().unwrap()), expected, "{accept}");
+        assert_eq!(response.status().as_u16(), status);
+        let body: Value = response.json().await.unwrap();
+        let error = body["error"].as_str().unwrap();
+        if let Some(message) = message {
+            assert_eq!(error, message);
+        }
+    }
+
+    // Both application state and report JSON negotiate compression.
+    for path in ["/application", "/reports/transfers/histogram?buckets=60"] {
+        for (accept, expected) in [
+            ("br", Some("br")),
+            ("gzip", Some("gzip")),
+            ("identity", None),
+        ] {
+            let response = client
+                .get(format!("{api}{path}"))
+                .header("accept-encoding", accept)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let encoding = response.headers().get("content-encoding");
+            assert_eq!(
+                encoding.map(|v| v.to_str().unwrap()),
+                expected,
+                "{path} {accept}"
+            );
+        }
     }
     let login: Value = login.json().await.unwrap();
     assert_eq!(
@@ -629,17 +669,107 @@ async fn daemon_http_smoke() {
         let error: Value = response.json().await.unwrap();
         assert!(error["error"].is_string(), "{path} {body}");
     }
-    let downloads: Value = client
-        .get(format!("{api}/transfers/downloads"))
+    // Seed history before taking the first snapshot, with Soulseek disconnected.
+    const TRANSFER_ID: &str = "11111111-1111-1111-1111-111111111111";
+    rusqlite::Connection::open(data_dir.path().join("db/transfers.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO transfers (id, username, direction, filename, size, state, requested_at, ended_at)
+             VALUES (?1, 'peer', 'Download', 'album/track.flac', 1, 48, '2025-01-01T00:00:00Z', '2025-01-01T00:01:00Z')",
+            [TRANSFER_ID],
+        )
+        .unwrap();
+    let report = format!(
+        "{api}/reports/transfers/summary?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z"
+    );
+    let report_size = |body: &Value| body["download"]["succeeded"]["total_bytes"].as_u64();
+    let summary: Value = client
+        .get(&report)
         .send()
         .await
-        .unwrap()
-        .error_for_status()
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(downloads, serde_json::json!([]));
+    assert_eq!(report_size(&summary), Some(1));
+    rusqlite::Connection::open(data_dir.path().join("db/transfers.db"))
+        .unwrap()
+        .execute("UPDATE transfers SET size = 2 WHERE id = ?1", [TRANSFER_ID])
+        .unwrap();
+    let cached: Value = client
+        .get(&report)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report_size(&cached), Some(1));
+    let separate: Value = client
+        .get(format!("{report}&direction=download"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report_size(&separate), Some(2));
+    let anonymous = reqwest::get(&report).await.unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let download_url = format!("{api}/transfers/downloads");
+    let snapshot = client
+        .get(&download_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let tag = snapshot.headers()[reqwest::header::ETAG].clone();
+    assert!(tag.to_str().unwrap().starts_with("W/"));
+    let snapshot: Value = snapshot.json().await.unwrap();
+    assert_eq!(snapshot[0]["id"], TRANSFER_ID);
+    let unchanged = client
+        .get(&download_url)
+        .header(reqwest::header::IF_NONE_MATCH, tag.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status(), reqwest::StatusCode::NOT_MODIFIED);
+    assert_eq!(unchanged.headers()[reqwest::header::ETAG], tag);
+    assert!(unchanged.bytes().await.unwrap().is_empty());
+    for url in [
+        format!("{download_url}?include_removed=true"),
+        format!("{download_url}?username=someone-else"),
+        format!("{api}/transfers/uploads"),
+    ] {
+        let scoped = client
+            .get(url)
+            .header(reqwest::header::IF_NONE_MATCH, tag.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(scoped.status(), reqwest::StatusCode::OK);
+        assert_ne!(scoped.headers()[reqwest::header::ETAG], tag);
+    }
+    let removed = client
+        .delete(format!("{download_url}/{TRANSFER_ID}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::NO_CONTENT);
+    let changed = client
+        .get(&download_url)
+        .header(reqwest::header::IF_NONE_MATCH, tag.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), reqwest::StatusCode::OK);
+    assert_ne!(changed.headers()[reqwest::header::ETAG], tag);
+    assert_eq!(
+        changed.json::<Value>().await.unwrap(),
+        serde_json::json!([])
+    );
 
     let scan = client
         .post(format!("{api}/shares/scan"))

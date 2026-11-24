@@ -305,7 +305,7 @@ fn line_view(entry: Entry, repeat: bool, own_nick: Signal<String>) -> impl IntoV
             view! {
                 <div class="line line--msg" class:line--own=is_own class:line--repeat=repeat>
                     {time}
-                    <span class="line__from"><span class=format!("line__nick {color}") title=title_nick>{nick}</span></span>
+                    <span class="line__from"><bdi class=format!("line__nick {color}") title=title_nick>{nick}</bdi></span>
                     <span class="line__text">{text}</span>
                 </div>
             }

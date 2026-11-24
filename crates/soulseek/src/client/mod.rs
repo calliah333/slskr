@@ -454,19 +454,19 @@ impl SoulseekClient {
     /// Next token for client operations, starting at
     /// [`ClientOptions::starting_token`] and wrapping to 0 after `i32::MAX`.
     pub fn get_next_token(&self) -> u32 {
-        let next = |current: u32| {
-            Some(if current >= i32::MAX as u32 {
+        let counter = &self.inner.next_token;
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let next = if current >= i32::MAX as u32 {
                 0
             } else {
                 current + 1
-            })
-        };
-        match self
-            .inner
-            .next_token
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, next)
-        {
-            Ok(token) | Err(token) => token,
+            };
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(token) => return token,
+                Err(actual) => current = actual,
+            }
         }
     }
 

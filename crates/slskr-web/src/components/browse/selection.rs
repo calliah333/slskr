@@ -66,7 +66,7 @@ pub fn Selection(
             selected
                 .iter()
                 .map(|&file| shares.files[index][file].size)
-                .sum::<u64>()
+                .fold(0_u64, u64::saturating_add)
         })
     });
     let count = Memo::new(move |_| selection.count());
@@ -137,9 +137,12 @@ pub fn Selection(
         let own = format!(
             "{} ({})",
             plural(file_count, "file", "files"),
-            util::format_bytes(
-                shares.with_value(|s| s.files[index].iter().map(|f| f.size).sum::<u64>()) as f64
-            )
+            util::format_bytes(shares.with_value(|s| {
+                s.files[index]
+                    .iter()
+                    .map(|f| f.size)
+                    .fold(0_u64, u64::saturating_add)
+            }) as f64)
         );
         if has_children {
             format!(

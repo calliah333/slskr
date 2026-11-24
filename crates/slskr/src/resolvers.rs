@@ -273,11 +273,21 @@ async fn search_permit(
         Ok(permit) => Some(permit),
         Err(TryAcquireError::Closed) => None,
         Err(TryAcquireError::NoPermits) => {
-            queued
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                    (count < limit).then(|| count + 1)
-                })
-                .ok()?;
+            let mut count = queued.load(Ordering::Relaxed);
+            loop {
+                if count >= limit {
+                    return None;
+                }
+                match queued.compare_exchange_weak(
+                    count,
+                    count + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => count = actual,
+                }
+            }
             struct Queued<'a>(&'a AtomicUsize);
             impl Drop for Queued<'_> {
                 fn drop(&mut self) {

@@ -251,9 +251,7 @@ impl Inner {
         if self.stopped.get() {
             return;
         }
-        if self.status.get_untracked() != Status::Connecting {
-            self.status.try_set(Status::Reconnecting);
-        }
+        self.status.try_set(Status::Reconnecting);
         let attempt = self.attempt.get();
         self.attempt.set(attempt + 1);
         let delay = RECONNECT_DELAYS[attempt.min(RECONNECT_DELAYS.len() - 1)];

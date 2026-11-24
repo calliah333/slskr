@@ -265,7 +265,7 @@ impl SoulseekClient {
         let (transport, mut incoming) = {
             let mut lifecycle = self.inner.server.lock();
             let active = lifecycle.active_mut(generation)?;
-            let (transport, incoming) = MessageConnection::spawn(conn, None);
+            let (transport, incoming) = MessageConnection::spawn(conn);
             active.transport = Some(transport.clone());
             (transport, incoming)
         };

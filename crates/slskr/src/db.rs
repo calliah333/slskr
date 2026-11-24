@@ -2,14 +2,22 @@
 
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use rusqlite::Connection;
 
 #[derive(Clone)]
 pub struct Database {
-    connection: Arc<Mutex<Connection>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    connection: Mutex<Connection>,
+    changes: AtomicU64,
 }
 
 impl Database {
@@ -41,8 +49,16 @@ impl Database {
             transaction.commit()?;
         }
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            inner: Arc::new(Inner {
+                changes: AtomicU64::new(connection.total_changes()),
+                connection: Mutex::new(connection),
+            }),
         })
+    }
+
+    /// Rows changed through this connection, without acquiring the SQLite lock.
+    pub fn changes(&self) -> u64 {
+        self.inner.changes.load(Ordering::Acquire)
     }
 
     /// Run a synchronous SQLite operation away from the async executor.
@@ -51,12 +67,18 @@ impl Database {
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let connection = Arc::clone(&self.connection);
+        let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let mut connection = connection
+            let mut connection = inner
+                .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            f(&mut connection).map_err(anyhow::Error::from)
+            let result = f(&mut connection);
+            // Publish under the lock, even when a call writes and then returns an error.
+            inner
+                .changes
+                .store(connection.total_changes(), Ordering::Release);
+            result.map_err(anyhow::Error::from)
         })
         .await
         .map_err(anyhow::Error::from)?

@@ -122,7 +122,7 @@ fn Directory(root: &'static str) -> impl IntoView {
                             modified: d.modified_at,
                         })
                         .collect();
-                    entries.sort_by_key(|e| e.name.to_lowercase());
+                    entries.sort_by_cached_key(|e| e.name.to_lowercase());
                     let mut files: Vec<Entry> = dir
                         .files
                         .into_iter()
@@ -134,10 +134,14 @@ fn Directory(root: &'static str) -> impl IntoView {
                             modified: f.modified_at,
                         })
                         .collect();
-                    files.sort_by_key(|e| e.name.to_lowercase());
+                    files.sort_by_cached_key(|e| e.name.to_lowercase());
                     entries.extend(files);
                     // Drop selections that no longer exist.
-                    selected.update(|s| s.retain(|p| entries.iter().any(|e| &e.path == p)));
+                    if !selected.with_untracked(BTreeSet::is_empty) {
+                        let paths: BTreeSet<_> =
+                            entries.iter().map(|entry| entry.path.as_str()).collect();
+                        selected.update(|s| s.retain(|path| paths.contains(path.as_str())));
+                    }
                     listing.set(Some((request_path, entries)));
                 }
                 Err(err) => error.set(Some(err.to_string())),

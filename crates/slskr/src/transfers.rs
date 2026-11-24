@@ -62,6 +62,7 @@ struct Inner {
     users: UserService,
     shares: ShareService,
     db: Database,
+    list_epoch: Uuid,
     runtime: Mutex<Runtime>,
     writes: tokio::sync::Mutex<()>,
     ready: watch::Sender<Option<Result<(), String>>>,
@@ -187,6 +188,7 @@ impl TransferService {
             users: users.clone(),
             shares: shares.clone(),
             db: Database::open(&path, store::MIGRATIONS)?,
+            list_epoch: Uuid::new_v4(),
             runtime: Mutex::default(),
             writes: tokio::sync::Mutex::new(()),
             ready: watch::channel(None).0,
@@ -1058,14 +1060,32 @@ impl TransferService {
         }
     }
 
+    /// Live rows need fresh elapsed time, progress and queue positions on each poll.
+    fn idle_list_revision(&self, direction: TransferDirection, user: Option<&str>) -> Option<u64> {
+        let runtime = self.runtime();
+        let live = runtime.active.values().any(|entry| {
+            entry.transfer.direction == direction
+                && user.is_none_or(|user| entry.transfer.username == user)
+        });
+        (!live).then(|| self.database().changes())
+    }
+
     async fn list(
         &self,
         direction: TransferDirection,
         user: Option<String>,
         include_removed: bool,
+        recent_completed: Option<u32>,
     ) -> anyhow::Result<Vec<Transfer>> {
         self.ready().await?;
-        let mut transfers = store::list(self.database(), direction, user, include_removed).await?;
+        let mut transfers = store::list(
+            self.database(),
+            direction,
+            user,
+            include_removed,
+            recent_completed,
+        )
+        .await?;
         self.overlay(&mut transfers);
         if !include_removed {
             transfers.retain(|t| !t.removed);

@@ -24,8 +24,6 @@
   /* Nick colours: twelve hues at a lightness that reads on the card in each theme. */
   --nick-s: 65%;
   --nick-l: 36%;
-  --nick-w: 16ch;
-  --time-w: 7ch;
   position: relative;
   flex: 1 1 0;
   min-height: 22rem;
@@ -126,7 +124,7 @@
 .messenger__body { position: relative; flex: 1 1 0; min-height: 0; display: flex; }
 .messenger__column { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .messenger__main > .buffer-wrap { flex: 1 1 0; }
-.messenger__back { display: none; }
+.topic > .messenger__back { display: none; }
 .messenger__alerts { padding: var(--space-2) var(--space-3) 0; }
 .messenger__alerts .alert p { margin: 0; overflow-wrap: anywhere; }
 
@@ -172,9 +170,10 @@
 .room-members-toggle[aria-pressed="true"] { background: hsl(var(--accent)); }
 
 /* ---------- line log ---------- */
-.buffer-wrap { position: relative; flex: 1 1 0; min-height: 0; display: flex; }
+.buffer-wrap { position: relative; flex: 1 1 0; min-height: 0; display: flex; container-type: inline-size; }
 .buffer {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -210,7 +209,7 @@
 /* time | nick (right-aligned) | text with a hanging indent */
 .line {
   display: grid;
-  grid-template-columns: var(--time-w) var(--nick-w) minmax(0, 1fr);
+  grid-template-columns: 7ch clamp(12ch, 24%, 22ch) minmax(0, 1fr);
   column-gap: 1ch;
   padding: 0 var(--space-1);
   border-radius: var(--radius-sm);
@@ -223,8 +222,8 @@
 .line--msg .line__from::before { content: "<"; color: hsl(var(--muted-foreground)); opacity: 0.6; }
 .line--msg .line__from::after { content: ">"; color: hsl(var(--muted-foreground)); opacity: 0.6; }
 .line__nick { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
-.line__text { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
-.line--repeat .line__nick { opacity: 0.4; }
+.line__text { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; }
+.line--repeat .line__nick { font-weight: 400; }
 .line--repeat .line__from::before,
 .line--repeat .line__from::after { opacity: 0.25; }
 .line--own .line__nick { font-weight: 800; }
@@ -246,6 +245,19 @@
 }
 .line--day:hover { background: transparent; }
 .line--day:first-child { margin-top: 0; }
+
+/* Keep the message readable when the transcript shares space with sidebars. */
+@container (max-width: 32rem) {
+  .line:not(.line--day) {
+    grid-template-columns: 5ch minmax(0, 1fr);
+    gap: 0 0.75ch;
+    padding-block: var(--space-1);
+  }
+  .line__time::before,
+  .line__time::after { content: none; }
+  .line__from { justify-content: flex-start; }
+  .line__text { grid-column: 2; }
+}
 
 /* ---------- input line ---------- */
 .inputline { flex-shrink: 0; padding: var(--space-2) var(--space-3) var(--space-2); border-top: 1px solid hsl(var(--border)); }
@@ -380,18 +392,20 @@
 
 /* ---------- phones: buffer list and buffer are separate views ---------- */
 @media (max-width: 767px) {
-  .messenger { grid-template-columns: minmax(0, 1fr); --nick-w: 10ch; --time-w: 5ch; }
+  .messenger { grid-template-columns: minmax(0, 1fr); }
   .buffers { border-right: 0; background: transparent; }
   .buffer-item { height: 2.5rem; font-size: 0.875rem; }
   .messenger[data-view="list"] .messenger__main { display: none; }
   .messenger[data-view="buffer"] .buffers { display: none; }
-  .messenger__back { display: inline-flex; }
-  .topic { gap: var(--space-2); padding-left: var(--space-1); }
-  .topic__name { max-width: 50%; }
-  .topic__text { padding-left: var(--space-2); }
+  .topic > .messenger__back { display: inline-flex; }
+  .topic {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 0 var(--space-2);
+    padding: var(--space-1) var(--space-2);
+  }
+  .topic__name { grid-column: 2 / -1; max-width: none; }
+  .topic__text { grid-column: 1 / 3; padding-left: 0; border-left: 0; }
   .buffer { padding: var(--space-2) var(--space-1); font-size: 0.75rem; }
-  .line { column-gap: 0.75ch; }
-  .line__time::before,
-  .line__time::after { content: none; }
   .inputline { padding: var(--space-2); }
 }

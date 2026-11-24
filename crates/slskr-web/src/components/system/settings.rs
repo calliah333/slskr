@@ -144,7 +144,7 @@ pub fn SettingsPage() -> impl IntoView {
     if let Some(events) = use_context::<Events>() {
         events.on(Topic::Settings, move |_| {
             if !form.saving.get_untracked() && !signed_out.get_untracked() {
-                spawn_local_scoped_with_cancellation(form.reload());
+                leptos::task::spawn_local(form.reload());
             }
         });
     }
@@ -243,6 +243,7 @@ pub fn SettingsPage() -> impl IntoView {
             let body = form.patch();
             let signs_out = form.changes_sign_in();
             form.saving.set(true);
+            form.invalidate_reload();
             form.top_error.set(None);
             let reveal_invalid = reveal_invalid.clone();
             spawn_local_scoped_with_cancellation(async move {
@@ -337,7 +338,7 @@ pub fn SettingsPage() -> impl IntoView {
                             }).collect_view()}
                         </ul>
                     </nav>
-                    <div class="settings-panels">
+                    <div class="settings-panels" inert=move || form.saving.get()>
                         {CATEGORIES.iter().map(|category| {
                             let slug = category.slug;
                             view! {

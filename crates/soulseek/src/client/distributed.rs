@@ -529,7 +529,7 @@ impl DistributedManager {
         {
             return;
         }
-        let (conn, incoming) = MessageConnection::spawn(conn, Some(username.clone()));
+        let (conn, incoming) = MessageConnection::spawn(conn);
         let (outgoing, writes) = mpsc::channel(CHILD_QUEUE);
         for frame in scope.branch_frames() {
             let _ = outgoing.try_send((frame, None));
@@ -779,7 +779,7 @@ async fn connect_candidate(
         .await
         .ok()?;
     drop(client);
-    let (conn, mut incoming) = MessageConnection::spawn(conn, Some(candidate.username.clone()));
+    let (conn, mut incoming) = MessageConnection::spawn(conn);
     // A TCP handshake and branch advertisement alone are not proof of a live
     // upstream: require the first distributed search, as Soulseek.NET does.
     let (level, root, first_search) =

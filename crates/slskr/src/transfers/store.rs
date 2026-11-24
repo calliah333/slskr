@@ -28,6 +28,12 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
 "#,
     // Folder downloads: the remote folder the file is saved relative to.
     "ALTER TABLE transfers ADD COLUMN root TEXT;",
+    "CREATE INDEX ix_transfers_recent ON transfers(direction, ended_at DESC) WHERE (state & 16) != 0;
+     CREATE INDEX ix_transfers_active ON transfers(direction) WHERE (state & 16) = 0;",
+    "CREATE INDEX ix_transfers_report_state_end ON transfers(state, ended_at) WHERE ended_at IS NOT NULL;
+     CREATE INDEX ix_transfers_report_errors_end ON transfers(direction, ended_at)
+         WHERE (state & ~48) != 0 AND ended_at IS NOT NULL;",
+    include_str!("migrations/chart.sql"),
 ];
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
@@ -253,8 +259,18 @@ pub(super) async fn list(
     direction: TransferDirection,
     username: Option<String>,
     include_removed: bool,
+    recent_completed: Option<u32>,
 ) -> anyhow::Result<Vec<Transfer>> {
     db.call(move |db| {
+        if let Some(limit) = recent_completed {
+            let filter = "direction = ?1 AND (?2 IS NULL OR username = ?2) AND (?3 OR NOT removed)";
+            let mut stmt = db.prepare(&format!(
+                "SELECT {FIELDS} FROM transfers WHERE {filter} AND (state & 16) = 0
+                 UNION ALL SELECT * FROM (SELECT {FIELDS} FROM transfers WHERE {filter}
+                 AND (state & 16) != 0 ORDER BY ended_at DESC, rowid DESC LIMIT ?4)"
+            ))?;
+            return stmt.query_map(params![direction_name(direction), username, include_removed, limit], transfer)?.collect();
+        }
         let mut stmt = db.prepare(&format!("SELECT {FIELDS} FROM transfers WHERE direction = ?1\n            AND (?2 IS NULL OR username = ?2) AND (?3 OR NOT removed) ORDER BY rowid"))?;
         stmt.query_map(params![direction_name(direction), username, include_removed], transfer)?.collect()
     }).await
@@ -473,7 +489,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            list(&db, TransferDirection::Download, None, false)
+            list(&db, TransferDirection::Download, None, false, None)
                 .await
                 .unwrap()
                 .is_empty()

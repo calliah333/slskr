@@ -1243,7 +1243,7 @@ mod tests {
     #[test]
     fn defaults_without_a_file_are_valid() {
         let config = sources(&[]).unwrap().resolve(None).unwrap();
-        assert_eq!(config.web.listen.to_string(), "127.0.0.1:5030");
+        assert_eq!(config.web.listen.to_string(), "127.0.0.1:5031");
         assert_eq!(config.web.url_base, "/");
         assert_eq!(config.downloads.directory, "/data/downloads");
         assert_eq!(config.downloads.incomplete_directory, "/data/incomplete");
@@ -1485,7 +1485,7 @@ mod tests {
     fn example_file_parses_and_validates() {
         let text = include_str!("../../../slskr.example.toml");
         let config = resolve(text).unwrap();
-        assert_eq!(config.web.listen.to_string(), "127.0.0.1:5030");
+        assert_eq!(config.web.listen.to_string(), "127.0.0.1:5031");
         // The example stays short: infrastructure keys only.
         assert!(text.lines().count() <= 60, "slskr.example.toml grew");
     }
@@ -1768,7 +1768,7 @@ mod tests {
         assert_eq!(config.uploads.speed_limit, 50);
         assert_eq!(config.downloads.retry_delay, Duration::from_secs(5));
         assert!(!config.downloads.resume);
-        assert_eq!(config.web.listen.port(), 5030);
+        assert_eq!(config.web.listen.port(), 5031);
         // Later writes keep only the usable entries.
         store
             .patch(serde_json::json!({"uploads": {"speed_limit": 60}}))

@@ -115,7 +115,14 @@ pub(super) async fn upload(
     source: UploadInput,
 ) -> Result<()> {
     let mut raw_offset = [0; 8];
-    conn.read_exact(&mut raw_offset).await?;
+    conn.read_exact(&mut raw_offset)
+        .await
+        .map_err(|error| match error {
+            Error::Connection(message) => Error::Connection(format!(
+                "Could not read the upload resume offset from the peer: {message}"
+            )),
+            error => error,
+        })?;
     let offset = u64::from_le_bytes(raw_offset);
     let size = transfer.snapshot.size;
     if offset > size {

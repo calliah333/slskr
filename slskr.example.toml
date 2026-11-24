@@ -11,7 +11,7 @@
 
 [web]
 # Address of the web UI and API (restart).
-listen = "127.0.0.1:5030"
+listen = "127.0.0.1:5031"
 # Path prefix behind a reverse proxy, e.g. "/slskr" (restart). slskr serves plain HTTP:
 # terminate TLS at the proxy, send X-Forwarded-Proto: https and keep the original Host.
 # url_base = "/"

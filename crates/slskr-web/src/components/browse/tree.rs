@@ -35,10 +35,6 @@ pub fn detect_separator<'a>(names: impl IntoIterator<Item = &'a str>) -> char {
         .unwrap_or('\\')
 }
 
-fn parent_key(name: &str, separator: char) -> &str {
-    name.rfind(separator).map_or("", |index| &name[..index])
-}
-
 /// Builds the directory tree in a single pass by grouping each directory under its
 /// parent path (upstream `Browse.getDirectoryTree`). Each entry carries its locked flag.
 pub fn build_tree(directories: Vec<(Directory, bool)>, separator: char) -> Vec<TreeNode> {
@@ -46,8 +42,9 @@ pub fn build_tree(directories: Vec<(Directory, bool)>, separator: char) -> Vec<T
     let names: HashSet<String> = directories.iter().map(|(d, _)| d.name.clone()).collect();
     let mut roots = Vec::new();
     for (index, (directory, _)) in directories.iter().enumerate() {
-        let parent = parent_key(&directory.name, separator);
-        if names.contains(parent) {
+        if let Some((parent, _)) = directory.name.rsplit_once(separator)
+            && names.contains(parent)
+        {
             by_parent.entry(parent.to_owned()).or_default().push(index);
         } else {
             roots.push(index);
@@ -198,7 +195,11 @@ impl Shares {
 
     /// Downloadable files (folder, file index) of a folder, and of its subfolders when
     /// `recursive`. Locked folders are skipped.
-    pub fn folder_files(&self, index: usize, recursive: bool) -> Vec<(usize, usize)> {
+    pub fn folder_files(
+        &self,
+        index: usize,
+        recursive: bool,
+    ) -> impl Iterator<Item = (usize, usize)> + '_ {
         let end = if recursive {
             self.nodes[index].end
         } else {
@@ -207,17 +208,17 @@ impl Shares {
         (index..end)
             .filter(|&folder| !self.nodes[folder].locked)
             .flat_map(|folder| (0..self.files[folder].len()).map(move |file| (folder, file)))
-            .collect()
     }
 
     /// Count and total size of [`Shares::folder_files`].
     pub fn folder_totals(&self, index: usize, recursive: bool) -> (usize, u64) {
-        let files = self.folder_files(index, recursive);
-        let size = files
-            .iter()
-            .map(|&(folder, file)| self.files[folder][file].size)
-            .sum();
-        (files.len(), size)
+        self.folder_files(index, recursive)
+            .fold((0, 0_u64), |(count, size), (folder, file)| {
+                (
+                    count + 1,
+                    size.saturating_add(self.files[folder][file].size),
+                )
+            })
     }
 
     /// Folders whose path contains `query` (lowercase), in tree order.

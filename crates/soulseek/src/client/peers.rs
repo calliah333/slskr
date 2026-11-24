@@ -270,42 +270,51 @@ impl PeerManager {
                     .unwrap_or_else(|e| e.into_inner()),
             )
             .clone();
-        let local_username = client.username().ok_or_else(disconnected)?;
-        let direct = async {
-            let mut conn = Connection::connect(endpoint, &options).await?;
-            let init = PeerInit {
-                username: local_username,
-                connection_type: kind.code().into(),
-                token: init_token,
+        let init = PeerInit {
+            username: client.username().ok_or_else(disconnected)?,
+            connection_type: kind.code().into(),
+            token: init_token,
+        }
+        .to_bytes();
+        // One rejected or unreachable path must not cancel the other. Drop the
+        // losing future before sending a file PeerInit, so only the winning
+        // socket can announce this transfer token.
+        let winner = {
+            let direct = async {
+                let mut conn = Connection::connect(endpoint, &options).await?;
+                if kind != Kind::File {
+                    conn.write_all(&init).await?;
+                }
+                Ok::<_, Error>(conn)
             };
-            conn.write_all(&init.to_bytes()).await?;
-            Ok::<_, Error>(conn)
+            let indirect = self.solicit(
+                client,
+                username,
+                kind,
+                init_token,
+                options.connect_timeout,
+                session,
+            );
+            tokio::pin!(direct, indirect);
+            tokio::select! {
+                result = &mut direct => match result {
+                    Ok(conn) => Ok((conn, true)),
+                    Err(error) => indirect.await.map(|conn| (conn, false)).map_err(|indirect_error| (error, indirect_error)),
+                },
+                result = &mut indirect => match result {
+                    Ok(conn) => Ok((conn, false)),
+                    Err(error) => direct.await.map(|conn| (conn, true)).map_err(|direct_error| (direct_error, error)),
+                },
+            }
         };
-        let indirect = self.solicit(
-            client,
-            username,
-            kind,
-            init_token,
-            options.connect_timeout,
-            session,
-        );
-        // One rejected or unreachable path must not cancel the other.
-        tokio::pin!(direct, indirect);
-        let (direct_error, indirect_error) = tokio::select! {
-            result = &mut direct => match result {
-                Ok(conn) => return Ok(conn),
-                Err(error) => match indirect.await {
-                    Ok(conn) => return Ok(conn),
-                    Err(indirect_error) => (error, indirect_error),
-                },
-            },
-            result = &mut indirect => match result {
-                Ok(conn) => return Ok(conn),
-                Err(error) => match direct.await {
-                    Ok(conn) => return Ok(conn),
-                    Err(direct_error) => (direct_error, error),
-                },
-            },
+        let (direct_error, indirect_error) = match winner {
+            Ok((mut conn, direct)) => {
+                if kind == Kind::File && direct {
+                    conn.write_all(&init).await?;
+                }
+                return Ok(conn);
+            }
+            Err(errors) => errors,
         };
         let message = format!(
             "Failed to establish a {} connection to {username} ({endpoint}): direct: {direct_error}; indirect: {indirect_error}",
@@ -621,8 +630,7 @@ impl PeerManager {
         supersede: bool,
     ) {
         let (observer, tracking) = peer_handler::observer(client, &username);
-        let (conn, incoming) =
-            MessageConnection::spawn_observed(conn, Some(username.clone()), Some(observer));
+        let (conn, incoming) = MessageConnection::spawn_observed(conn, Some(observer));
         let sockets = state.sockets.entry(username.clone()).or_default();
         if supersede || sockets.cached().is_none() {
             sockets.uncache();

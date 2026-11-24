@@ -21,13 +21,11 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub struct FileService {
-    core: Core,
-}
+pub struct FileService;
 
 impl FileService {
-    pub fn new(core: &Core) -> anyhow::Result<Self> {
-        Ok(Self { core: core.clone() })
+    pub fn new(_core: &Core) -> anyhow::Result<Self> {
+        Ok(Self)
     }
 
     pub fn start(&self, _app: AppState) {}

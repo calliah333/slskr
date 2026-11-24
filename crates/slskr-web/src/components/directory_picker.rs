@@ -245,6 +245,8 @@ pub fn DirectoryPicker(open: RwSignal<bool>, on_pick: Callback<String>) -> impl 
             return;
         }
         let requested = path.get();
+        listing.set(None);
+        error.set(None);
         loading.set(true);
         spawn_local_scoped_with_cancellation(async move {
             let url = match &requested {
@@ -267,11 +269,15 @@ pub fn DirectoryPicker(open: RwSignal<bool>, on_pick: Callback<String>) -> impl 
     });
 
     let go = move |target: String| {
+        loading.set(true);
+        listing.set(None);
         error.set(None);
         path.set(Some(target));
     };
     let pick = move || {
-        if let Some(current) = listing.get_untracked() {
+        if !loading.get_untracked()
+            && let Some(current) = listing.get_untracked()
+        {
             on_pick.run(current.path);
             open.set(false);
         }
@@ -287,7 +293,7 @@ pub fn DirectoryPicker(open: RwSignal<bool>, on_pick: Callback<String>) -> impl 
                     {current_path}
                 </span>
                 <button type="button" class="btn" on:click=move |_| open.set(false)>"Cancel"</button>
-                <button type="button" class="btn btn--primary directory-pick" disabled=move || listing.with(Option::is_none)
+                <button type="button" class="btn btn--primary directory-pick" disabled=move || loading.get() || listing.with(Option::is_none)
                     on:click=move |_| pick()>
                     <Icon name="share-2"/>"Share this folder"
                 </button>

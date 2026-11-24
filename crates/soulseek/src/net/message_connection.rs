@@ -22,7 +22,6 @@ struct Inner {
     closed: CancellationToken,
     remote: SocketAddr,
     id: u64,
-    username: Option<String>,
 }
 
 impl Drop for Inner {
@@ -33,14 +32,13 @@ impl Drop for Inner {
 
 impl MessageConnection {
     /// Starts the reader and writer. The receiver yields frame bodies without the length prefix.
-    pub fn spawn(conn: Connection, username: Option<String>) -> (Self, mpsc::Receiver<Bytes>) {
-        Self::spawn_observed(conn, username, None)
+    pub fn spawn(conn: Connection) -> (Self, mpsc::Receiver<Bytes>) {
+        Self::spawn_observed(conn, None)
     }
 
     /// Like [`Self::spawn`]; `observer` sees the progress of each frame while it is read.
     pub fn spawn_observed(
         conn: Connection,
-        username: Option<String>,
         observer: Option<FrameObserver>,
     ) -> (Self, mpsc::Receiver<Bytes>) {
         let remote = conn.remote();
@@ -111,7 +109,6 @@ impl MessageConnection {
             closed,
             remote,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            username,
         }));
         (handle, frames)
     }
@@ -167,10 +164,6 @@ impl MessageConnection {
     pub fn id(&self) -> u64 {
         self.0.id
     }
-
-    pub fn username(&self) -> Option<String> {
-        self.0.username.clone()
-    }
 }
 
 fn closed_error(remote: SocketAddr) -> Error {
@@ -197,7 +190,7 @@ mod tests {
             .await
             .unwrap();
         let mut peer = server.accept().await;
-        let (conn, mut incoming) = MessageConnection::spawn(conn, Some("peer".into()));
+        let (conn, mut incoming) = MessageConnection::spawn(conn);
 
         write_frame(&mut peer, b"\x07reply").await;
         assert_eq!(incoming.recv().await.unwrap(), &b"\x07reply"[..]);
@@ -223,7 +216,7 @@ mod tests {
             .await
             .unwrap();
         let mut peer = server.accept().await;
-        let (conn, _incoming) = MessageConnection::spawn(conn, None);
+        let (conn, _incoming) = MessageConnection::spawn(conn);
         {
             let write = conn.send(Bytes::from_static(b"\x02\0\0\0ab"));
             tokio::pin!(write);

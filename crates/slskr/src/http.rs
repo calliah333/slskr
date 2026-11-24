@@ -217,6 +217,26 @@ pub fn optional_json<T: DeserializeOwned>(
     })
 }
 
+/// Tests a conditional GET for an existing resource, with weak ETag comparison.
+pub(crate) fn if_none_match(headers: &HeaderMap, etag: Option<&str>) -> bool {
+    let etag = etag.map(|tag| tag.strip_prefix("W/").unwrap_or(tag));
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| {
+            let mut quoted = false;
+            value.split(move |ch| {
+                if ch == '"' {
+                    quoted = !quoted;
+                }
+                ch == ',' && !quoted
+            })
+        })
+        .map(str::trim)
+        .any(|tag| tag == "*" || Some(tag.strip_prefix("W/").unwrap_or(tag)) == etag)
+}
+
 /// Rewrites every API error response that is not JSON yet (unknown routes, unsupported
 /// methods, body limits, upgrade failures) into `{"error": ...}`, keeping its status and
 /// headers. A short plain-text body becomes the message.

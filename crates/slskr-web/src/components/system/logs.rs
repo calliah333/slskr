@@ -384,7 +384,7 @@ fn LogFiles() -> impl IntoView {
             let result = api::get_text(&format!("/logs/files/{}", encode_uri_component(&name)))
                 .await
                 .map_err(|e| e.to_string());
-            if open_name.get_untracked().as_deref() == Some(name.as_str()) {
+            if open_name.try_get_untracked().flatten().as_deref() == Some(name.as_str()) {
                 contents.try_set(Some(result));
             }
         });

@@ -68,7 +68,6 @@ impl BrowseActions {
         let Some(shares) = self.shares() else { return };
         let files = shares
             .folder_files(index, recursive)
-            .into_iter()
             .map(|(folder, file)| {
                 let file = &shares.files[folder][file];
                 DownloadFile {

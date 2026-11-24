@@ -156,6 +156,7 @@ pub struct Form {
     pub top_error: RwSignal<Option<String>>,
     pub notice: RwSignal<Option<String>>,
     pub saving: RwSignal<bool>,
+    reload_revision: RwSignal<u64>,
     /// Keys of the fields on the page, in display order.
     fields: StoredValue<Vec<String>>,
 }
@@ -172,6 +173,7 @@ impl Form {
             top_error: RwSignal::new(None),
             notice: RwSignal::new(None),
             saving: RwSignal::new(false),
+            reload_revision: RwSignal::new(0),
             fields: StoredValue::new(Vec::new()),
         }
     }
@@ -191,8 +193,23 @@ impl Form {
     }
 
     /// Loads `GET /api/settings`.
+    pub fn invalidate_reload(&self) {
+        self.reload_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
+    }
+
     pub async fn reload(self) {
-        match api::get::<Settings>("/settings").await {
+        let Some(revision) = self.reload_revision.try_update(|value| {
+            *value = value.wrapping_add(1);
+            *value
+        }) else {
+            return;
+        };
+        let result = api::get::<Settings>("/settings").await;
+        if self.reload_revision.try_get_untracked() != Some(revision) {
+            return;
+        }
+        match result {
             Ok(settings) => self.load(settings),
             Err(error) => {
                 self.top_error.try_set(Some(error.message));

@@ -1,5 +1,5 @@
 use std::io::Cursor;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -260,6 +260,34 @@ async fn upload_enqueues_and_honors_a_full_width_resume_offset_without_seeking()
         tokio::join!(uploader, remote);
     })
     .await;
+}
+
+#[tokio::test]
+async fn upload_reports_when_the_peer_closes_before_sending_the_resume_offset() {
+    with_peer(|client, peer, _| async move {
+        let uploader = async {
+            let input = UploadInput::Stream {
+                size: 3,
+                factory: Box::new(|_| Box::pin(async { panic!("peer never requested an offset") })),
+            };
+            let transfer = client
+                .enqueue_upload(PEER, FILE, input, Some(200), TransferOptions::default(), CancellationToken::new())
+                .await
+                .unwrap();
+            let error = transfer.wait().await.unwrap_err();
+            assert!(matches!(error, Error::Connection(message)
+                if message.contains("upload resume offset") && message.contains("Remote connection closed")));
+        };
+        let remote = async {
+            let mut message = accept_init(&peer, "P").await;
+            let incoming = request(&mut message).await;
+            message.write_all(&TransferResponse::allowed(incoming.token, None).to_bytes()).await.unwrap();
+            let mut file = accept_init(&peer, "F").await;
+            assert_eq!(file.read_u32_le().await.unwrap(), incoming.token);
+            file.shutdown().await.unwrap();
+        };
+        tokio::join!(uploader, remote);
+    }).await;
 }
 
 #[tokio::test]

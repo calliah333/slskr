@@ -14,7 +14,7 @@ docker compose up -d
 docker compose logs slskr   # shows the setup code
 ```
 
-Open <http://localhost:5030/setup> and complete [first-run setup](#first-run) with the
+Open <http://localhost:5031/setup> and complete [first-run setup](#first-run) with the
 setup code from the log. Settings, databases and downloads live in the `slskr-data` volume
 (`/data`). To share music, uncomment the bind mount in
 [`docker-compose.yml`](docker-compose.yml) and add `/music` to the shares. Forward port
@@ -27,7 +27,7 @@ nix run . -- --data-dir ~/.local/share/slskr
 ```
 
 `nix build .#slskr` puts the same single binary in `result/bin/slskr`. On the first start
-it prints the setup URL; see [First run](#first-run).
+it prints the setup URL at `127.0.0.1:5031`. See [First run](#first-run).
 
 ### From source
 

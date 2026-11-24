@@ -394,9 +394,13 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         });
     });
 
+    const UPLOAD_PAGE: u32 = 500;
+    let upload_limit = RwSignal::new(UPLOAD_PAGE);
+    let more_uploads = RwSignal::new(false);
+    let history_revision = RwSignal::new(0_u64);
     spawn_local_scoped_with_cancellation(async move {
         let active_url = collection(direction);
-        let history_url = format!("{active_url}?include_removed=true");
+        let mut validator: Option<(String, u64, String)> = None;
         let mut ticks = 0_u32;
         loop {
             if document().hidden() {
@@ -404,19 +408,34 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                 continue;
             }
             let include_removed = history.get_untracked();
-            let url = if include_removed {
-                &history_url
-            } else {
-                &active_url
-            };
-            let snapshot = api::get::<Vec<Transfer>>(url).await;
-            if history.get_untracked() == include_removed {
+            let revision = history_revision.get_untracked();
+            let limit = upload_limit.get_untracked();
+            let mut url = format!("{active_url}?include_removed={include_removed}");
+            if !is_download {
+                url.push_str(&format!("&recent_completed={limit}"));
+            }
+            let etag = validator
+                .as_ref()
+                .filter(|(path, version, _)| *path == url && *version == revision)
+                .map(|(_, _, etag)| etag.as_str());
+            let snapshot = api::get_if_changed::<Vec<Transfer>>(&url, etag).await;
+            if history_revision.get_untracked() == revision && upload_limit.get_untracked() == limit
+            {
                 match snapshot {
-                    Ok(mut list) => {
-                        if !include_removed {
-                            list.retain(|file| !file.removed);
+                    Ok(snapshot) => {
+                        if let Some((mut list, etag)) = snapshot {
+                            if !include_removed {
+                                list.retain(|file| !file.removed);
+                            }
+                            if !is_download {
+                                more_uploads.set(
+                                    list.iter().filter(|file| file.state.is_complete()).count()
+                                        >= limit as usize,
+                                );
+                            }
+                            apply_snapshot(list, rows, index, speed);
+                            validator = etag.map(|etag| (url, revision, etag));
                         }
-                        apply_snapshot(list, rows, index, speed);
                         if load_error.with_untracked(Option::is_some) {
                             load_error.set(None);
                         }
@@ -530,13 +549,13 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     disabled=move || busy.get() || counts.with(|c| c.succeeded == 0)
                     on:click=move |_| change.run((Operation::Remove,
                         page.targets(Operation::Remove, None, |entry| entry.state == State::Succeeded)))>
-                    <Icon name="circle-check"/>"Clear succeeded"
+                    <Icon name="circle-check"/>{if is_download { "Clear succeeded" } else { "Clear shown succeeded" }}
                 </button>
                 <button type="button" class="menu__item" role="menuitem"
                     disabled=move || busy.get() || counts.with(|c| c.failed + c.cancelled == 0)
                     on:click=move |_| change.run((Operation::Remove,
                         page.targets(Operation::Remove, None, |entry| entry.state.is_failed())))>
-                    <Icon name="circle-alert"/>"Clear failed and cancelled"
+                    <Icon name="circle-alert"/>{if is_download { "Clear failed and cancelled" } else { "Clear shown failed and cancelled" }}
                 </button>
                 <div class="menu__separator"></div>
                 <button type="button" class="menu__item" role="menuitem"
@@ -623,7 +642,11 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     <label class="switch transfers-history">
                         <input type="checkbox" role="switch" prop:checked=history on:change=move |event| {
                             history.set(event_target_checked(&event));
+                            history_revision.update(|revision| *revision = revision.wrapping_add(1));
                             loading.set(true);
+                            apply_snapshot(Vec::new(), rows, index, speed);
+                            more_uploads.set(false);
+                            load_error.set(None);
                         }/>
                         <span class="switch__track" aria-hidden="true"></span>
                         <span class="switch__label">"Show removed"</span>
@@ -674,6 +697,14 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     }/>
             </div>
 
+            <Show when=move || more_uploads.get()>
+                <div class="row">
+                    <Button text="Load older uploads" on_click=Callback::new(move |_| {
+                        upload_limit.update(|limit| *limit = limit.saturating_add(UPLOAD_PAGE));
+                    })/>
+                    <span class="muted text-sm">"Filters apply to the uploads loaded here."</span>
+                </div>
+            </Show>
             <SelectionBar page/>
             <groups::DetailsDialog page/>
             <Modal open=confirm_cancel size="sm"

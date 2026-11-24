@@ -1,4 +1,4 @@
-# docker compose up -d, then open http://localhost:5030
+# docker compose up -d, then open http://localhost:5031
 services:
   slskr:
     build: .
@@ -6,12 +6,11 @@ services:
     container_name: slskr
     restart: unless-stopped
     ports:
-      - "5030:5030" # web UI
+      - "5031:5030" # web UI
       - "50300:50300" # incoming Soulseek connections; forward this port on your router
-    environment:
-      # Without a web password, the first visit opens first-run setup; the setup code it
-      # asks for is in `docker compose logs slskr`. To fix the sign-in here instead (it is
-      # then locked in the UI), set SLSKR_WEB_PASSWORD in a .env file and uncomment:
+    # The setup code is in `docker compose logs slskr`. To pin the sign-in instead,
+    # set SLSKR_WEB_PASSWORD in .env and uncomment environment and the web settings.
+    # environment:
       # SLSKR_WEB_USERNAME: admin
       # SLSKR_WEB_PASSWORD: ${SLSKR_WEB_PASSWORD:?set SLSKR_WEB_PASSWORD in .env}
       # Everything else, including the Soulseek account, can be set in the UI.

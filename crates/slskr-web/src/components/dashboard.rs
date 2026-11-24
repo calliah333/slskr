@@ -1,7 +1,8 @@
 mod charts;
 mod reports;
+pub(crate) use reports::ReportCache;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use chrono::{DateTime, Duration, Local, Utc};
 use leptos::prelude::*;
@@ -100,22 +101,47 @@ impl Reports {
             download_errors: RwSignal::new(None),
         }
     }
+
+    fn clear_tabs(self) {
+        self.uploads.set(None);
+        self.downloads.set(None);
+        self.directories.set(None);
+        self.upload_pareto.set(None);
+        self.download_pareto.set(None);
+        self.upload_errors.set(None);
+        self.download_errors.set(None);
+    }
 }
 
-/// Clears `slot`, then fills it with the answer unless a newer load has started since.
-fn fill<T, F>(slot: Slot<T>, generation: StoredValue<u64>, current: u64, request: F)
-where
-    T: Send + Sync + 'static,
-    F: Future<Output = Result<T, api::ApiError>> + 'static,
-{
-    slot.set(None);
+struct ReportWindow {
+    period: usize,
+    start: String,
+    end: String,
+    requested_summary: bool,
+    requested_tabs: HashSet<String>,
+}
+
+/// Show the last result while refreshing an older snapshot.
+fn fill<T: serde::de::DeserializeOwned + Send + Sync + 'static>(
+    slot: Slot<T>,
+    generation: StoredValue<u64>,
+    current: u64,
+    cache: ReportCache,
+    period: usize,
+    request: reports::ReportRequest<T>,
+) {
+    let cached = request.cached(cache, period);
+    let has_snapshot = cached.is_some();
+    let fresh = cached.as_ref().is_some_and(|(_, fresh)| *fresh);
+    slot.set(cached.map(|(report, _)| Ok(report)));
+    if fresh {
+        return;
+    }
     spawn_local(async move {
-        let result = request.await;
-        // Period changed or page unmounted while loading: drop the stale result.
-        if generation.try_get_value() != Some(current) {
-            return;
+        let result = request.fetch(cache, period).await;
+        if generation.try_get_value() == Some(current) && (result.is_ok() || !has_snapshot) {
+            let _ = slot.try_set(Some(result.map_err(|error| error.to_string())));
         }
-        let _ = slot.try_set(Some(result.map_err(|error| error.to_string())));
     });
 }
 
@@ -199,6 +225,7 @@ fn typing(event: &web_sys::KeyboardEvent) -> bool {
 
 #[component]
 pub fn Dashboard() -> impl IntoView {
+    let cache = expect_context::<ReportCache>();
     let state = expect_context::<AppContext>().state;
     let connected = Signal::derive(move || state.with(|state| state.server.state.is_connected()));
     let search = NodeRef::<leptos::html::Input>::new();
@@ -212,34 +239,67 @@ pub fn Dashboard() -> impl IntoView {
     // Bumped per load so a slow response for an earlier period cannot overwrite a newer one.
     let generation = StoredValue::new(0_u64);
 
-    Effect::new(move |_| {
-        let selected = PERIODS[period.get()];
-        let end = Utc::now();
-        let start = selected
-            .days
-            .map(|days| end - Duration::days(days))
-            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap_or(end));
-        let start = start.to_rfc3339();
-        let end = end.to_rfc3339();
-        let current = generation.get_value().wrapping_add(1);
-        generation.set_value(current);
+    Effect::new(move |previous: Option<ReportWindow>| {
+        let period = period.get();
+        let selected = PERIODS[period];
+        let active_tab = tab.get();
+        let previous = previous.filter(|window| window.period == period);
+        let new_period = previous.is_none();
+        let mut window = previous.unwrap_or_else(|| {
+            // Share a window across page visits and sessions for the current minute.
+            let now = Utc::now();
+            let end = DateTime::from_timestamp((now.timestamp().div_euclid(60) + 1) * 60, 0)
+                .unwrap_or(now);
+            let start = selected
+                .days
+                .map(|days| end - Duration::days(days))
+                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap_or(end));
+            ReportWindow {
+                period,
+                start: start.to_rfc3339(),
+                end: end.to_rfc3339(),
+                requested_summary: false,
+                requested_tabs: HashSet::new(),
+            }
+        });
+        if new_period {
+            generation.update_value(|current| *current = current.wrapping_add(1));
+            data.clear_tabs();
+        }
+        let current = generation.get_value();
         macro_rules! load {
             ($slot:ident, $report:ident $(, $arg:expr)*) => {{
-                let (start, end) = (start.clone(), end.clone());
-                fill(data.$slot, generation, current, async move {
-                    reports::$report(&start, &end $(, $arg)*).await
-                });
+                let request = reports::$report(&window.start, &window.end $(, $arg)*);
+                fill(data.$slot, generation, current, cache, period, request);
             }};
         }
-        load!(summary, summary);
-        load!(histogram, histogram, selected.buckets);
-        load!(uploads, leaderboard, "upload", "count");
-        load!(downloads, leaderboard, "download", "count");
-        load!(directories, directories);
-        load!(upload_pareto, error_types, "upload");
-        load!(download_pareto, error_types, "download");
-        load!(upload_errors, errors, "upload");
-        load!(download_errors, errors, "download");
+        if new_period {
+            load!(histogram, histogram, selected.buckets);
+        }
+        // Give the chart the first turn on SQLite's transfer connection.
+        if data.histogram.with(Option::is_none) {
+            return window;
+        }
+        if !window.requested_summary {
+            window.requested_summary = true;
+            load!(summary, summary);
+        }
+        if window.requested_tabs.insert(active_tab.clone()) {
+            match active_tab.as_str() {
+                "users" => {
+                    load!(uploads, leaderboard, "upload", "count");
+                    load!(downloads, leaderboard, "download", "count");
+                }
+                "content" => load!(directories, directories),
+                _ => {
+                    load!(upload_pareto, error_types, "upload");
+                    load!(download_pareto, error_types, "download");
+                    load!(upload_errors, errors, "upload");
+                    load!(download_errors, errors, "download");
+                }
+            }
+        }
+        window
     });
 
     // `/` focuses the search box from anywhere on the page.
@@ -274,8 +334,10 @@ pub fn Dashboard() -> impl IntoView {
             };
             match api::post::<_, serde_json::Value>("/searches", &request).await {
                 Ok(_) => {
-                    let _ = text.try_set(String::new());
-                    let _ = creating.try_set(false);
+                    if creating.try_set(false).is_some() {
+                        return;
+                    }
+                    text.set(String::new());
                     navigate(
                         &format!("/searches/{}", util::encode_uri_component(&id)),
                         Default::default(),
@@ -438,12 +500,12 @@ fn SummaryStats(summary: Slot<TransferSummaryReport>) -> impl IntoView {
                 (ratio, "Uploaded ÷ downloaded".into())
             })}
             {tile("Distinct peers", "users", "muted", |report| {
-                let peers = [TransferDirection::Upload, TransferDirection::Download]
-                    .iter()
-                    .filter_map(|direction| report.get(direction).and_then(|states| states.get(&TransferState::Succeeded)))
-                    .map(|summary| summary.distinct_users)
-                    .sum::<u64>();
-                (peers.to_string(), "With completed transfers".into())
+                let peers = |direction| report.get(&direction)
+                    .and_then(|states| states.get(&TransferState::Succeeded))
+                    .map_or(0, |summary| summary.distinct_users);
+                let down = peers(TransferDirection::Download);
+                let up = peers(TransferDirection::Upload);
+                (format!("{down} down · {up} up"), "Successful transfers by direction".into())
             })}
         </div>
     }

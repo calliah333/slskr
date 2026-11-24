@@ -89,8 +89,9 @@ pub(super) fn specs(roots: &[String]) -> impl Iterator<Item = ShareSpec<'_>> {
 
 pub(super) fn scan_roots(
     options: ScanOptions,
+    previous: Option<&Snapshot>,
     cancel: &CancellationToken,
-    progress: impl Fn(usize, usize),
+    progress: impl Fn(u32),
 ) -> Result<Snapshot> {
     ensure!(!cancel.is_cancelled(), "share scan cancelled");
     let scanned_at = Utc::now();
@@ -143,14 +144,29 @@ pub(super) fn scan_roots(
     }
 
     let mut shares = BTreeMap::new();
-    let total = includes.len();
-    for (i, (spec, root)) in includes.into_iter().enumerate() {
+    let mut completed = 0_u32;
+    for (spec, root) in includes {
         ensure!(!cancel.is_cancelled(), "share scan cancelled");
         if !excludes.iter().any(|path| root.starts_with(path)) {
-            let contents = scan_root(&spec, root, &roots, &excludes, &filters, cancel)?;
+            let cached = previous
+                .and_then(|snapshot| snapshot.shares.get(spec.alias))
+                .filter(|share| share.root == root);
+            let contents = scan_root(
+                &spec,
+                root,
+                &roots,
+                &excludes,
+                &filters,
+                cancel,
+                cached,
+                |count| {
+                    progress(completed.saturating_add(count));
+                },
+            )?;
+            completed = completed.saturating_add(contents.file_count);
             shares.insert(spec.alias.into(), contents);
         }
-        progress(i + 1, total);
+        progress(completed);
     }
     Ok(Snapshot {
         options,
@@ -166,6 +182,8 @@ fn scan_root(
     excludes: &[PathBuf],
     filters: &RegexSet,
     cancel: &CancellationToken,
+    cached: Option<&ShareContents>,
+    progress: impl Fn(u32),
 ) -> Result<ShareContents> {
     let mut directories = BTreeMap::<String, Vec<ShareFile>>::new();
     let mut file_count = 0u32;
@@ -239,17 +257,39 @@ fn scan_root(
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .map_or_else(String::new, str::to_lowercase);
-            let attributes = audio::read(&audio_root, &root, path, &extension);
+            let modified = metadata.modified().ok().map(chrono::DateTime::<Utc>::from);
+            let cached_file = cached
+                .and_then(|share| share.directories.get(parent))
+                .and_then(|files| {
+                    files
+                        .binary_search_by(|file| file.name.as_str().cmp(name))
+                        .ok()
+                        .map(|index| &files[index])
+                })
+                .filter(|file| {
+                    modified.is_some()
+                        && file.modified == modified
+                        && file.size == metadata.len()
+                        && !file.attributes.is_empty()
+                });
+            let attributes = cached_file.map_or_else(
+                || audio::read(&audio_root, &root, path, &extension),
+                |file| file.attributes.clone(),
+            );
             directories
                 .get_mut(parent)
                 .expect("scanned parent directory")
                 .push(ShareFile {
                     name: name.into(),
+                    modified,
                     size: metadata.len(),
                     extension,
                     attributes,
                 });
             file_count = file_count.saturating_add(1);
+            if file_count == 1 || file_count.is_multiple_of(128) {
+                progress(file_count);
+            }
         }
     }
     for files in directories.values_mut() {
@@ -278,6 +318,54 @@ fn is_filtered(path: &Path, root: &Path, configured_root: &Path, filters: &Regex
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shares::{Attribute, AttributeType, NamedAttribute};
+
+    #[test]
+    fn rescans_reuse_metadata_and_refresh_changed_files() {
+        let root = tempfile::tempdir().unwrap();
+        let track = root.path().join("track.mp3");
+        fs::write(&track, b"invalid audio").unwrap();
+        let scan = |previous: Option<&Snapshot>| {
+            let seen = std::cell::Cell::new(0);
+            let snapshot = scan_roots(
+                ScanOptions {
+                    directories: vec![format!("[music]{}", root.path().display())],
+                    filters: Vec::new(),
+                },
+                previous,
+                &CancellationToken::new(),
+                |count| seen.set(count),
+            )
+            .unwrap();
+            assert_eq!(seen.get(), 1);
+            snapshot
+        };
+        let mut first = scan(None);
+        first
+            .shares
+            .get_mut("music")
+            .unwrap()
+            .directories
+            .get_mut("music")
+            .unwrap()[0]
+            .attributes
+            .push(Attribute {
+                kind: AttributeType::Named(NamedAttribute::BitRate),
+                value: 320,
+            });
+        let second = scan(Some(&first));
+        assert_eq!(
+            second.shares["music"].directories["music"][0].attributes[0].value,
+            320
+        );
+        fs::write(&track, b"different size, invalid audio").unwrap();
+        let third = scan(Some(&second));
+        assert!(
+            third.shares["music"].directories["music"][0]
+                .attributes
+                .is_empty()
+        );
+    }
 
     #[test]
     fn upstream_share_id_and_spec_syntax() {
@@ -320,8 +408,9 @@ mod tests {
                 ],
                 filters: vec![r"\.tmp$".into(), r"Filtered$".into()],
             },
+            None,
             &CancellationToken::new(),
-            |_, _| {},
+            |_| {},
         )
         .unwrap();
         let collection = &snapshot.shares["collection"];
@@ -351,8 +440,9 @@ mod tests {
                     directories: Vec::new(),
                     filters: Vec::new(),
                 },
+                None,
                 &token,
-                |_, _| {}
+                |_| {}
             )
             .is_err()
         );

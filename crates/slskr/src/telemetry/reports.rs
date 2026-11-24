@@ -1,5 +1,8 @@
 //! Transfer reports backed by the transfers database.
 
+mod cache;
+pub(crate) use cache::cache_response;
+
 use crate::http::{ApiError, ApiResult, Json, Path, Query, Routes};
 use crate::{app::AppState, auth::Authenticated, db::Database};
 use axum::extract::State;
@@ -34,6 +37,16 @@ fn histogram_bucket_count(start: DateTime<Utc>, end: DateTime<Utc>, seconds: i64
     let end = end.timestamp() + i64::from(end.timestamp_subsec_nanos() > 0);
     let span = (end - histogram_begin(start, seconds)).max(0);
     (span + seconds - 1) / seconds
+}
+
+fn empty_histogram(start: DateTime<Utc>, end: DateTime<Utc>, seconds: i64) -> TransferHistogram {
+    let mut histogram = TransferHistogram::new();
+    let mut bucket = histogram_begin(start, seconds);
+    while let Some(at) = DateTime::from_timestamp(bucket, 0).filter(|&at| at < end) {
+        histogram.insert(at, empty_summary());
+        bucket += seconds;
+    }
+    histogram
 }
 
 const fn utc(seconds: i64, nanos: u32) -> DateTime<Utc> {
@@ -90,11 +103,15 @@ fn ms(seconds: Option<f64>) -> u64 {
 #[derive(Clone)]
 pub struct ReportsService {
     database: Database,
+    cache: cache::ReportCache,
 }
 
 impl ReportsService {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            cache: cache::ReportCache::default(),
+        }
     }
 
     async fn oldest_requested(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
@@ -158,17 +175,10 @@ impl ReportsService {
             histogram_bucket_count(start, end, seconds) <= MAX_HISTOGRAM_BUCKETS,
             "Histogram would exceed {MAX_HISTOGRAM_BUCKETS} buckets"
         );
-        let begin = histogram_begin(start, seconds);
         let (start_text, end_text) = (timestamp(start), timestamp(end));
         let direction = direction.map(str::to_owned);
         let username = username.map(str::to_owned);
-        // Build the gapless empty buckets before taking the database connection.
-        let mut histogram = TransferHistogram::new();
-        let mut bucket = begin;
-        while let Some(at) = DateTime::from_timestamp(bucket, 0).filter(|&at| at < end) {
-            histogram.insert(at, empty_summary());
-            bucket += seconds;
-        }
+        let mut histogram = empty_histogram(start, end, seconds);
         self.database.call(move |db| {
             let mut stmt = db.prepare(&format!(
                 "SELECT (CAST(strftime('%s', ended_at) AS INTEGER) / ?1) * ?1, direction, state,
@@ -192,6 +202,60 @@ impl ReportsService {
                     average_speed: row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
                     average_wait_ms: ms(row.get(7)?),
                     average_duration_ms: ms(row.get(8)?),
+                    ..Default::default()
+                });
+            }
+            Ok(histogram)
+        }).await
+    }
+
+    /// Fast chart totals from completed hours, with the raw rows at the two edges.
+    async fn chart(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        seconds: i64,
+    ) -> anyhow::Result<TransferHistogram> {
+        const HOUR: i64 = 3600;
+        let first = start.timestamp().div_euclid(HOUR) * HOUR;
+        let full_start = if start == utc(first, 0) {
+            first
+        } else {
+            first + HOUR
+        };
+        let full_end = end.timestamp().div_euclid(HOUR) * HOUR;
+        // Give both edge scans a single lower and upper bound for the date index.
+        let bounds = (
+            timestamp(start),
+            timestamp(end.min(utc(full_start, 0) - Duration::nanoseconds(1))),
+            timestamp(utc(full_start.max(full_end), 0)),
+            timestamp(end),
+        );
+        self.database.call(move |db| {
+            let mut histogram = empty_histogram(start, end, seconds);
+            let mut stmt = db.prepare_cached(&format!(
+                "SELECT hour / ?1 * ?1, direction, state, SUM(bytes), SUM(files) FROM (
+                    SELECT hour, direction, state, bytes, files FROM transfer_chart_hours
+                    WHERE hour >= ?2 AND hour < ?3
+                    UNION ALL
+                    SELECT unixepoch(substr(ended_at, 1, 19)) / 3600 * 3600, direction, state, size, 1
+                    FROM transfers WHERE ended_at BETWEEN ?4 AND ?5
+                      AND state IN ({COMPLETED_STATES})
+                    UNION ALL
+                    SELECT unixepoch(substr(ended_at, 1, 19)) / 3600 * 3600, direction, state, size, 1
+                    FROM transfers WHERE ended_at BETWEEN ?6 AND ?7 AND state IN ({COMPLETED_STATES})
+                ) GROUP BY 1, 2, 3"
+            ))?;
+            let mut rows = stmt.query(rusqlite::params![seconds, full_start, full_end, bounds.0, bounds.1, bounds.2, bounds.3])?;
+            while let Some(row) = rows.next()? {
+                let Some(summary) = DateTime::from_timestamp(row.get(0)?, 0)
+                    .and_then(|at| histogram.get_mut(&at))
+                else {
+                    continue;
+                };
+                summary.entry(api_direction(&row.get::<_, String>(1)?)).or_default().insert(summary_state(row.get(2)?), TransferSummary {
+                    total_bytes: row.get(3)?,
+                    count: row.get(4)?,
                     ..Default::default()
                 });
             }
@@ -487,6 +551,34 @@ async fn histogram(
     ))
 }
 
+async fn chart(
+    _: Authenticated,
+    State(state): State<AppState>,
+    Query(q): Query<Window>,
+) -> ApiResult<Json<TransferHistogram>> {
+    let (mut start, end) = q.recent_bounds()?;
+    if end < GENESIS {
+        return Err(bad_request("end is earlier than 2020-12-30 06:22 UTC"));
+    }
+    let reports = &state.services.telemetry.reports;
+    if start < GENESIS {
+        start = reports
+            .database
+            .call(|db| {
+                db.query_row("SELECT MIN(hour) FROM transfer_chart_hours", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+            })
+            .await?
+            .and_then(|hour| DateTime::from_timestamp(hour, 0))
+            .unwrap_or(GENESIS)
+            .min(end - Duration::hours(1));
+    }
+    let seconds = q.histogram_seconds(start, end)?;
+    let hours = (seconds + 3599) / 3600;
+    Ok(Json(reports.chart(start, end, hours * 3600).await?))
+}
+
 async fn leaderboard(
     _: Authenticated,
     State(state): State<AppState>,
@@ -598,6 +690,7 @@ pub fn routes() -> Routes {
     Routes::new()
         .get("/api/reports/transfers/summary", summary)
         .get("/api/reports/transfers/histogram", histogram)
+        .get("/api/reports/transfers/chart", chart)
         .get("/api/reports/transfers/leaderboard", leaderboard)
         .get("/api/reports/transfers/errors", errors)
         .get("/api/reports/transfers/errors/pareto", pareto)
@@ -694,8 +787,84 @@ mod tests {
                  '2026-01-01T00:00:00.000000000Z',NULL,NULL,'2026-01-01T00:01:00.000000000Z',40,4,NULL),
                 ('u2','bob','Upload','music\album\two.flac',70,48,
                  '2026-01-01T00:00:00.000000000Z',NULL,NULL,'2026-01-01T00:01:01.000000000Z',70,7,NULL);
-        "#]).unwrap();
+        "#, include_str!("../transfers/migrations/chart.sql")]).unwrap();
         ReportsService::new(database)
+    }
+
+    #[tokio::test]
+    async fn chart_keeps_exact_edges_and_tracks_transfer_changes() {
+        let reports = fixture();
+        let start = START - Duration::minutes(5);
+        let end = START + Duration::hours(2) + Duration::minutes(2);
+        let chart = |histogram: &TransferHistogram, hour, direction, state| {
+            let summary = &histogram[&hour][&direction][&state];
+            (summary.count, summary.total_bytes)
+        };
+        let first = reports.chart(start, END, 3600).await.unwrap();
+        assert_eq!(
+            chart(
+                &first,
+                START,
+                TransferDirection::Download,
+                TransferState::Succeeded
+            ),
+            (2, 720)
+        );
+        let first = reports.chart(start, end, 3600).await.unwrap();
+        assert_eq!(
+            chart(
+                &first,
+                START,
+                TransferDirection::Download,
+                TransferState::Succeeded
+            ),
+            (3, 1620)
+        );
+
+        reports.database.call(|db| db.execute_batch(
+            "DELETE FROM transfers WHERE id = 'd2';
+             UPDATE transfers SET direction = 'Upload', size = 50 WHERE id = 'd1';
+             UPDATE transfers SET state = 48, ended_at = '2026-01-01T02:01:00.000000000Z' WHERE id = 'd3';
+             INSERT INTO transfers (id, username, direction, size, state, ended_at)
+             VALUES ('d5', 'alice', 'Download', 7, 48, '2026-01-01T01:59:59.999999999Z');"
+        )).await.unwrap();
+        let updated = reports.chart(start, end, 3600).await.unwrap();
+        assert_eq!(
+            chart(
+                &updated,
+                START,
+                TransferDirection::Download,
+                TransferState::Succeeded
+            ),
+            (1, 900)
+        );
+        assert_eq!(
+            chart(
+                &updated,
+                START,
+                TransferDirection::Upload,
+                TransferState::Succeeded
+            ),
+            (3, 160)
+        );
+        assert_eq!(
+            chart(
+                &updated,
+                START + Duration::hours(1),
+                TransferDirection::Download,
+                TransferState::Succeeded
+            ),
+            (1, 7)
+        );
+        assert_eq!(
+            chart(
+                &updated,
+                START + Duration::hours(2),
+                TransferDirection::Download,
+                TransferState::Succeeded
+            ),
+            (1, 90)
+        );
     }
 
     #[tokio::test]

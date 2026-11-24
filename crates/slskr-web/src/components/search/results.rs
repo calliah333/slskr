@@ -4,7 +4,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -326,6 +326,18 @@ pub(super) fn SearchResults(
             })
         })
     });
+    let visible_cards = Memo::new(move |_| {
+        results.with(|(_, _, cards)| {
+            let mut keys = Vec::new();
+            let mut by_key = HashMap::new();
+            for card in cards.iter().take(limit.get()) {
+                let key = card.key();
+                keys.push(key.clone());
+                by_key.insert(key, card.clone());
+            }
+            (keys, by_key)
+        })
+    });
     let hide = Callback::new(move |username: String| {
         hidden.update(|hidden| {
             hidden.insert(username);
@@ -441,9 +453,9 @@ pub(super) fn SearchResults(
                 </div>
             </section>
             <div class="results-list">
-                <For each=move || results.with(|(_, _, cards)| cards.iter().take(limit.get()).map(|card| card.key()).collect::<Vec<_>>())
+                <For each=move || visible_cards.with(|(keys, _)| keys.clone())
                     key=String::clone children=move |key: String| {
-                        let row = Memo::new(move |_| results.with(|(_, _, cards)| cards.iter().find(|card| card.key() == key).cloned()));
+                        let row = Memo::new(move |_| visible_cards.with(|(_, cards)| cards.get(&key).cloned()));
                         view! { <FolderCard row connected collapsed hide/> }
                     }/>
             </div>

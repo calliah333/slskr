@@ -431,9 +431,14 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
         };
         testing.set(true);
         test_result.set(None);
-        spawn_local_scoped_with_cancellation(async move {
-            test_result.set(Some(test_login(credentials).await));
-            testing.set(false);
+        leptos::task::spawn_local(async move {
+            let result = test_login(credentials.clone()).await;
+            if testing.try_set(false).is_none()
+                && soulseek_username.get_untracked() == credentials.username
+                && soulseek_password.get_untracked() == credentials.password
+            {
+                test_result.set(Some(result));
+            }
         });
     };
 

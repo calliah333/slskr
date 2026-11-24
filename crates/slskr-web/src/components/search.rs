@@ -288,7 +288,7 @@ pub fn Searches() -> impl IntoView {
                     <SearchDetail id searches live loading connection_epoch busy connected create change/>
                 }.into_any(),
                 None => view! {
-                    <PageHeader title="Search" description="Search the Soulseek network and revisit earlier results."
+                    <PageHeader title="Search"
                         actions=ViewFn::from(move || view! {
                             <Show when=move || { completed.get() > 0 }>
                                 <Button icon="trash-2" text="Clear completed" disabled=busy
@@ -322,17 +322,21 @@ fn SearchBox(
 ) -> impl IntoView {
     let blank = Signal::derive(move || query.with(|text| text.trim().is_empty()));
     let blocked = Signal::derive(move || busy.get() || !connected.get() || blank.get());
+    let help = RwSignal::new(false);
     view! {
         <Card class="search-box">
             <form class="search-box__form" role="search" aria-label="Search"
                 on:submit=move |event| { event.prevent_default(); create.run((query.get_untracked(), true)); }>
                 <div class="input-icon search-box__field">
                     <Icon name="search" size="lg"/>
-                    <input type="search" class="input" aria-label="Search phrase" aria-describedby="search-box-help"
+                    <input type="search" class="input" aria-label="Search phrase"
+                        aria-describedby=move || (!connected.get()).then_some("search-box-offline")
                         data-lpignore="true" autocomplete="off" autofocus
                         disabled=move || busy.get() || !connected.get()
                         placeholder=move || if connected.get() { "Artist, album, track…" } else { "Connect to the server to search" }
                         prop:value=query on:input=move |event| query.set(event_target_value(&event))/>
+                    <Button class="search-box__syntax" variant="ghost" size="sm" icon="circle-help"
+                        label="Advanced search help" on_click=Callback::new(move |_| help.set(true))/>
                 </div>
                 <div class="search-box__actions">
                     <Button size="lg" icon="plus" label="Add search without opening it" disabled=blocked
@@ -341,14 +345,19 @@ fn SearchBox(
                         loading=creating disabled=blocked/>
                 </div>
             </form>
-            <p id="search-box-help" class="help search-box__help" class:text-warning=move || !connected.get()>
-                {move || if connected.get() {
-                    view! { "Press " <kbd class="kbd">"Enter"</kbd> " to search and open the results, or " <Icon name="plus" size="xs"/> " to add it to the list." }.into_any()
-                } else {
-                    view! { <Icon name="wifi-off" size="xs"/> " Not connected to the Soulseek server. Connect from the header to search." }.into_any()
-                }}
-            </p>
+            <Show when=move || !connected.get()>
+                <p id="search-box-offline" class="help search-box__help text-warning">
+                    <Icon name="wifi-off" size="xs"/> " Not connected to the Soulseek server. Connect from the header to search."
+                </p>
+            </Show>
         </Card>
+        <Modal open=help on_close=Callback::new(move |()| help.set(false)) title="Advanced search" size="sm">
+            <div class="stack stack--sm">
+                <p><code>"massive attack"</code>" searches for both words."</p>
+                <p><code>"massive attack -live"</code>" excludes results containing “live”."</p>
+                <p><code>"*step"</code>" matches words ending in “step”, such as “dubstep”."</p>
+            </div>
+        </Modal>
     }
 }
 

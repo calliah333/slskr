@@ -1,8 +1,10 @@
 /* ---------- page: system (src/components/system*.rs, not settings) ---------- */
 
 /* Info */
-.system-info__grid { align-items: start; }
-.system-info__grid > .card { height: 100%; }
+.system-info__grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 27rem), 1fr)); }
+@media (min-width: 480px) {
+  .system-info__grid .dl { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); column-gap: var(--space-3); }
+}
 .system-info__error,
 .system-info__message > .alert { margin-top: var(--space-4); }
 .system-connection .status-dot { width: 0.5rem; height: 0.5rem; }

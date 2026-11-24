@@ -255,6 +255,7 @@ fn AuthenticatedApp(
     let metrics = RwSignal::new(CurrentMetrics::default());
     // The live configuration gates readiness; the onboarding banner reads it.
     provide_context(AppContext { state, metrics });
+    provide_context(super::dashboard::ReportCache::new());
 
     let events = Events::start();
     let loaded = [
@@ -309,7 +310,8 @@ fn AuthenticatedApp(
         {move || if status.get() == Status::Reconnecting {
             view! {
                 <div class="container reconnect-banner">
-                    <Alert variant="warning" class="reconnect-alert">"Lost connection to slskr. Reconnecting…"</Alert>
+                    <Alert variant="warning" class="reconnect-alert">{move || if ready.get() { "Lost connection to slskr. Reconnecting…" }
+                        else { "Could not open the live connection to slskr. Retrying…" }}</Alert>
                 </div>
             }.into_any()
         } else if !ready.get() {
@@ -440,9 +442,10 @@ fn NavLink(path: &'static str, icon: &'static str, label: &'static str) -> impl 
     let href = format!("{base}{path}");
     let location = use_location();
     let active = Memo::new(move |_| {
-        location
-            .pathname
-            .with(|current| is_current(current, &base, path))
+        location.pathname.with(|current| {
+            is_current(current, &base, path)
+                || (path == "/chat" && is_current(current, &base, "/rooms"))
+        })
     });
     // `<A>` sets `aria-current` itself; the class keeps the active look independent of it.
     view! {
@@ -536,8 +539,7 @@ fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
                     <NavLink path="/uploads" icon="upload" label="Uploads"/>
                     <NavLink path="/browse" icon="folder-open" label="Browse"/>
                     <NavLink path="/users" icon="users" label="Users"/>
-                    <NavLink path="/rooms" icon="messages-square" label="Rooms"/>
-                    <NavLink path="/chat" icon="message-square" label="Chat"/>
+                    <NavLink path="/chat" icon="messages-square" label="Chat"/>
                     <NavLink path="/system" icon="server" label="System"/>
                 </nav>
             </div>

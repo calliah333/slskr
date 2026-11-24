@@ -18,7 +18,7 @@ use leptos_router::{
 };
 use slskr_types::{
     conversations::Conversation,
-    rooms::{RoomInfo, RoomMessage, RoomUser, Ticker},
+    rooms::{Room, RoomInfo, RoomMessage, RoomUser, Ticker},
     users::UserPresence,
 };
 use wasm_bindgen_futures::spawn_local;
@@ -190,43 +190,28 @@ pub fn Rooms() -> impl IntoView {
                 // Responses for a room that is no longer active must not replace its view.
                 let still_active =
                     || current() && active.try_get_untracked().as_deref() == Some(&selected);
-                let value = crate::services::api::get::<Vec<RoomMessage>>(&format!(
-                    "/rooms/joined/{encoded}/messages"
-                ))
-                .await;
+                let value =
+                    crate::services::api::get::<Room>(&format!("/rooms/joined/{encoded}")).await;
                 if !still_active() {
                     finish();
                     return;
                 }
                 match value {
-                    Ok(value) => {
-                        if let Some(at) = value.last().map(|m| m.timestamp) {
+                    Ok(room) => {
+                        if let Some(at) = room.messages.last().map(|m| m.timestamp) {
                             let _ = last_seen
                                 .try_update_value(|seen| seen.insert(selected.clone(), at));
                         }
                         if unread.try_with_untracked(|u| u.contains_key(&selected)) == Some(true) {
                             unread.try_update(|u| u.remove(&selected));
                         }
-                        set_if_changed(messages, value);
-                    }
-                    Err(e) => problem = Some(e.to_string()),
-                }
-                let value = crate::services::api::get::<Vec<RoomUser>>(&format!(
-                    "/rooms/joined/{encoded}/users"
-                ))
-                .await;
-                if !still_active() {
-                    finish();
-                    return;
-                }
-                match value {
-                    Ok(value) => {
+                        set_if_changed(messages, room.messages);
                         if users_room.try_get_untracked().flatten().as_deref() == Some(&selected) {
-                            announce_presence(events, &selected, users, &value);
+                            announce_presence(events, &selected, users, &room.users);
                         } else {
                             let _ = users_room.try_set(Some(selected.clone()));
                         }
-                        set_if_changed(users, value);
+                        set_if_changed(users, room.users);
                     }
                     Err(e) => problem = Some(e.to_string()),
                 }
@@ -297,7 +282,10 @@ pub fn Rooms() -> impl IntoView {
         while poll_alive.load(Ordering::Relaxed) {
             crate::services::util::sleep(1_000).await;
             // Skip ticks while a refresh is still outstanding so polls never overlap.
-            if poll_alive.load(Ordering::Relaxed) && in_flight.try_get_untracked() == Some(false) {
+            if poll_alive.load(Ordering::Relaxed)
+                && !document().hidden()
+                && in_flight.try_get_untracked() == Some(false)
+            {
                 refresh();
             }
         }
@@ -430,8 +418,11 @@ pub fn Rooms() -> impl IntoView {
             {
                 Ok(_) => {
                     unread.try_update(|u| u.remove(&name));
-                    let _ = show_buffer.try_set(false);
-                    if active.try_set(String::new()).is_none() {
+                    if active.try_get_untracked().as_deref() == Some(&name) {
+                        let _ = show_buffer.try_set(false);
+                        let _ = active.try_set(String::new());
+                    }
+                    if generation.try_get_untracked().is_some() {
                         refresh();
                     }
                 }
@@ -450,7 +441,7 @@ pub fn Rooms() -> impl IntoView {
                 }
                 spawn_local(async move {
                     match buffer::join_room(&room).await {
-                        Ok(()) => {
+                        Ok(()) if active.try_get_untracked().as_ref() == Some(&here) => {
                             select_room.run(room.clone());
                             push_event(
                                 events,
@@ -460,6 +451,7 @@ pub fn Rooms() -> impl IntoView {
                                 format!("You joined #{room}"),
                             );
                         }
+                        Ok(()) => {}
                         Err(e) => error_line(here, format!("Could not join #{room}: {e}")),
                     }
                 });
@@ -586,7 +578,7 @@ pub fn Rooms() -> impl IntoView {
                         class="messenger__back" on_click=Callback::new(move |_| show_buffer.set(false))/>
                     <Show when=move || has_room.get() fallback=|| view! {
                         <h2 class="topic__name">"Rooms"</h2>
-                        <span class="topic__text truncate">"Public chat rooms \u{b7} type /join room"</span>
+                        <span class="topic__text"><span class="truncate">"Public chat rooms \u{b7} type /join room"</span></span>
                     }>
                         <h2 class="topic__name">
                             <span class="topic__sigil" aria-hidden="true">

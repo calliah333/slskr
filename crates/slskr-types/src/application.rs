@@ -113,6 +113,8 @@ pub struct ShareState {
     pub cancelled: bool,
     /// 0.0 to 1.0.
     pub scan_progress: f64,
+    /// Number of files indexed so far during the current scan.
+    pub scan_files: u32,
     pub directories: u32,
     pub files: u32,
 }

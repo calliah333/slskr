@@ -1,7 +1,7 @@
 # HTTP API
 
 The daemon's API, used by the web UI and by scripts. Every route below is served under
-`{web.url_base}/api` (for example `http://127.0.0.1:5030/api/searches`, or
+`{web.url_base}/api` (for example `http://127.0.0.1:5031/api/searches`, or
 `/client/api/searches` with `web.url_base = "/client"`). The request and response types
 are the Rust types in [`crates/slskr-types`](../crates/slskr-types/src); this page is the
 authoritative list of routes, and a test (`bootstrap::tests::documented_routes_match_router`)
@@ -13,6 +13,8 @@ keeps it in step with the router.
   names and enum values are `snake_case`. Responses include every field, with `null` for
   absent values; request fields marked optional may be left out. Responses are compressed
   with brotli or gzip when the request's `Accept-Encoding` allows it.
+- **Request compression** accepts `Content-Encoding: gzip` on REST requests. Body
+  size limits apply to the decompressed JSON.
 - **Timestamps** are RFC 3339 UTC strings (`"2026-01-01T12:00:00.123Z"`). **Sizes** are
   bytes, **speeds** bytes per second, **durations** integer milliseconds in fields named
   `*_ms`.
@@ -26,7 +28,8 @@ keeps it in step with the router.
   malformed JSON, query or path, or an invalid value; `401` not signed in; `403` role too
   low, a cross-site request, or a missing or wrong setup code; `404` no such route or
   resource; `405` method not allowed; `409` conflicting state (already exists, not logged
-  in to Soulseek, a pinned setting); `413` body too large; `415` missing JSON content type;
+  in to Soulseek, a pinned setting); `413` body too large; `415` missing JSON content type
+  or unsupported request encoding;
   `422` well-formed JSON of the wrong shape; `429` another enqueue request or login test is
   running, or too many wrong setup codes (with `Retry-After`); `500` an unexpected failure;
   `503` first-run setup is required (`{"error": "setup required"}`, see
@@ -134,6 +137,7 @@ purpose, so keep administrator access to trusted people.
 | GET | `/api/metrics` | readonly | | `CurrentMetrics` |
 | GET | `/api/reports/transfers/summary` | readonly | `?start&end&direction&username` | `TransferSummaryReport` |
 | GET | `/api/reports/transfers/histogram` | readonly | `?start&end&direction&username&buckets=100` | `TransferHistogram` |
+| GET | `/api/reports/transfers/chart` | readonly | `?start&end&buckets=100` | `TransferHistogram` with bytes and counts only, with hour-aligned buckets |
 | GET | `/api/reports/transfers/leaderboard` | readonly | `?direction&start&end&sort_by&sort_order&limit&offset` | `[TransferSummary]` |
 | GET | `/api/reports/transfers/errors` | readonly | `?direction&start&end&username&sort_order&limit&offset` | `[TransferErrorDetail]` |
 | GET | `/api/reports/transfers/errors/pareto` | readonly | `?direction&start&end&username&limit&offset` | `[TransferErrorSummary]` |
@@ -145,7 +149,7 @@ purpose, so keep administrator access to trusted people.
 | DELETE | `/api/searches/{id}` | readwrite | | 204; stops the search if it is running |
 | POST | `/api/searches/{id}/cancel` | readwrite | | 204; the final state arrives as an event |
 | GET | `/api/searches/{id}/responses` | readonly | | `[SearchResponse]`, in arrival order |
-| GET | `/api/transfers/downloads` | readonly | `?username&include_removed=false` | `[Transfer]` |
+| GET | `/api/transfers/downloads` | readonly | `?username&include_removed=false&recent_completed` | `[Transfer]` or 304 when a matching `If-None-Match` validator is sent |
 | POST | `/api/transfers/downloads` | readwrite | `EnqueueDownloadsRequest` `{username, files: [{filename, size}], root?}`; with `root`, each file is saved as `<downloads>/<last component of root>/<path below root>`, and a file not below `root` is a 400 | 201/207/200 `EnqueuedDownloads` `{enqueued, failed, files}` |
 | POST | `/api/transfers/downloads/folder` | readwrite | `EnqueueFolder` `{username, path, recursive=false}` | 201/207/200 `EnqueuedDownloads` for files saved as `<downloads>/<last component of path>/<path below it>`. Includes downloadable files in the peer's folder `path` and, with `recursive`, its subfolders. Returns 404 if the folder is missing or has no files, 409 if not logged in, and 504 if the peer does not answer. |
 | DELETE | `/api/transfers/downloads/completed` | readwrite | | 204; removes every completed download from the list |
@@ -153,7 +157,7 @@ purpose, so keep administrator access to trusted people.
 | DELETE | `/api/transfers/downloads/{id}` | readwrite | | 204; cancels if active and removes from the list |
 | POST | `/api/transfers/downloads/{id}/cancel` | readwrite | | 204; cancels if active |
 | GET | `/api/transfers/downloads/{id}/position` | readwrite | | `QueuePosition`, asked of the peer |
-| GET | `/api/transfers/uploads` | readonly | `?username&include_removed=false` | `[Transfer]` |
+| GET | `/api/transfers/uploads` | readonly | `?username&include_removed=false&recent_completed` | `[Transfer]` or 304 when a matching `If-None-Match` validator is sent |
 | DELETE | `/api/transfers/uploads/completed` | readwrite | | 204 |
 | GET | `/api/transfers/uploads/{id}` | readonly | | `Transfer` |
 | DELETE | `/api/transfers/uploads/{id}` | readwrite | | 204; cancels if active and removes from the list |
@@ -197,6 +201,15 @@ Outside `/api`: `GET {url_base}/health` answers `200` without authentication, an
 `metrics.enabled` the Prometheus exposition is served at `metrics.path` (Basic auth with
 `metrics.username`/`metrics.password` when set).
 
+With `recent_completed`, transfer lists return every active transfer and at most that
+many completed transfers, newest first by end time.
+
+Transfer lists include a weak `ETag` when the snapshot is stable. Clients that still
+hold that snapshot can send the tag as `If-None-Match` on the same list URL and keep
+the snapshot on a bodyless `304`. Lists with live transfers or changing elapsed time
+return a fresh snapshot without a tag. The daemon tracks writes on its own SQLite
+connection. Stop the daemon before editing its transfer database directly.
+
 ### Query parameters
 
 `start` and `end` are RFC 3339 timestamps. `direction` is `download` or `upload`;
@@ -218,7 +231,8 @@ Outside `/api`: `GET {url_base}/health` answers `200` without authentication, an
 | `LoginTestFailure` | `invalid_password`, `invalid_username`, `server_full`, `server_private`, `invalid_version`, `rejected`, `unreachable`, `timeout`, `error` |
 
 Transfer reports key their maps by direction and then by final `TransferState`
-(`{"upload": {"succeeded": {...}}}`).
+(`{"upload": {"succeeded": {...}}}`). Reports with explicit start and end times may
+reuse a server snapshot for up to 60 seconds.
 
 ## Live events
 
@@ -243,7 +257,7 @@ resubscribe), `1001` shutdown. See [daemon internals](DAEMON.md#live-events-srcr
 
 ```sh
 key=...   # created in System → Settings → API keys
-api=http://127.0.0.1:5030/api
+api=http://127.0.0.1:5031/api
 curl -s -H "X-API-Key: $key" -H 'Content-Type: application/json' \
   -d '{"query": "artist album"}' "$api/searches"
 curl -s -H "X-API-Key: $key" "$api/searches/<id>/responses"

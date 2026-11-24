@@ -112,7 +112,7 @@ enum NamedAttribute {
     BitDepth,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Attribute {
     #[serde(rename = "type")]
     kind: AttributeType,
@@ -144,6 +144,8 @@ impl Attribute {
 #[derive(Debug, Serialize, Deserialize)]
 struct ShareFile {
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modified: Option<DateTime<Utc>>,
     size: u64,
     extension: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -319,6 +321,7 @@ impl ShareService {
             s.shares.cancelled = false;
             s.shares.faulted = false;
             s.shares.scan_progress = 0.0;
+            s.shares.scan_files = 0;
         });
         let options = ScanOptions::new(&self.0.core.options.get());
         let service = self.clone();
@@ -342,12 +345,19 @@ impl ShareService {
 
     fn scan_and_publish(&self, options: ScanOptions, cancel: &CancellationToken) -> Result<()> {
         tracing::info!("scanning shares");
-        let snapshot = scan::scan_roots(options, cancel, |completed, total| {
-            // Reserve the final step for writing and publishing the new snapshot.
-            self.0
-                .core
-                .state
-                .update(|s| s.shares.scan_progress = completed as f64 / (total as f64 + 1.0));
+        let previous = self.snapshot();
+        let previous_files = previous
+            .as_deref()
+            .map(snapshot_counts)
+            .map_or(0, |(_, n)| n);
+        let snapshot = scan::scan_roots(options, previous.as_deref(), cancel, |files| {
+            self.0.core.state.update(|s| {
+                s.shares.scan_files = files;
+                if previous_files != 0 {
+                    s.shares.scan_progress =
+                        (f64::from(files) / f64::from(previous_files)).min(0.99);
+                }
+            });
         })
         .and_then(|snapshot| {
             ensure!(!cancel.is_cancelled(), "share scan cancelled");
@@ -845,8 +855,9 @@ mod tests {
                 directories: vec![format!("[music]{}", root.display())],
                 filters: Vec::new(),
             },
+            None,
             &CancellationToken::new(),
-            |_, _| {},
+            |_| {},
         )
         .unwrap();
         let contents = &snapshot.shares["music"];

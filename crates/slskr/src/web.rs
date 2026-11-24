@@ -265,7 +265,7 @@ fn respond(asset: &Asset, request: &HeaderMap) -> Response {
     if asset.br.is_some() || asset.gzip.is_some() {
         headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
     }
-    if if_none_match(request, &etag) {
+    if crate::http::if_none_match(request, Some(&etag)) {
         return (StatusCode::NOT_MODIFIED, headers).into_response();
     }
     headers.insert(
@@ -296,17 +296,6 @@ fn accepts(headers: &HeaderMap, coding: &str) -> bool {
                         .is_none_or(|q| q.trim().parse::<f32>().is_ok_and(|q| q > 0.0))
                 })
         })
-}
-
-/// Whether `If-None-Match` matches `etag` (weak comparison, as for GET).
-fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
-    headers
-        .get_all(header::IF_NONE_MATCH)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag)
 }
 
 #[cfg(test)]

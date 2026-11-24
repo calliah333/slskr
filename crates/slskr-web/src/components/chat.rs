@@ -124,7 +124,7 @@ pub fn Chat() -> impl IntoView {
     spawn_local_scoped_with_cancellation(async move {
         loop {
             crate::services::util::sleep(5_000).await;
-            if !in_flight.get_untracked() {
+            if !document().hidden() && !in_flight.get_untracked() {
                 refresh();
             }
         }
@@ -230,6 +230,9 @@ pub fn Chat() -> impl IntoView {
         spawn_local(async move {
             match buffer::send_private(&username, &text).await {
                 Ok(()) => {
+                    if target.try_get_untracked().as_deref() != Some(&username) {
+                        return;
+                    }
                     if compose_to.try_get_untracked().flatten().as_deref() == Some(&username) {
                         let _ = compose_to.try_set(None);
                     }
@@ -239,9 +242,11 @@ pub fn Chat() -> impl IntoView {
                     }
                 }
                 Err(e) => {
-                    error_line(username, format!("Not sent: {e}"));
+                    error_line(username.clone(), format!("Not sent: {e}"));
                     // Give the text back unless something new was typed meanwhile.
-                    if draft.try_with_untracked(String::is_empty) == Some(true) {
+                    if target.try_get_untracked().as_deref() == Some(&username)
+                        && draft.try_with_untracked(String::is_empty) == Some(true)
+                    {
                         let _ = draft.try_set(text);
                     }
                 }
@@ -254,7 +259,10 @@ pub fn Chat() -> impl IntoView {
             Command::Say(text) => say(here, text),
             Command::Join(room) => spawn_local(async move {
                 match buffer::join_room(&room).await {
-                    Ok(()) => go(format!("/rooms?room={}", util::encode_uri_component(&room))),
+                    Ok(()) if target.try_get_untracked().as_ref() == Some(&here) => {
+                        go(format!("/rooms?room={}", util::encode_uri_component(&room)));
+                    }
+                    Ok(()) => {}
                     Err(e) => error_line(here, format!("Could not join #{room}: {e}")),
                 }
             }),
@@ -268,7 +276,8 @@ pub fn Chat() -> impl IntoView {
             Command::Query(nick) => start.run(nick),
             Command::Msg(nick, text) => spawn_local(async move {
                 match buffer::send_private(&nick, &text).await {
-                    Ok(()) => select(nick),
+                    Ok(()) if target.try_get_untracked().as_ref() == Some(&here) => select(nick),
+                    Ok(()) => {}
                     Err(e) => error_line(here, format!("Not sent to {nick}: {e}")),
                 }
             }),
@@ -401,7 +410,7 @@ pub fn Chat() -> impl IntoView {
                         class="messenger__back" on_click=Callback::new(move |_| show_buffer.set(false))/>
                     <Show when=move || has_target.get() fallback=|| view! {
                         <h2 class="topic__name">"Chat"</h2>
-                        <span class="topic__text truncate">"Private messages \u{b7} open one on the left or type /query nick"</span>
+                        <span class="topic__text"><span class="truncate">"Private messages \u{b7} type /query nick to start"</span></span>
                     }>
                         <h2 class="topic__name">
                             <span class=move || format!("truncate {}", buffer::nick_color(&target.get()))>{move || target.get()}</span>
@@ -410,15 +419,17 @@ pub fn Chat() -> impl IntoView {
                                 view! { <StatusDot status=dot label=text.to_owned()/> }
                             })}
                         </h2>
-                        <span class="topic__text truncate">
-                            {move || if compose_to.with(Option::is_some) {
-                                "New conversation".to_owned()
-                            } else {
-                                match presence.get() {
-                                    Some(p) => format!("{} \u{b7} private conversation", presence_dot(p).1),
-                                    None => "Private conversation".to_owned(),
-                                }
-                            }}
+                        <span class="topic__text">
+                            <span class="truncate">
+                                {move || if compose_to.with(Option::is_some) {
+                                    "New conversation".to_owned()
+                                } else {
+                                    match presence.get() {
+                                        Some(p) => format!("{} \u{b7} private conversation", presence_dot(p).1),
+                                        None => "Private conversation".to_owned(),
+                                    }
+                                }}
+                            </span>
                         </span>
                         <div class="topic__actions">
                             <a class="btn btn--ghost btn--icon btn--sm" href=browse_link

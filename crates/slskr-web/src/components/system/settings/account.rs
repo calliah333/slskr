@@ -121,8 +121,14 @@ pub fn SoulseekAccount() -> impl IntoView {
         testing.set(true);
         result.set(None);
         spawn_local_scoped_with_cancellation(async move {
-            result.set(Some(test_login(Credentials { username, password }).await));
-            testing.set(false);
+            let credentials = Credentials { username, password };
+            let answer = test_login(credentials.clone()).await;
+            if testing.try_set(false).is_none()
+                && super::model::text_of(&form.value("soulseek.username")) == credentials.username
+                && super::model::text_of(&form.value("soulseek.password")) == credentials.password
+            {
+                result.set(Some(answer));
+            }
         });
     };
     view! {

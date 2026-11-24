@@ -196,8 +196,9 @@ pub fn init(options: &Config, paths: &Paths, bus: EventBus) -> anyhow::Result<Lo
     } else {
         None
     };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(options.logging.level.as_str()));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!("{},lofty=error", options.logging.level.as_str()))
+    });
     tracing_subscriber::registry()
         .with(filter)
         .with(BufferLayer(buffer.clone()))

@@ -203,7 +203,7 @@ fn EventRow(event: Event, expanded: RwSignal<HashSet<String>>) -> impl IntoView 
     };
     let (variant, icon, label) = kind_badge(event.kind);
     let summary = summary(&event);
-    let json = serde_json::to_string_pretty(&event.data).unwrap_or_default();
+    let data = StoredValue::new(event.data);
     let detail_target = detail_id.clone();
     view! {
         <tr class="event-row" class:is-selected=move || open.get()>
@@ -231,7 +231,10 @@ fn EventRow(event: Event, expanded: RwSignal<HashSet<String>>) -> impl IntoView 
                     <dt>"Time"</dt><dd>{format::full(event.timestamp)}</dd>
                     <dt>"ID"</dt><dd class="mono">{event.id.clone()}</dd>
                 </dl>
-                <pre class="code code--plain event-json">{json}</pre>
+                {move || open.get().then(|| {
+                    let json = data.with_value(|data| serde_json::to_string_pretty(data).unwrap_or_default());
+                    view! { <pre class="code code--plain event-json">{json}</pre> }
+                })}
             </td>
         </tr>
     }

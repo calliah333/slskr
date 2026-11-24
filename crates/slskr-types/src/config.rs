@@ -191,7 +191,7 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5030),
+            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5031),
             url_base: "/".to_owned(),
             username: "admin".to_owned(),
             password: String::new(),
@@ -715,7 +715,7 @@ mod tests {
     fn json_uses_snake_case_and_string_durations() {
         let v = serde_json::to_value(Config::default()).unwrap();
         assert_eq!(v["web"]["url_base"], "/");
-        assert_eq!(v["web"]["listen"], "127.0.0.1:5030");
+        assert_eq!(v["web"]["listen"], "127.0.0.1:5031");
         assert_eq!(v["soulseek"]["listen_address"], "0.0.0.0");
         assert_eq!(v["downloads"]["retry_delay"], "5s");
         assert_eq!(v["downloads"]["on_conflict"], "rename");

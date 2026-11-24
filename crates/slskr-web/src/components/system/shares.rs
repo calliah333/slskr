@@ -15,7 +15,11 @@ fn scan_status(scan: &ShareState) -> (&'static str, String) {
     if scan.scanning {
         (
             "primary",
-            format!("Scanning {:.0}%", scan.scan_progress * 100.0),
+            if scan.scan_files == 0 {
+                "Scanning…".to_owned()
+            } else {
+                format!("Scanning · {} files", scan.scan_files)
+            },
         )
     } else if scan.faulted {
         ("danger", "Scan failed".to_owned())
@@ -109,8 +113,7 @@ pub fn Shares() -> impl IntoView {
                         }}
                     </div>
                     {move || scanning.get().then(|| view! {
-                        <Progress value=Signal::derive(move || scan.with(|s| s.scan_progress * 100.0))
-                            label="Scan progress"/>
+                        <Progress label="Scan in progress"/>
                     })}
                 </div>
             </div>

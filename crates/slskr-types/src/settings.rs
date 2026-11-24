@@ -85,7 +85,7 @@ mod tests {
         settings.values.web.password = "secret".into();
         let json = serde_json::to_value(&settings).unwrap();
         assert!(json["values"]["web"].get("password").is_none());
-        assert_eq!(json["values"]["web"]["listen"], "127.0.0.1:5030");
+        assert_eq!(json["values"]["web"]["listen"], "127.0.0.1:5031");
         assert_eq!(json["pinned"][0], "web.listen");
         assert_eq!(json["stored"][0], "uploads.slots");
         let back: Settings = serde_json::from_value(json).unwrap();

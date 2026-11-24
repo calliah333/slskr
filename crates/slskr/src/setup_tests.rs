@@ -783,5 +783,5 @@ fn hosts_and_codes() {
         }),
         "http://localhost:5030/client/setup"
     );
-    assert_eq!(open_url(&Config::default()), "http://127.0.0.1:5030/setup");
+    assert_eq!(open_url(&Config::default()), "http://127.0.0.1:5031/setup");
 }
