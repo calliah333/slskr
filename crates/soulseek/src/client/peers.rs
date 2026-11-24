@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{SoulseekClient, peer_handler, require_non_blank};
@@ -21,6 +22,17 @@ use crate::options::{BrowseOptions, ClientOptions, ConnectionOptions};
 use crate::protocol::init::{PeerInit, PierceFirewall};
 use crate::protocol::peer::{BrowseRequest, FolderContentsRequest, UserInfoRequest};
 use crate::protocol::server::{CannotConnect, ConnectToPeerRequest, ConnectToPeerResponse};
+
+/// How long a direct dial runs alone before the server is asked to have the
+/// peer connect back. A reachable peer accepts within one round trip; asking
+/// for the reverse connection as well would cost a server message and make the
+/// peer open a socket that is then refused.
+const INDIRECT_HEAD_START: Duration = Duration::from_secs(1);
+
+/// How long a failed direct dial makes later dials to that user solicit the
+/// reverse connection at once.
+const UNREACHABLE_TTL: Duration = Duration::from_secs(30 * 60);
+const UNREACHABLE_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -102,6 +114,32 @@ struct State {
     reverse_message_dials: HashMap<String, Arc<CancellationToken>>,
     solicitations: HashMap<u32, Solicitation>,
     next_solicitation_id: u64,
+    /// Users whose last direct dial failed, until when to skip the head start.
+    unreachable: HashMap<String, Instant>,
+}
+
+impl State {
+    fn is_unreachable(&self, username: &str) -> bool {
+        self.unreachable
+            .get(username)
+            .is_some_and(|until| *until > Instant::now())
+    }
+
+    fn set_reachable(&mut self, username: &str, reachable: bool) {
+        if reachable {
+            self.unreachable.remove(username);
+            return;
+        }
+        let now = Instant::now();
+        if self.unreachable.len() >= UNREACHABLE_CAPACITY {
+            self.unreachable.retain(|_, until| *until > now);
+            if self.unreachable.len() >= UNREACHABLE_CAPACITY {
+                self.unreachable.clear();
+            }
+        }
+        self.unreachable
+            .insert(username.to_owned(), now + UNREACHABLE_TTL);
+    }
 }
 
 pub(crate) struct PeerManager {
@@ -276,17 +314,27 @@ impl PeerManager {
             token: init_token,
         }
         .to_bytes();
-        // One rejected or unreachable path must not cancel the other. Drop the
-        // losing future before sending a file PeerInit, so only the winning
-        // socket can announce this transfer token.
+        // A direct dial runs alone for a head start, unless this user's last
+        // one failed; the reverse connection is solicited only after that, or
+        // as soon as the direct dial fails. One rejected or unreachable path
+        // must not cancel the other. Drop the losing future before sending a
+        // file PeerInit, so only the winning socket can announce this token.
+        let head_start = if self.lock().is_unreachable(username) {
+            Duration::ZERO
+        } else {
+            INDIRECT_HEAD_START
+        };
         let winner = {
             let direct = async {
-                let mut conn = Connection::connect(endpoint, &options).await?;
+                let mut conn = Connection::connect(endpoint, &options)
+                    .await
+                    .inspect_err(|_| client.inner().server.forget_endpoint(username))?;
                 if kind != Kind::File {
                     conn.write_all(&init).await?;
                 }
                 Ok::<_, Error>(conn)
             };
+            // Lazy: nothing is sent to the server until this is first polled.
             let indirect = self.solicit(
                 client,
                 username,
@@ -296,17 +344,32 @@ impl PeerManager {
                 session,
             );
             tokio::pin!(direct, indirect);
+            let alone = async {
+                if !head_start.is_zero() {
+                    tokio::time::sleep(head_start).await;
+                }
+            };
             tokio::select! {
+                biased;
                 result = &mut direct => match result {
                     Ok(conn) => Ok((conn, true)),
                     Err(error) => indirect.await.map(|conn| (conn, false)).map_err(|indirect_error| (error, indirect_error)),
                 },
-                result = &mut indirect => match result {
-                    Ok(conn) => Ok((conn, false)),
-                    Err(error) => direct.await.map(|conn| (conn, true)).map_err(|direct_error| (direct_error, error)),
+                () = alone => tokio::select! {
+                    result = &mut direct => match result {
+                        Ok(conn) => Ok((conn, true)),
+                        Err(error) => indirect.await.map(|conn| (conn, false)).map_err(|indirect_error| (error, indirect_error)),
+                    },
+                    result = &mut indirect => match result {
+                        Ok(conn) => Ok((conn, false)),
+                        Err(error) => direct.await.map(|conn| (conn, true)).map_err(|direct_error| (direct_error, error)),
+                    },
                 },
             }
         };
+        if let Ok((_, direct)) = &winner {
+            self.lock().set_reachable(username, *direct);
+        }
         let (direct_error, indirect_error) = match winner {
             Ok((mut conn, direct)) => {
                 if kind == Kind::File && direct {
@@ -381,7 +444,13 @@ impl PeerManager {
                 .await?;
             result.await.map_err(|_| disconnected())?
         })
-        .await?
+        .await
+        .map_err(|_| {
+            Error::Timeout(format!(
+                "{username} did not connect back within {} s",
+                timeout.as_secs()
+            ))
+        })?
     }
 
     pub(crate) async fn send_to(
@@ -1241,5 +1310,143 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), exchange)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    use bytes::Buf;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    use super::*;
+    use crate::net::test_support::{FakeServer, read_frame};
+    use crate::protocol::MessageBuilder;
+    use crate::protocol::codes::ServerCode;
+    use crate::protocol::init::InitIncoming;
+    use crate::resolvers::DefaultResolvers;
+
+    async fn logged_in() -> (SoulseekClient, TcpStream) {
+        let client = SoulseekClient::new(
+            ClientOptions {
+                enable_listener: false,
+                enable_distributed_network: false,
+                ..ClientOptions::default()
+            },
+            Arc::new(DefaultResolvers),
+        );
+        let server = FakeServer::bind().await;
+        let (login, stream) = tokio::join!(
+            client.connect("127.0.0.1", server.addr().port(), "local", "password"),
+            async {
+                let mut stream = server.accept().await;
+                read_frame(&mut stream).await;
+                read_frame(&mut stream).await;
+                let login = MessageBuilder::new()
+                    .code_u32(ServerCode::Login as u32)
+                    .bool(true)
+                    .string("")
+                    .ip(Ipv4Addr::LOCALHOST)
+                    .string("")
+                    .bool(false)
+                    .build();
+                stream.write_all(&login).await.unwrap();
+                stream
+            },
+        );
+        login.unwrap();
+        (client, stream)
+    }
+
+    /// Answers the client's address request for `remote` with `port`.
+    async fn answer_address(server: &mut TcpStream, port: u16) {
+        loop {
+            let mut frame = read_frame(server).await;
+            if frame.get_u32_le() == ServerCode::GetPeerAddress as u32 {
+                break;
+            }
+        }
+        let address = MessageBuilder::new()
+            .code_u32(ServerCode::GetPeerAddress as u32)
+            .string("remote")
+            .ip(Ipv4Addr::LOCALHOST)
+            .u32(u32::from(port))
+            .build();
+        server.write_all(&address).await.unwrap();
+    }
+
+    async fn solicitation_token(server: &mut TcpStream) -> Option<u32> {
+        loop {
+            let mut frame = tokio::time::timeout(Duration::from_millis(200), read_frame(server))
+                .await
+                .ok()?;
+            if frame.get_u32_le() == ServerCode::ConnectToPeer as u32 {
+                return Some(frame.get_u32_le());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reachable_peer_is_not_solicited_through_the_server() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (client, mut server) = logged_in().await;
+            let peer = FakeServer::bind().await;
+            let dial = client.connect_to_user("remote", false, CancellationToken::new());
+            let remote = async {
+                answer_address(&mut server, peer.addr().port()).await;
+                let mut socket = peer.accept().await;
+                assert!(matches!(
+                    InitIncoming::decode(read_frame(&mut socket).await).unwrap(),
+                    InitIncoming::PeerInit(init) if init.connection_type == "P"
+                ));
+                socket
+            };
+            let (result, _socket) = tokio::join!(dial, remote);
+            result.unwrap();
+            assert_eq!(solicitation_token(&mut server).await, None);
+            assert!(!client.inner().peers.lock().is_unreachable("remote"));
+            assert!(client.inner().server.cached_endpoint("remote").is_some());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_direct_dial_solicits_at_once_and_is_remembered() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (client, mut server) = logged_in().await;
+            let closed = FakeServer::bind().await;
+            let port = closed.addr().port();
+            drop(closed);
+            let dial = client.connect_to_user("remote", false, CancellationToken::new());
+            let remote = async {
+                answer_address(&mut server, port).await;
+                let started = Instant::now();
+                let token = solicitation_token(&mut server).await.expect("solicited");
+                assert!(started.elapsed() < INDIRECT_HEAD_START);
+                let listener = FakeServer::bind().await;
+                let (_outgoing, accepted) =
+                    tokio::join!(TcpStream::connect(listener.addr()), listener.accept());
+                let remote = accepted.peer_addr().unwrap();
+                let conn =
+                    Connection::from_accepted(accepted, remote, &ConnectionOptions::default());
+                client
+                    .inner()
+                    .peers
+                    .handle_pierce_firewall(&client, token, conn);
+            };
+            let (result, ()) = tokio::join!(dial, remote);
+            result.unwrap();
+            assert!(client.inner().peers.lock().is_unreachable("remote"));
+            assert!(
+                client.inner().server.cached_endpoint("remote").is_none(),
+                "an unreachable address is asked for again"
+            );
+        })
+        .await
+        .unwrap();
     }
 }

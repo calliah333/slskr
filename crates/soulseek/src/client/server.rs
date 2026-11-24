@@ -24,6 +24,11 @@ use crate::protocol::server::{
     SetOnlineStatusCommand,
 };
 
+/// How long a user's address from the server is reused. Addresses rarely change, and a
+/// dial that cannot reach a cached one drops it ([`ServerConnection::forget_endpoint`]);
+/// reusing it saves a server round trip on each transfer of an album.
+const ENDPOINT_TTL: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Default)]
 pub(crate) struct ServerConnection {
     // Owns all resources of one session, including a reservation during DNS.
@@ -117,6 +122,14 @@ impl ServerConnection {
         let lifecycle = self.lock();
         let (endpoint, expires) = lifecycle.active.as_ref()?.endpoints.get(username)?;
         (*expires > Instant::now()).then_some(*endpoint)
+    }
+
+    /// Drops a cached address that a direct dial could not reach, so the next
+    /// dial asks the server again.
+    pub(super) fn forget_endpoint(&self, username: &str) {
+        if let Some(active) = self.lock().active.as_mut() {
+            active.endpoints.remove(username);
+        }
     }
 }
 
@@ -679,10 +692,9 @@ fn dispatch(client: &SoulseekClient, active: &mut Active, message: ServerIncomin
                         active.endpoints.clear();
                     }
                 }
-                active.endpoints.insert(
-                    response.username.clone(),
-                    (endpoint, now + Duration::from_secs(30)),
-                );
+                active
+                    .endpoints
+                    .insert(response.username.clone(), (endpoint, now + ENDPOINT_TTL));
             }
             let key = crate::net::waiter::WaitKey("peer_address", response.username);
             inner.waiter.complete(&key, endpoint);

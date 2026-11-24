@@ -107,7 +107,7 @@ Core listener (`net/listener.rs`), after reading the first init frame:
 
 Peers provides:
 * `peers.get_message_connection(&client, username: &str, cancel: &CancellationToken) -> Result<MessageConnection>`
-  (cached per user; direct connect to `get_user_endpoint` raced with indirect ConnectToPeer solicitation + PierceFirewall; sends PeerInit P on direct)
+  (cached per user; direct connect to `get_user_endpoint`, with the indirect ConnectToPeer solicitation + PierceFirewall started only if the direct dial fails or has not connected within a 1 s head start (at once for users whose last direct dial failed); sends PeerInit P on direct)
 * `peers.get_transfer_connection(&client, username: &str, token: u32, cancel: &CancellationToken) -> Result<Connection>` (outgoing 'F', after PeerInit F / PierceFirewall; caller writes/reads the token + offset)
 * `peers.get_distributed_connection(&client, username: &str, endpoint: SocketAddr, cancel: &CancellationToken) -> Result<Connection>` (outgoing 'D' to a candidate parent)
 * `peers.send_to(&client, username: &str, frame: Bytes, cancel: &CancellationToken) -> Result<()>` convenience
