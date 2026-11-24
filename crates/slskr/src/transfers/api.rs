@@ -204,7 +204,8 @@ async fn clear_completed<const UPLOAD: bool>(
     let transfers = &app.services.transfers;
     transfers.ready().await?;
     transfers.flush().await;
-    store::remove(transfers.database(), direction::<UPLOAD>(), None).await?;
+    let removed = store::remove(transfers.database(), direction::<UPLOAD>(), None).await?;
+    transfers.publish_removed(removed);
     Ok(StatusCode::NO_CONTENT)
 }
 

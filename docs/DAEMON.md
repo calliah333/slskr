@@ -364,6 +364,14 @@ snapshots under its own lock to make this exact).
 | `searches` | `search_list` (`Vec<Search>`, no responses) | `search_created`, `search_updated`, `search_deleted {id}`, `search_responses {search_id, responses}` | `SearchService`; progress (response batch, then counts) at most every 500 ms per search; state changes and the final state at once |
 | `logs` (administrators) | `log_buffer` (`Vec<LogRecord>`) | `log` per record | `LogBuffer` |
 | `metrics` | `metrics` (`CurrentMetrics`) | `metrics` every second | `TelemetryService` |
+| `transfers` | `transfer_list` (in-memory transfers, stored ones only) | `transfer_updated` (changed rows, one batch per 250 ms flush), `transfer_removed {ids}` | `TransferService`; batches are published and snapshots taken under the runtime lock |
+| `conversations` | `conversation_list` (open conversations) | `conversation_message`, `conversation_updated` | `ConversationService`, on the database connection right after each commit |
+| `rooms` | `room_list` (joined rooms) | `room_joined`, `room_left {room}`, `room_message`, `room_user_joined {room, user}`, `room_user_left {room, username}` | `RoomService`, under the rooms write lock |
+
+`Snapshots::snapshot` is async, so a snapshot may read a database (`conversations`); the
+connection's queued events wait meanwhile. The transfer service persists a state change
+on the next 250 ms flush but byte progress only every 5 s per transfer (and everything at
+shutdown); the list routes overlay the live values.
 
 Frames are JSON text, `{"type": "<event>", "data": ...}`. The client sends
 `{"type": "subscribe", "topics": [...]}` and `{"type": "unsubscribe", "topics": [...]}`

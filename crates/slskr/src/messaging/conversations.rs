@@ -7,6 +7,7 @@ use serde::Deserialize;
 use slskr_types::{
     conversations::{Conversation, MessageDirection, PrivateMessage, SendMessage},
     events::EventData,
+    realtime::{Event as LiveEvent, Topic},
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -16,6 +17,7 @@ use crate::{
     db::Database,
     events::EventService,
     http::{ApiError, ApiResult, Json, Path, Query, Routes},
+    realtime::EventBus,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -41,6 +43,8 @@ pub struct ConversationService {
     db: Database,
     client: soulseek::SoulseekClient,
     events: EventService,
+    /// The `conversations` topic: changes are published after they are committed.
+    bus: EventBus,
     // No lock is held across network I/O. Instead, a replay that resets a message while its
     // ACK is in flight bumps `revision`, so `mark_acknowledged` skips it, and `close` only
     // deactivates a conversation that has no unacknowledged messages left.
@@ -53,7 +57,22 @@ impl ConversationService {
             db,
             client: core.client.clone(),
             events: events.clone(),
+            bus: core.bus.clone(),
         })
+    }
+
+    /// The open conversations for the `conversations` topic snapshot, with the bus
+    /// sequence number they include.
+    pub(crate) async fn snapshot(&self) -> (u64, Vec<Conversation>) {
+        // Changes are published after their commit: read the number first.
+        let seq = self.bus.seq();
+        match self.list(false, false).await {
+            Ok(list) => (seq, list),
+            Err(error) => {
+                tracing::warn!(%error, "could not list conversations");
+                (seq, Vec::new())
+            }
+        }
     }
 
     pub fn start(&self, app: AppState) {
@@ -84,6 +103,7 @@ impl ConversationService {
     }
 
     async fn receive(&self, message: soulseek::PrivateMessage) -> anyhow::Result<()> {
+        let bus = self.bus.clone();
         let message = self.db.call(move |db| {
             let record = PrivateMessage {
                 timestamp: message.timestamp.into(),
@@ -104,6 +124,7 @@ impl ConversationService {
                 params![record.username, record.id, record.timestamp.to_rfc3339(), record.message, record.is_replayed],
             )?;
             tx.commit()?;
+            publish_message(&bus, db, &record);
             Ok(record)
         }).await?;
         self.events
@@ -133,16 +154,7 @@ impl ConversationService {
     ) -> anyhow::Result<Option<Conversation>> {
         self.db
             .call(move |db| {
-                let mut conversation = db
-                    .query_row(
-                        "SELECT c.username, c.is_active,
-                    (SELECT count(*) FROM private_messages m
-                     WHERE m.username = c.username AND m.is_acknowledged = 0)
-                 FROM conversations c WHERE c.username = ?1",
-                        [&username],
-                        read_conversation,
-                    )
-                    .optional()?;
+                let mut conversation = conversation_summary(db, &username)?;
                 if include_messages && let Some(conversation) = &mut conversation {
                     conversation.messages = Some(recent_messages(db, &username, false)?);
                 }
@@ -177,7 +189,10 @@ impl ConversationService {
     async fn acknowledge(&self, username: String, id: Option<i32>) -> ApiResult<bool> {
         let selected = self
             .db
-            .call(move |db| unacknowledged_messages(db, &username, id))
+            .call({
+                let username = username.clone();
+                move |db| unacknowledged_messages(db, &username, id)
+            })
             .await?;
         let Some(mut selected) = selected else {
             return Ok(false);
@@ -194,8 +209,13 @@ impl ConversationService {
         }
         if sent != 0 {
             selected.truncate(sent);
+            let bus = self.bus.clone();
             self.db
-                .call(move |db| mark_acknowledged(db, &selected))
+                .call(move |db| {
+                    mark_acknowledged(db, &selected)?;
+                    publish_summary(&bus, db, &username);
+                    Ok(())
+                })
                 .await?;
         }
         if let Some(error) = failure {
@@ -216,7 +236,14 @@ impl ConversationService {
             return Ok(false);
         }
         self.acknowledge(username.clone(), None).await?;
-        self.db.call(move |db| deactivate(db, &username)).await?;
+        let bus = self.bus.clone();
+        self.db
+            .call(move |db| {
+                deactivate(db, &username)?;
+                publish_summary(&bus, db, &username);
+                Ok(())
+            })
+            .await?;
         Ok(true)
     }
 
@@ -234,6 +261,7 @@ impl ConversationService {
             is_replayed: false,
         };
         let timestamp = record.timestamp.to_rfc3339();
+        let (bus, published) = (self.bus.clone(), record.clone());
         self.db.call(move |db| {
             let tx = db.transaction()?;
             activate(&tx, &username)?;
@@ -242,9 +270,48 @@ impl ConversationService {
                  VALUES (?1,0,?2,'Out',?3,1,0)",
                 params![username, timestamp, message],
             )?;
-            tx.commit()
+            tx.commit()?;
+            publish_message(&bus, db, &published);
+            Ok(())
         }).await?;
         Ok(record)
+    }
+}
+
+/// One conversation without its messages.
+fn conversation_summary(db: &Connection, username: &str) -> rusqlite::Result<Option<Conversation>> {
+    db.query_row(
+        "SELECT c.username, c.is_active,
+            (SELECT count(*) FROM private_messages m
+             WHERE m.username = c.username AND m.is_acknowledged = 0)
+         FROM conversations c WHERE c.username = ?1",
+        [username],
+        read_conversation,
+    )
+    .optional()
+}
+
+// Changes are published on the database connection right after their commit, so a
+// snapshot (read after `EventBus::seq`) and the events are ordered by the connection lock,
+// and summaries of one conversation are published in the order the changes were made.
+
+/// Publishes a conversation's current summary to `conversations` subscribers.
+fn publish_summary(bus: &EventBus, db: &Connection, username: &str) {
+    if !bus.wants(Topic::Conversations) {
+        return;
+    }
+    match conversation_summary(db, username) {
+        Ok(Some(conversation)) => bus.publish(&LiveEvent::ConversationUpdated(conversation)),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "could not read a conversation to publish"),
+    }
+}
+
+/// Publishes a new message and its conversation's summary.
+fn publish_message(bus: &EventBus, db: &Connection, message: &PrivateMessage) {
+    if bus.wants(Topic::Conversations) {
+        bus.publish(&LiveEvent::ConversationMessage(message.clone()));
+        publish_summary(bus, db, &message.username);
     }
 }
 
@@ -597,6 +664,55 @@ mod tests {
             assert!(!exists(db, "alice", true)?);
             Ok(())
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_and_summaries_are_published_to_the_conversations_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::bootstrap::test_app(dir.path(), "[soulseek]\nconnect = false\n", &[])
+            .await
+            .unwrap();
+        let service = app.services.messaging.conversations.clone();
+        let incoming = || soulseek::PrivateMessage {
+            id: 7,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            username: "alice".into(),
+            message: "hi".into(),
+            is_admin: false,
+            replayed: false,
+        };
+        let mut events = app.bus.receiver();
+        // No subscribers: nothing is published.
+        service.receive(incoming()).await.unwrap();
+        assert!(events.try_recv().is_err());
+
+        let mut connection = app.bus.connection();
+        connection.subscribe(Topic::Conversations);
+        let (seq, list) = service.snapshot().await;
+        assert_eq!(seq, app.bus.seq());
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].unacknowledged_count, 1);
+
+        // A replay resets the message; both the message and the summary are published.
+        service.receive(incoming()).await.unwrap();
+        let mut next = || {
+            let published = events.try_recv().expect("an event");
+            serde_json::from_str::<LiveEvent>(published.frame.as_str()).unwrap()
+        };
+        let LiveEvent::ConversationMessage(message) = next() else {
+            panic!("expected conversation_message")
+        };
+        assert_eq!((message.id, message.direction), (7, MessageDirection::In));
+        assert_eq!(
+            next(),
+            LiveEvent::ConversationUpdated(Conversation {
+                username: "alice".into(),
+                is_active: true,
+                unacknowledged_count: 1,
+                messages: None,
+            })
+        );
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

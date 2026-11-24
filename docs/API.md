@@ -248,6 +248,20 @@ each subscription first delivers the topic's snapshot, then its changes, as
 | `searches` | `search_list` (`[Search]`) | `search_created`, `search_updated`, `search_deleted` `{id}`, `search_responses` `{search_id, responses}` |
 | `logs` (admin) | `log_buffer` (`[LogRecord]`) | `log` |
 | `metrics` | `metrics` (`CurrentMetrics`) | `metrics`, every second |
+| `transfers` | `transfer_list` (`[Transfer]`, the transfers the daemon is working on, both directions) | `transfer_updated` (`[Transfer]`, added or changed rows, at most four batches per second), `transfer_removed` `{ids}` |
+| `conversations` | `conversation_list` (`[Conversation]`, as `GET /api/conversations`) | `conversation_message` (`PrivateMessage`, received or sent), `conversation_updated` (`Conversation` without messages) |
+| `rooms` | `room_list` (`[Room]`, every joined room; empty while logged out) | `room_joined` (`Room`), `room_left` `{room}`, `room_message` (`RoomMessage`), `room_user_joined` `{room, user}`, `room_user_left` `{room, username}` |
+
+Changes are applied in event order; a change can also arrive again right after the
+snapshot that already includes it, so apply events idempotently (replace rows by id).
+
+`transfers` carries rows exactly as the list routes return them. Its snapshot holds only
+live transfers; fetch the list route for history, applying events received while that
+request runs on top of its result (the newest event about a transfer is its current
+state). A row with `removed` set, or an id in `transfer_removed`, has left the list
+(removed, cleared, superseded by a new transfer of the same file, or expired by
+retention). `conversation_updated` follows every message, acknowledgement and close.
+Room tickers and operator changes have no events; reload the room for them.
 
 An invalid command is answered with `{"type": "error", "data": {"message", "topic"}}`.
 Close codes: `4401` sign in again, `4408` idle, `4429` too slow (reconnect and

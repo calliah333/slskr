@@ -10,9 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     application::State,
     config::Config,
+    conversations::{Conversation, PrivateMessage},
     logs::LogRecord,
+    rooms::{Room, RoomMessage, RoomUser},
     search::{Search, SearchResponse},
     telemetry::CurrentMetrics,
+    transfers::Transfer,
 };
 
 /// Path of the endpoint below `web.url_base`.
@@ -41,15 +44,26 @@ pub enum Topic {
     Logs,
     /// [`Event::Metrics`].
     Metrics,
+    /// [`Event::TransferList`] snapshot, then [`Event::TransferUpdated`] and
+    /// [`Event::TransferRemoved`].
+    Transfers,
+    /// [`Event::ConversationList`] snapshot, then the other `conversation_*` events.
+    Conversations,
+    /// [`Event::RoomList`] snapshot, then the other `room_*` events.
+    Rooms,
 }
 
 impl Topic {
-    pub const ALL: [Topic; 5] = [
+    /// Every topic, in declaration order ([`Topic::index`]).
+    pub const ALL: [Topic; 8] = [
         Self::State,
         Self::Settings,
         Self::Searches,
         Self::Logs,
         Self::Metrics,
+        Self::Transfers,
+        Self::Conversations,
+        Self::Rooms,
     ];
 
     /// Position in [`Topic::ALL`].
@@ -64,6 +78,9 @@ impl Topic {
             Self::Searches => "searches",
             Self::Logs => "logs",
             Self::Metrics => "metrics",
+            Self::Transfers => "transfers",
+            Self::Conversations => "conversations",
+            Self::Rooms => "rooms",
         }
     }
 }
@@ -106,6 +123,37 @@ pub enum Event {
     },
     /// Live transfer metrics, about once a second.
     Metrics(CurrentMetrics),
+    /// Every transfer the daemon is working on (both directions, including ones that just
+    /// ended); snapshot of [`Topic::Transfers`]. The history comes from the list routes.
+    TransferList(Vec<Transfer>),
+    /// Transfers that were added or changed since the previous batch, as the list routes
+    /// return them, about four batches a second at most. A row with `removed` set has left
+    /// the list.
+    TransferUpdated(Vec<Transfer>),
+    /// Transfers that left the list (`removed` is now set): removed or cleared through the
+    /// API, superseded by a new transfer of the same file, or expired by retention.
+    TransferRemoved { ids: Vec<String> },
+    /// The open conversations, as `GET /api/conversations`; snapshot of
+    /// [`Topic::Conversations`].
+    ConversationList(Vec<Conversation>),
+    /// A conversation was opened or closed, or its unacknowledged count changed. Without
+    /// messages.
+    ConversationUpdated(Conversation),
+    /// A private message was received or sent.
+    ConversationMessage(PrivateMessage),
+    /// Every joined room with its members and recent messages; snapshot of
+    /// [`Topic::Rooms`]. Empty while not logged in.
+    RoomList(Vec<Room>),
+    /// A room was joined.
+    RoomJoined(Room),
+    /// A room was left, also when the server connection was lost.
+    RoomLeft { room: String },
+    /// A message in a joined room.
+    RoomMessage(RoomMessage),
+    /// Someone joined a joined room, or their details changed.
+    RoomUserJoined { room: String, user: RoomUser },
+    /// Someone left a joined room.
+    RoomUserLeft { room: String, username: String },
     /// A command was not understood or not allowed. `topic` names the refused topic.
     Error {
         message: String,
@@ -127,6 +175,18 @@ impl Event {
             | Self::SearchDeleted { .. }
             | Self::SearchResponses { .. } => Topic::Searches,
             Self::Metrics(_) => Topic::Metrics,
+            Self::TransferList(_) | Self::TransferUpdated(_) | Self::TransferRemoved { .. } => {
+                Topic::Transfers
+            }
+            Self::ConversationList(_)
+            | Self::ConversationUpdated(_)
+            | Self::ConversationMessage(_) => Topic::Conversations,
+            Self::RoomList(_)
+            | Self::RoomJoined(_)
+            | Self::RoomLeft { .. }
+            | Self::RoomMessage(_)
+            | Self::RoomUserJoined { .. }
+            | Self::RoomUserLeft { .. } => Topic::Rooms,
             Self::Error { .. } => return None,
         })
     }
@@ -167,6 +227,33 @@ mod tests {
             })
             .unwrap(),
             json!({"type": "error", "data": {"message": "m", "topic": "logs"}})
+        );
+        assert_eq!(
+            serde_json::to_value(Event::TransferRemoved {
+                ids: vec!["a".into()]
+            })
+            .unwrap(),
+            json!({"type": "transfer_removed", "data": {"ids": ["a"]}})
+        );
+        assert_eq!(
+            serde_json::to_value(Event::TransferUpdated(Vec::new())).unwrap(),
+            json!({"type": "transfer_updated", "data": []})
+        );
+        assert_eq!(
+            serde_json::to_value(Event::RoomUserLeft {
+                room: "r".into(),
+                username: "u".into()
+            })
+            .unwrap(),
+            json!({"type": "room_user_left", "data": {"room": "r", "username": "u"}})
+        );
+        assert_eq!(
+            serde_json::to_value(Event::RoomLeft { room: "r".into() }).unwrap(),
+            json!({"type": "room_left", "data": {"room": "r"}})
+        );
+        assert_eq!(
+            Event::ConversationList(Vec::new()).topic(),
+            Some(Topic::Conversations)
         );
         let state = serde_json::to_value(Event::State(Box::default())).unwrap();
         assert_eq!(state["type"], "state");

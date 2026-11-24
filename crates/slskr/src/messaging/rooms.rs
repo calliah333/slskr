@@ -13,6 +13,7 @@ use axum::{
 use chrono::Utc;
 use slskr_types::{
     events::EventData,
+    realtime::{Event as LiveEvent, Topic},
     rooms::{AddMember, JoinRoom, Room, RoomInfo, RoomMessage, RoomUser, Ticker},
     users::UserPresence,
 };
@@ -26,6 +27,7 @@ use crate::{
     app::{AppState, Core},
     auth::{Authenticated, RequireReadWrite},
     http::{ApiError, ApiResult, Json, Path, Routes},
+    realtime::EventBus,
 };
 
 const MESSAGE_LIMIT: usize = 25;
@@ -37,7 +39,10 @@ pub struct RoomService(Arc<Inner>);
 
 struct Inner {
     client: SoulseekClient,
+    /// Changed only together with publishing to the `rooms` topic, under the write lock,
+    /// so a snapshot taken under the read lock is exact.
     rooms: RwLock<BTreeMap<String, JoinedRoom>>,
+    bus: EventBus,
     commands: OnceLock<mpsc::Sender<Command>>,
     list_request: Mutex<()>,
 }
@@ -47,9 +52,26 @@ impl RoomService {
         Ok(Self(Arc::new(Inner {
             client: core.client.clone(),
             rooms: RwLock::default(),
+            bus: core.bus.clone(),
             commands: OnceLock::new(),
             list_request: Mutex::default(),
         })))
+    }
+
+    /// Every joined room for the `rooms` topic snapshot, with the bus sequence number it
+    /// includes.
+    pub(crate) fn snapshot(&self) -> (u64, Vec<Room>) {
+        let rooms = self.0.rooms.read().unwrap_or_else(PoisonError::into_inner);
+        let seq = self.0.bus.seq();
+        if !self.0.client.state().is_logged_in() {
+            return (seq, Vec::new());
+        }
+        let username = self.0.client.username();
+        let rooms = rooms
+            .values()
+            .map(|room| room.response(username.as_deref()))
+            .collect();
+        (seq, rooms)
     }
 
     pub fn start(&self, app: AppState) {
@@ -256,6 +278,22 @@ enum Update {
 }
 
 impl Update {
+    /// The `rooms` topic event of this update, if it has one.
+    fn live_event(&self, room: &str, username: Option<&str>) -> Option<LiveEvent> {
+        match self {
+            Self::UserJoined(user) => Some(LiveEvent::RoomUserJoined {
+                room: room.into(),
+                user: user_response(user, username),
+            }),
+            Self::UserLeft(name) => Some(LiveEvent::RoomUserLeft {
+                room: room.into(),
+                username: name.clone(),
+            }),
+            Self::Message(message) => Some(LiveEvent::RoomMessage(message.clone())),
+            _ => None,
+        }
+    }
+
     fn apply(self, room: &mut JoinedRoom) -> Option<RoomMessage> {
         match self {
             Self::UserJoined(user) => {
@@ -447,12 +485,19 @@ impl Session {
                     .as_ref()
                     .map(|_| room.response(self.last_username.as_deref()));
                 self.rejoin.insert(name.clone());
-                self.service
-                    .0
-                    .rooms
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(name, room);
+                {
+                    let bus = &self.service.0.bus;
+                    let mut rooms = self
+                        .service
+                        .0
+                        .rooms
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    bus.publish_with(Topic::Rooms, || {
+                        LiveEvent::RoomJoined(room.response(self.last_username.as_deref()))
+                    });
+                    rooms.insert(name, room);
+                }
                 self.publish_rooms();
                 for message in received {
                     self.raise_message(message);
@@ -562,13 +607,24 @@ impl Session {
             return;
         }
         let message = {
+            let bus = &self.service.0.bus;
             let mut rooms = self
                 .service
                 .0
                 .rooms
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            rooms.get_mut(name).and_then(|room| update.apply(room))
+            rooms.get_mut(name).and_then(|room| {
+                let live = bus
+                    .wants(Topic::Rooms)
+                    .then(|| update.live_event(name, self.last_username.as_deref()))
+                    .flatten();
+                let message = update.apply(room);
+                if let Some(live) = live {
+                    bus.publish(&live);
+                }
+                message
+            })
         };
         if let Some(message) = message {
             self.raise_message(message);
@@ -617,12 +673,20 @@ impl Session {
         for (_, pending) in std::mem::take(&mut self.pending) {
             pending.action.fail(unavailable());
         }
-        self.service
-            .0
-            .rooms
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        {
+            let mut rooms = self
+                .service
+                .0
+                .rooms
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            for room in std::mem::take(&mut *rooms).into_keys() {
+                self.service
+                    .0
+                    .bus
+                    .publish_with(Topic::Rooms, || LiveEvent::RoomLeft { room });
+            }
+        }
         self.publish_rooms();
     }
 
@@ -649,14 +713,23 @@ impl Session {
 
     fn remove_joined(&mut self, name: &str) {
         self.rejoin.remove(name);
-        let removed = self
-            .service
-            .0
-            .rooms
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(name);
-        if removed.is_some() {
+        let removed = {
+            let mut rooms = self
+                .service
+                .0
+                .rooms
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let removed = rooms.remove(name).is_some();
+            if removed {
+                self.service
+                    .0
+                    .bus
+                    .publish_with(Topic::Rooms, || LiveEvent::RoomLeft { room: name.into() });
+            }
+            removed
+        };
+        if removed {
             self.publish_rooms();
         }
     }
@@ -898,6 +971,91 @@ mod tests {
         assert!(!response.users[1].is_self);
         assert_eq!(response.messages.len(), MESSAGE_LIMIT);
         assert_eq!(response.messages[0].message, "1");
+    }
+
+    #[tokio::test]
+    async fn membership_and_messages_are_published_to_the_rooms_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::bootstrap::test_app(dir.path(), "[soulseek]\nconnect = false\n", &[])
+            .await
+            .unwrap();
+        let service = app.services.messaging.rooms.clone();
+        let mut session = Session {
+            app: app.clone(),
+            service: service.clone(),
+            last_username: Some("me".into()),
+            logged_in: true,
+            rejoin: BTreeSet::new(),
+            pending: BTreeMap::new(),
+            operations: JoinSet::new(),
+        };
+        let mut connection = app.bus.connection();
+        connection.subscribe(Topic::Rooms);
+        let mut events = app.bus.receiver();
+        let mut next = move || {
+            let published = events.try_recv().expect("an event");
+            assert_eq!(published.topic, Topic::Rooms);
+            serde_json::from_str::<LiveEvent>(published.frame.as_str()).unwrap()
+        };
+
+        session.pending.insert(
+            "room".into(),
+            Pending {
+                action: Action::Join(None),
+                observed: true,
+                outcome: Some(Outcome::Joined(RoomData {
+                    name: "room".into(),
+                    users: vec![user("me")],
+                    is_private: false,
+                    owner: None,
+                    operators: Vec::new(),
+                })),
+                updates: Vec::new(),
+            },
+        );
+        session.finish("room".into());
+        let LiveEvent::RoomJoined(room) = next() else {
+            panic!("expected room_joined")
+        };
+        assert_eq!(room.name, "room");
+        assert!(room.users[0].is_self);
+
+        session.update("room", Update::UserJoined(user("guest")));
+        assert_eq!(
+            next(),
+            LiveEvent::RoomUserJoined {
+                room: "room".into(),
+                user: user_response(&user("guest"), Some("me")),
+            }
+        );
+        let message = RoomMessage {
+            timestamp: Utc::now(),
+            room: "room".into(),
+            username: "guest".into(),
+            message: "hi".into(),
+            is_self: false,
+        };
+        session.update("room", Update::Message(message.clone()));
+        assert_eq!(next(), LiveEvent::RoomMessage(message));
+        session.update("room", Update::UserLeft("guest".into()));
+        assert_eq!(
+            next(),
+            LiveEvent::RoomUserLeft {
+                room: "room".into(),
+                username: "guest".into(),
+            }
+        );
+        // Updates of rooms that are not joined are not published.
+        session.update("elsewhere", Update::UserLeft("guest".into()));
+        session.remove_joined("room");
+        assert_eq!(
+            next(),
+            LiveEvent::RoomLeft {
+                room: "room".into()
+            }
+        );
+        // The snapshot is empty while not logged in.
+        assert!(service.snapshot().1.is_empty());
     }
 
     #[test]

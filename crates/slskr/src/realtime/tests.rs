@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, future::BoxFuture};
 use slskr_types::{
     logs::LogRecord,
     realtime::{CLOSE_TIMEOUT, CLOSE_TOO_SLOW, CLOSE_UNAUTHORIZED, Event, Topic},
@@ -36,9 +36,9 @@ struct Fixture {
 }
 
 impl Snapshots for Fixture {
-    fn snapshot(&self, topic: Topic, bus: &EventBus) -> (u64, Event) {
+    fn snapshot<'a>(&'a self, topic: Topic, bus: &'a EventBus) -> BoxFuture<'a, (u64, Event)> {
         let seq = bus.seq();
-        match topic {
+        let snapshot = match topic {
             Topic::State => (seq, Event::State(Box::new(self.state.get()))),
             Topic::Settings => (seq, Event::Settings(Box::default())),
             Topic::Searches => (seq, Event::SearchList(Vec::new())),
@@ -47,7 +47,11 @@ impl Snapshots for Fixture {
                 let (seq, records) = self.logs.snapshot_with_seq();
                 (seq, Event::LogBuffer(records))
             }
-        }
+            Topic::Transfers => (seq, Event::TransferList(Vec::new())),
+            Topic::Conversations => (seq, Event::ConversationList(Vec::new())),
+            Topic::Rooms => (seq, Event::RoomList(Vec::new())),
+        };
+        Box::pin(std::future::ready(snapshot))
     }
 }
 
@@ -252,6 +256,42 @@ async fn subscribe_sends_the_snapshot_then_changes() {
     drop(client);
     server.until(|s| s.bus.connection_count() == 0).await;
     assert_eq!(server.bus.subscriber_count(Topic::Searches), 0);
+}
+
+#[tokio::test]
+async fn transfer_conversation_and_room_topics_send_snapshots_then_changes() {
+    let server = Server::start(fast()).await;
+    // A read-only key may follow all three.
+    let mut client = server.connect(&[("x-api-key", READER_KEY)]).await.unwrap();
+    subscribe(&mut client, &["transfers", "conversations", "rooms"]).await;
+    // Snapshots arrive in topic order.
+    assert_eq!(recv(&mut client).await, Event::TransferList(Vec::new()));
+    assert_eq!(recv(&mut client).await, Event::ConversationList(Vec::new()));
+    assert_eq!(recv(&mut client).await, Event::RoomList(Vec::new()));
+    for topic in [Topic::Transfers, Topic::Conversations, Topic::Rooms] {
+        assert!(server.bus.wants(topic));
+    }
+
+    let removed = Event::TransferRemoved {
+        ids: vec!["id".into()],
+    };
+    server.bus.publish(&removed);
+    assert_eq!(recv(&mut client).await, removed);
+    let left = Event::RoomLeft {
+        room: "room".into(),
+    };
+    server.bus.publish(&left);
+    assert_eq!(recv(&mut client).await, left);
+
+    send(
+        &mut client,
+        r#"{"type":"unsubscribe","topics":["transfers"]}"#,
+    )
+    .await;
+    server.until(|s| !s.bus.wants(Topic::Transfers)).await;
+    drop(client);
+    server.until(|s| s.bus.connection_count() == 0).await;
+    assert!(!server.bus.wants(Topic::Rooms));
 }
 
 #[tokio::test]
