@@ -92,7 +92,7 @@ impl SearchQuery {
                 .filter(|exclusion| !exclusion.is_empty())
                 .map(|exclusion| (exclusion.to_lowercase(), tokenize(exclusion)))
                 .collect(),
-            words: Vec::new(),
+            tokenizer: SearchTokenizer::default(),
         }
     }
 }
@@ -101,7 +101,20 @@ impl SearchQuery {
 pub struct SearchMatcher {
     terms: Vec<(Vec<String>, bool)>,
     exclusions: Vec<(String, Vec<String>)>,
-    words: Vec<String>,
+    tokenizer: SearchTokenizer,
+}
+
+/// A word that every filename accepted by a [`SearchMatcher`] must contain
+/// among the words [`SearchTokenizer`] produces for it.
+///
+/// Lets a caller holding an inverted index of filename words narrow the
+/// candidates before confirming each one with [`SearchMatcher::matches`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredToken<'a> {
+    /// Some filename word equals this word.
+    Exact(&'a str),
+    /// Some filename word ends with this word (from a `*`-prefixed term).
+    Suffix(&'a str),
 }
 
 impl SearchMatcher {
@@ -110,12 +123,26 @@ impl SearchMatcher {
         self.terms.is_empty()
     }
 
+    /// Words that any matching filename must contain. Every word of every
+    /// term phrase is listed, in order; exclusions never are.
+    pub fn required_tokens(&self) -> impl Iterator<Item = RequiredToken<'_>> {
+        self.terms.iter().flat_map(|(phrase, wildcard)| {
+            phrase.iter().enumerate().map(move |(i, word)| {
+                if i == 0 && *wildcard {
+                    RequiredToken::Suffix(word)
+                } else {
+                    RequiredToken::Exact(word)
+                }
+            })
+        })
+    }
+
     /// Tests a filename against the prepared query.
     pub fn matches(&mut self, filename: &str) -> bool {
         if self.is_empty() {
             return false;
         }
-        let words = tokenize_into(filename, &mut self.words);
+        let words = self.tokenizer.tokenize(filename);
         if !self
             .terms
             .iter()
@@ -155,8 +182,24 @@ fn build_search_text(terms: &[String], exclusions: &[String]) -> String {
     text
 }
 
-/// Splits into lowercase, diacritic-folded runs of alphanumeric characters
-/// (equivalent to SQLite FTS5's default `unicode61` tokenizer used by slskd).
+/// Splits text into the words search matching compares: lowercase,
+/// diacritic-folded runs of alphanumeric characters (equivalent to SQLite
+/// FTS5's default `unicode61` tokenizer used by slskd).
+///
+/// Keeps its word buffers, so tokenizing many strings does not reallocate.
+#[derive(Debug, Default)]
+pub struct SearchTokenizer {
+    words: Vec<String>,
+}
+
+impl SearchTokenizer {
+    /// Tokenizes `text`; the words borrow the tokenizer until the next call.
+    pub fn tokenize(&mut self, text: &str) -> &[String] {
+        tokenize_into(text, &mut self.words)
+    }
+}
+
+/// Tokenizes into owned words; see [`SearchTokenizer`].
 fn tokenize(s: &str) -> Vec<String> {
     let mut words = Vec::new();
     tokenize_into(s, &mut words);
@@ -637,6 +680,26 @@ mod tests {
         assert!(!matcher.matches("Jello/AC-DC - lIvE.flac"));
         assert!(matcher.matches("Jello/AC-DC.flac"));
         assert!(SearchQuery::parse("! -live").matcher().is_empty());
+    }
+
+    #[test]
+    fn lists_required_tokens_and_tokenizes_like_the_matcher() {
+        let matcher = SearchQuery::parse("*Éllo ac/dc ! -live").matcher();
+        assert_eq!(
+            matcher.required_tokens().collect::<Vec<_>>(),
+            [
+                RequiredToken::Suffix("ello"),
+                RequiredToken::Exact("ac"),
+                RequiredToken::Exact("dc"),
+            ]
+        );
+        let mut tokenizer = SearchTokenizer::default();
+        assert_eq!(
+            tokenizer.tokenize("Music\\Beyoncé - Halo.MP3"),
+            ["music", "beyonce", "halo", "mp3"]
+        );
+        assert_eq!(tokenizer.tokenize("a"), ["a"]);
+        assert!(tokenizer.tokenize(" - ").is_empty());
     }
 
     #[test]
