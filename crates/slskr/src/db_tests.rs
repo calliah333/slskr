@@ -90,3 +90,70 @@ async fn migration_versions_apply_once() {
         .unwrap();
     assert_eq!(value, 7);
 }
+
+#[tokio::test]
+async fn reader_sees_commits_without_waiting_for_the_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::open(
+        &directory.path().join("reader.db"),
+        &["CREATE TABLE item (value INTEGER); INSERT INTO item VALUES (1);"],
+    )
+    .unwrap();
+    let reader = db.reader().unwrap();
+    async fn count(db: &Database) -> anyhow::Result<i64> {
+        db.call(|connection| {
+            connection.query_row("SELECT count(*) FROM item", [], |row| row.get(0))
+        })
+        .await
+    }
+
+    // The writer holds its connection inside an open transaction until released.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (started, writing) = tokio::sync::oneshot::channel();
+    let writer = tokio::spawn({
+        let db = db.clone();
+        async move {
+            db.call(move |connection| {
+                let transaction = connection.transaction()?;
+                transaction.execute("INSERT INTO item VALUES (2)", [])?;
+                started.send(()).unwrap();
+                held.recv().unwrap();
+                transaction.commit()
+            })
+            .await
+        }
+    });
+    writing.await.unwrap();
+    let during = tokio::time::timeout(std::time::Duration::from_secs(5), count(&reader))
+        .await
+        .expect("the reader waited for the writer")
+        .unwrap();
+    assert_eq!(during, 1, "uncommitted rows are not visible");
+    release.send(()).unwrap();
+    writer.await.unwrap().unwrap();
+    assert_eq!(count(&reader).await.unwrap(), 2);
+
+    let write = reader
+        .call(|connection| connection.execute("INSERT INTO item VALUES (3)", []))
+        .await;
+    assert!(write.is_err(), "the reader is read-only");
+}
+
+#[tokio::test]
+async fn in_memory_reader_is_the_same_database() {
+    let db = Database::open(
+        Path::new(":memory:"),
+        &["CREATE TABLE item (value INTEGER);"],
+    )
+    .unwrap();
+    db.reader()
+        .unwrap()
+        .call(|connection| connection.execute("INSERT INTO item VALUES (1)", []))
+        .await
+        .unwrap();
+    let count: i64 = db
+        .call(|connection| connection.query_row("SELECT count(*) FROM item", [], |row| row.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}

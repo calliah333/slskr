@@ -1,7 +1,7 @@
 //! SQLite database wrapper with ordered, transactional migrations.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 /// How long a statement waits for a lock held by another connection before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,6 +27,9 @@ pub struct Database {
 struct Inner {
     connection: Mutex<Connection>,
     changes: AtomicU64,
+    /// The database file; `None` in memory, where a second connection would be another
+    /// database.
+    path: Option<PathBuf>,
 }
 
 impl Database {
@@ -48,9 +51,7 @@ impl Database {
             Connection::open(path)?
         };
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "temp_store", "MEMORY")?;
-        connection.pragma_update(None, "cache_size", -CACHE_KIB)?;
+        tune(&connection)?;
         if !in_memory {
             // Outside any transaction: the journal mode cannot change inside one.
             let mode: String =
@@ -81,6 +82,28 @@ impl Database {
             inner: Arc::new(Inner {
                 changes: AtomicU64::new(connection.total_changes()),
                 connection: Mutex::new(connection),
+                path: (!in_memory).then(|| path.to_owned()),
+            }),
+        })
+    }
+
+    /// A separate read-only connection to the same file, for long reads (reports) that
+    /// should not hold up writers: with write-ahead logging, readers and the writer do not
+    /// block each other. An in-memory database returns itself.
+    pub fn reader(&self) -> anyhow::Result<Self> {
+        let Some(path) = &self.inner.path else {
+            return Ok(self.clone());
+        };
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        tune(&connection)?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                changes: AtomicU64::new(0),
+                connection: Mutex::new(connection),
+                path: Some(path.clone()),
             }),
         })
     }
@@ -112,6 +135,13 @@ impl Database {
         .await
         .map_err(anyhow::Error::from)?
     }
+}
+
+/// Per-connection settings shared by the writer and readers.
+fn tune(connection: &Connection) -> rusqlite::Result<()> {
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    connection.pragma_update(None, "cache_size", -CACHE_KIB)
 }
 
 #[cfg(test)]

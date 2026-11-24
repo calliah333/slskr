@@ -115,7 +115,11 @@ pub fn subscribe(&self) -> tokio::sync::watch::Receiver<State>;
 pub fn open(path: &Path, migrations: &[&str]) -> anyhow::Result<Self>; // path ":memory:" in tests
 pub async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
     where F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static, T: Send + 'static; // spawn_blocking
+pub fn reader(&self) -> anyhow::Result<Self>; // separate read-only connection (itself in memory)
 ```
+Each `Database` is one connection behind a mutex, so calls run one at a time. File
+databases use WAL, so a `reader()` connection runs long reads (transfer reports) without
+holding up the writer.
 Migrations: ordered SQL strings; applied ones tracked via `PRAGMA user_version`.
 Timestamps stored as TEXT RFC 3339 UTC; flags as INTEGER; GUIDs as TEXT.
 

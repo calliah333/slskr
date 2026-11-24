@@ -36,7 +36,7 @@ impl TelemetryService {
     pub fn new(core: &Core, transfers: &TransferService) -> anyhow::Result<Self> {
         let config = &core.options.startup().metrics;
         Ok(Self {
-            reports: reports::ReportsService::new(transfers.database().clone()),
+            reports: reports::ReportsService::new(transfers.database().reader()?),
             transfers: transfers.clone(),
             bus: core.bus.clone(),
             scrape_token: if config.enabled {
