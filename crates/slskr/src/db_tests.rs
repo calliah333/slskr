@@ -201,3 +201,30 @@ async fn existing_files_switch_to_incremental_vacuum_and_return_free_pages() {
     assert_eq!(pragma("freelist_count").await, 0);
     assert!(pragma("page_count").await < 50);
 }
+
+#[tokio::test]
+async fn opening_returns_pages_freed_before_a_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("restart.db");
+    let migrations = ["CREATE TABLE item (value BLOB);"];
+    let db = Database::open(&path, &migrations).unwrap();
+    db.call(|connection| {
+        connection.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+             INSERT INTO item SELECT zeroblob(4096) FROM n;
+             DELETE FROM item;",
+        )
+    })
+    .await
+    .unwrap();
+    drop(db);
+    let db = Database::open(&path, &migrations).unwrap();
+    let free: i64 = db
+        .call(|connection| connection.pragma_query_value(None, "freelist_count", |row| row.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(
+        free, 0,
+        "the restart did not wait out the maintenance interval"
+    );
+}

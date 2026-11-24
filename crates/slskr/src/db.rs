@@ -95,6 +95,9 @@ impl Database {
         // SQLite's advice for long-lived connections: analyze what needs it now (0x10000
         // also checks tables that have not been queried yet), then again periodically.
         connection.execute_batch("PRAGMA optimize = 0x10002;")?;
+        // Retention may have freed pages since the last run; restarts must not keep
+        // postponing their return past the first maintenance interval.
+        release_free_pages(&connection)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 connection: Mutex::new(Slot {
@@ -190,9 +193,14 @@ fn enable_incremental_vacuum(connection: &Connection, path: &Path) -> rusqlite::
 }
 
 /// Refreshes planner statistics where the data changed enough to matter, and gives free
-/// pages back to the file system once they are a tenth of the file.
+/// pages back to the file system.
 fn maintain(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch("PRAGMA optimize;")?;
+    release_free_pages(connection)
+}
+
+/// Gives free pages back to the file system once they are a tenth of the file.
+fn release_free_pages(connection: &Connection) -> rusqlite::Result<()> {
     let free: i64 = connection.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
     let pages: i64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
     if free > 0 && free * 10 >= pages {
