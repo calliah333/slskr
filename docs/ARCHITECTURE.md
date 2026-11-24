@@ -137,7 +137,7 @@ directory picker), `error` (`{"error"}` body), `session`,
 One plain WebSocket at `{url_base}/api/events` carries every live update as JSON text
 frames of `slskr_types::realtime::Event` (`{"type": "...", "data": ...}`). The client
 subscribes to topics (`state`, `settings`, `searches`, `logs` for administrators,
-`metrics`); each subscription first delivers that topic's snapshot, then changes. Services
+`metrics`, `transfers`, `conversations`, `rooms`); each subscription first delivers that topic's snapshot, then changes. Services
 publish to an internal `EventBus`; the socket fans it out per connection. The upgrade is
 authenticated like any route (session cookie or `X-API-Key`, same-origin check for
 cookies). See [daemon internals](DAEMON.md#live-events-srcrealtime) for the message list,

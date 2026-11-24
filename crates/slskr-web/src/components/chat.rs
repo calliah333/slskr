@@ -16,7 +16,10 @@ use wasm_bindgen_futures::spawn_local;
 use crate::{
     components::app::AppContext,
     config,
-    services::util,
+    services::{
+        events::{Event as LiveEvent, Status as LiveStatus, Topic, use_events},
+        util,
+    },
     ui::{Button, EmptyState, Icon, Loading, StatusDot},
 };
 
@@ -121,10 +124,57 @@ pub fn Chat() -> impl IntoView {
         });
     };
     Effect::new(move |_| refresh());
+    // The `conversations` topic triggers reloads; a reload asked for while one runs waits.
+    let pending = StoredValue::new(false);
+    let request_refresh = move || {
+        if in_flight.get_untracked() {
+            pending.set_value(true);
+        } else {
+            refresh();
+        }
+    };
+    let live = use_events();
+    live.on(Topic::Conversations, move |event| match event {
+        // (Re)subscribed, possibly after missed events.
+        LiveEvent::ConversationList(_) => {
+            if !in_flight.get_untracked() {
+                refresh();
+            }
+        }
+        LiveEvent::ConversationMessage(_) => request_refresh(),
+        LiveEvent::ConversationUpdated(update) => {
+            // Our own acknowledgements come back as updates the list already shows.
+            let known = conversations.with_untracked(|list| {
+                list.iter().any(|c| {
+                    c.username == update.username
+                        && c.is_active == update.is_active
+                        && c.unacknowledged_count == update.unacknowledged_count
+                })
+            });
+            if !known {
+                request_refresh();
+            }
+        }
+        _ => {}
+    });
+    let socket = live.status();
     spawn_local_scoped_with_cancellation(async move {
+        let mut since_refresh = 0_u32;
         loop {
-            crate::services::util::sleep(5_000).await;
-            if !document().hidden() && !in_flight.get_untracked() {
+            crate::services::util::sleep(1_000).await;
+            if document().hidden() || in_flight.get_untracked() {
+                continue;
+            }
+            since_refresh += 1;
+            // Without live updates, poll every 5 s as before; otherwise every 30 s in case
+            // an update was missed.
+            let interval = if socket.get_untracked() == LiveStatus::Open {
+                30
+            } else {
+                5
+            };
+            if std::mem::take(&mut *pending.write_value()) || since_refresh >= interval {
+                since_refresh = 0;
                 refresh();
             }
         }

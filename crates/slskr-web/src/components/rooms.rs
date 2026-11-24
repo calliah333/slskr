@@ -34,7 +34,10 @@ use crate::{
         sidebar::{BufferList, NewMessage, QueryRow, RoomRow},
     },
     config,
-    services::util,
+    services::{
+        events::{Event as LiveEvent, Status as LiveStatus, Topic, use_events},
+        util,
+    },
     ui::{Button, EmptyState, Icon, Loading, StatusDot},
 };
 
@@ -42,8 +45,13 @@ mod join;
 
 pub(crate) use join::RoomJoin;
 
-/// Other rooms and the conversation list are checked every this many polls.
+/// Without live updates, other rooms and the conversation list are checked every this
+/// many polls.
 const BACKGROUND_EVERY: u32 = 5;
+/// With live updates, everything is reloaded this often in case an update was missed.
+const FALLBACK_POLL_SECONDS: u32 = 30;
+/// Recent messages kept per room (as the daemon keeps them).
+const ROOM_MESSAGE_LIMIT: usize = 25;
 /// More joins and parts than this between two polls are not listed (e.g. after a reconnect).
 const MAX_PRESENCE_LINES: usize = 8;
 
@@ -126,7 +134,6 @@ pub fn Rooms() -> impl IntoView {
     // Unread counts of the other rooms, and when each room was last read.
     let unread = RwSignal::new(HashMap::<String, u32>::new());
     let last_seen = StoredValue::new(HashMap::<String, DateTime<Utc>>::new());
-    let ticks = StoredValue::new(0u32);
     let room_list = RwSignal::new(Vec::<RoomInfo>::new());
     let conversations = RwSignal::new(Vec::<Conversation>::new());
     let queries_loaded = RwSignal::new(false);
@@ -142,13 +149,12 @@ pub fn Rooms() -> impl IntoView {
     let poll_alive = Arc::clone(&alive);
     announce_connection(events, logged_in);
 
-    let refresh = move || {
+    // `background` also recounts the other rooms' unread messages and reloads the
+    // conversation list.
+    let refresh_with = move |background: bool| {
         let ticket = generation.get_untracked().wrapping_add(1);
         generation.set(ticket);
         in_flight.set(true);
-        let tick = ticks.get_value();
-        ticks.set_value(tick.wrapping_add(1));
-        let background = tick.is_multiple_of(BACKGROUND_EVERY);
         // A newer refresh supersedes this one; its results are dropped.
         let current = move || generation.try_get_untracked() == Some(ticket);
         // Only the latest refresh owns the in-flight flag.
@@ -277,16 +283,117 @@ pub fn Rooms() -> impl IntoView {
         });
     };
 
-    Effect::new(move |_| refresh());
+    let refresh = move || refresh_with(false);
+    // A refresh asked for while one runs; `Some(true)` for a background one.
+    let pending = StoredValue::new(None::<bool>);
+    let request_refresh = move |background: bool| {
+        if in_flight.try_get_untracked() == Some(false) {
+            refresh_with(background);
+        } else {
+            let _ = pending.try_update_value(|p| *p = Some(background || p.unwrap_or(false)));
+        }
+    };
+    let load_queries = move || {
+        spawn_local(async move {
+            let list = crate::services::api::get::<Vec<Conversation>>("/conversations").await;
+            if let Ok(mut list) = list {
+                list.retain(|c| c.username != "..");
+                set_if_changed(conversations, list);
+                set_if_changed(queries_loaded, true);
+            }
+        });
+    };
+
+    // The `rooms` topic adds messages and members as they come; joins and parts reload.
+    let live = use_events();
+    live.on(Topic::Rooms, move |event| match event {
+        // (Re)subscribed, possibly after missed events.
+        LiveEvent::RoomList(_) => {
+            if in_flight.try_get_untracked() == Some(false) {
+                refresh_with(true);
+            }
+        }
+        LiveEvent::RoomJoined(_) | LiveEvent::RoomLeft { .. } => request_refresh(false),
+        LiveEvent::RoomMessage(message) => {
+            let room = &message.room;
+            if users_room.try_get_untracked().flatten().as_ref() == Some(room)
+                && active.try_get_untracked().as_ref() == Some(room)
+            {
+                let added = messages
+                    .try_update(|list| {
+                        if list.contains(message) {
+                            return false;
+                        }
+                        list.push(message.clone());
+                        let excess = list.len().saturating_sub(ROOM_MESSAGE_LIMIT);
+                        list.drain(..excess);
+                        true
+                    })
+                    .unwrap_or(false);
+                if added {
+                    let _ = last_seen
+                        .try_update_value(|seen| seen.insert(room.clone(), message.timestamp));
+                }
+            } else if !message.is_self
+                && joined.try_with_untracked(|joined| joined.contains(room)) == Some(true)
+                && last_seen.try_with_value(|seen| seen.contains_key(room)) == Some(true)
+            {
+                unread.try_update(|unread| *unread.entry(room.clone()).or_default() += 1);
+            }
+        }
+        // Members are listed only for the open room.
+        LiveEvent::RoomUserJoined { room, user }
+            if users_room.try_get_untracked().flatten().as_ref() == Some(room) =>
+        {
+            let mut next = users.get_untracked();
+            match next.iter_mut().find(|u| u.username == user.username) {
+                Some(existing) => *existing = user.clone(),
+                None => next.push(user.clone()),
+            }
+            announce_presence(events, room, users, &next);
+            set_if_changed(users, next);
+        }
+        LiveEvent::RoomUserLeft { room, username }
+            if users_room.try_get_untracked().flatten().as_ref() == Some(room) =>
+        {
+            let mut next = users.get_untracked();
+            next.retain(|u| &u.username != username);
+            announce_presence(events, room, users, &next);
+            set_if_changed(users, next);
+        }
+        _ => {}
+    });
+    live.on(Topic::Conversations, move |event| match event {
+        LiveEvent::ConversationList(_) | LiveEvent::ConversationUpdated(_) => load_queries(),
+        _ => {}
+    });
+    let socket = live.status();
+
+    Effect::new(move |_| refresh_with(true));
     spawn_local(async move {
+        let mut ticks = 0_u32;
+        let mut since_refresh = 0_u32;
         while poll_alive.load(Ordering::Relaxed) {
             crate::services::util::sleep(1_000).await;
             // Skip ticks while a refresh is still outstanding so polls never overlap.
-            if poll_alive.load(Ordering::Relaxed)
-                && !document().hidden()
-                && in_flight.try_get_untracked() == Some(false)
+            if !poll_alive.load(Ordering::Relaxed)
+                || document().hidden()
+                || in_flight.try_get_untracked() != Some(false)
             {
-                refresh();
+                continue;
+            }
+            since_refresh += 1;
+            if let Some(background) = pending.try_update_value(Option::take).flatten() {
+                since_refresh = 0;
+                refresh_with(background);
+            } else if socket.try_get_untracked() != Some(LiveStatus::Open) {
+                // Without live updates, poll every second as before.
+                ticks = ticks.wrapping_add(1);
+                since_refresh = 0;
+                refresh_with(ticks.is_multiple_of(BACKGROUND_EVERY));
+            } else if since_refresh >= FALLBACK_POLL_SECONDS {
+                since_refresh = 0;
+                refresh_with(true);
             }
         }
     });

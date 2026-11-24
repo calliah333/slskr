@@ -22,6 +22,7 @@ use axum::{
 };
 use futures::{
     SinkExt, StreamExt,
+    future::BoxFuture,
     stream::{SplitSink, SplitStream},
 };
 use slskr_types::realtime::{
@@ -45,8 +46,9 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// The current value of a topic, for new subscribers.
 pub trait Snapshots: Send + Sync + 'static {
     /// The snapshot of `topic` and the bus sequence number it includes: read
-    /// [`EventBus::seq`] before reading the data, or atomically with it.
-    fn snapshot(&self, topic: Topic, bus: &EventBus) -> (u64, Event);
+    /// [`EventBus::seq`] before reading the data, or atomically with it. May read a
+    /// database; the connection's queued events wait meanwhile.
+    fn snapshot<'a>(&'a self, topic: Topic, bus: &'a EventBus) -> BoxFuture<'a, (u64, Event)>;
 }
 
 /// Per-connection limits.
@@ -192,7 +194,7 @@ impl EventsEndpoint {
                 frame = stream.next() => {
                     last_seen = Instant::now();
                     match frame {
-                        Some(Ok(Message::Text(text))) => session.command(&text, &principal),
+                        Some(Ok(Message::Text(text))) => session.command(&text, &principal).await,
                         Some(Ok(Message::Binary(_))) => session.error("expected a JSON text message", None),
                         Some(Ok(Message::Ping(_) | Message::Pong(_))) => Ok(()),
                         Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Close::Silent),
@@ -259,7 +261,7 @@ impl Session<'_> {
         }
     }
 
-    fn command(&mut self, text: &str, principal: &Principal) -> Result<(), Close> {
+    async fn command(&mut self, text: &str, principal: &Principal) -> Result<(), Close> {
         let command = match serde_json::from_str::<Command>(text) {
             Ok(command) => command,
             Err(error) => return self.error(format!("invalid command: {error}"), None),
@@ -281,8 +283,11 @@ impl Session<'_> {
                     }
                     // Register first so publishers send every change after the snapshot.
                     self.connection.subscribe(topic);
-                    let (seq, snapshot) =
-                        self.endpoint.snapshots.snapshot(topic, &self.endpoint.bus);
+                    let (seq, snapshot) = self
+                        .endpoint
+                        .snapshots
+                        .snapshot(topic, &self.endpoint.bus)
+                        .await;
                     self.skip[topic.index()] = seq;
                     self.event(&snapshot)?;
                 }

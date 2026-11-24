@@ -20,13 +20,14 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, TimeDelta, Utc};
 use slskr_types::{
     config::{Config, DownloadsConfig, OnConflict},
     events::{DirectoryComplete, EventData, FileComplete},
+    realtime::{Event as LiveEvent, Topic},
     telemetry::{CompletedMetrics, CurrentMetrics},
     transfers::{
         Batch, DownloadFile, EnqueueFailure, EnqueuedDownloads, Transfer, TransferDirection,
@@ -88,10 +89,29 @@ struct Active {
     endpoint: Option<SocketAddr>,
     stored: bool,
     user_cancelled: bool,
+    /// A change other than byte progress waits to be persisted (on the next flush).
     dirty: bool,
+    /// Byte progress waits to be persisted (every [`PROGRESS_PERSIST_INTERVAL`]).
+    progress: bool,
+    /// When this entry was last persisted.
+    persisted_at: Instant,
+    /// A change waits to be published to the `transfers` topic (on the next flush).
+    changed: bool,
     offset: u64,
     remote_size_invalid: bool,
 }
+
+impl Active {
+    /// Records a change that is persisted and published on the next flush.
+    fn touch(&mut self) {
+        self.dirty = true;
+        self.changed = true;
+    }
+}
+
+/// Byte progress of a transfer is persisted at most this often; the in-memory entry
+/// serves live values meanwhile. Other changes are persisted on the next flush.
+const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct DownloadContext {
@@ -143,6 +163,10 @@ impl Runtime {
                 done: CancellationToken::new(),
                 user_cancelled: false,
                 dirty: false,
+                progress: false,
+                persisted_at: Instant::now(),
+                // Published once stored.
+                changed: true,
                 offset: 0,
             },
         );
@@ -218,13 +242,14 @@ impl TransferService {
             retention.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = service.0.core.shutdown.cancelled() => { service.flush().await; break; }
+                    _ = service.0.core.shutdown.cancelled() => { service.flush_all().await; break; }
                     _ = progress.tick() => { service.flush().await; }
                     _ = retention.tick() => {
                         service.runtime().history.prune();
                         let cfg = service.0.core.options.get();
-                        if let Err(error) = store::prune(service.database(), &cfg.retention).await {
-                            tracing::warn!(%error, "could not apply transfer retention");
+                        match store::prune(service.database(), &cfg.retention).await {
+                            Ok(removed) => service.publish_removed(removed),
+                            Err(error) => tracing::warn!(%error, "could not apply transfer retention"),
                         }
                     }
                     change = options.changed() => {
@@ -488,12 +513,15 @@ impl TransferService {
             if response.enqueued.is_empty() {
                 return Ok(response);
             }
-            if let Err(error) = store::insert(service.database(), response.enqueued.clone()).await {
-                let mut runtime = service.runtime();
-                for transfer in &response.enqueued {
-                    runtime.remove(&transfer.id);
+            match store::insert(service.database(), response.enqueued.clone()).await {
+                Ok(superseded) => service.publish_removed(superseded),
+                Err(error) => {
+                    let mut runtime = service.runtime();
+                    for transfer in &response.enqueued {
+                        runtime.remove(&transfer.id);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
             let count = response.enqueued.len();
             let throttle = Arc::new(Semaphore::new(if count > 30 { 5 } else { count }));
@@ -530,10 +558,13 @@ impl TransferService {
         slot: oneshot::Receiver<()>,
     ) {
         let id = &transfer.id;
-        if let Err(error) = store::insert(self.database(), vec![transfer.clone()]).await {
-            tracing::warn!(%error, %id, "could not persist queued upload");
-            self.runtime().remove(id);
-            return;
+        match store::insert(self.database(), vec![transfer.clone()]).await {
+            Ok(superseded) => self.publish_removed(superseded),
+            Err(error) => {
+                tracing::warn!(%error, %id, "could not persist queued upload");
+                self.runtime().remove(id);
+                return;
+            }
         }
         if let Some(entry) = self.runtime().active.get_mut(id) {
             entry.stored = true;
@@ -707,8 +738,9 @@ impl TransferService {
         t.place_in_queue = None;
         t.started_at = None;
         t.average_speed = 0.0;
-        entry.dirty = true;
-        Some(t.size)
+        let size = t.size;
+        entry.touch();
+        Some(size)
     }
 
     fn schedule_retry(
@@ -734,7 +766,7 @@ impl TransferService {
         t.next_attempt_at = Some(at);
         t.state = TransferState::QueuedLocally;
         t.error = Some(exception_text(error));
-        entry.dirty = true;
+        entry.touch();
         Some(at)
     }
 
@@ -887,6 +919,15 @@ impl TransferService {
         };
         let state = state_from_bits(wire.state.0);
         let t = &mut entry.transfer;
+        let before = (
+            t.state,
+            t.enqueued_at,
+            t.started_at,
+            t.size,
+            entry.offset,
+            entry.remote_size_invalid,
+        );
+        let progress = (t.bytes_transferred, t.average_speed);
         // A transport completion is not a daemon completion: downloads still
         // need to move the file, and failed attempts can be retried.
         if !state.is_complete() {
@@ -911,7 +952,23 @@ impl TransferService {
             .max(wire.start_offset);
         t.average_speed = wire.average_speed;
         entry.offset = wire.start_offset;
-        entry.dirty = true;
+        let t = &entry.transfer;
+        if before
+            != (
+                t.state,
+                t.enqueued_at,
+                t.started_at,
+                t.size,
+                entry.offset,
+                entry.remote_size_invalid,
+            )
+        {
+            entry.touch();
+        } else if progress != (t.bytes_transferred, t.average_speed) {
+            // Pure byte progress: persisted less often, published on the next flush.
+            entry.progress = true;
+            entry.changed = true;
+        }
     }
 
     async fn finish(&self, id: &str, result: soulseek::Result<PathBuf>) {
@@ -935,8 +992,8 @@ impl TransferService {
             t.ended_at = Some(Utc::now());
             t.next_attempt_at = None;
             t.refresh_derived(Utc::now());
-            entry.dirty = true;
             let transfer = t.clone();
+            entry.touch();
             if transfer.direction == TransferDirection::Upload {
                 runtime.uploads.release(id);
                 runtime.history.record(&transfer);
@@ -1004,24 +1061,62 @@ impl TransferService {
         }
     }
 
+    /// Publishes changed transfers and persists due changes: state changes now, byte
+    /// progress every [`PROGRESS_PERSIST_INTERVAL`]. Drops ended transfers once persisted.
     async fn flush(&self) {
+        self.flush_with(false).await;
+    }
+
+    /// Like [`Self::flush`], but persists all pending progress too (shutdown).
+    async fn flush_all(&self) {
+        self.flush_with(true).await;
+    }
+
+    async fn flush_with(&self, all: bool) {
         let _write = self.0.writes.lock().await;
         let mut finished = Vec::new();
-        let updates = self
-            .runtime()
-            .active
-            .values_mut()
-            .filter_map(|entry| {
-                if !entry.stored || !std::mem::take(&mut entry.dirty) {
-                    return None;
+        let updates = {
+            let mut runtime = self.runtime();
+            let bus = &self.0.core.bus;
+            let publish = bus.wants(Topic::Transfers);
+            let (instant, now) = (Instant::now(), Utc::now());
+            let mut changed = Vec::new();
+            let mut updates = Vec::new();
+            for entry in runtime.active.values_mut() {
+                if !entry.stored {
+                    continue;
                 }
+                if std::mem::take(&mut entry.changed) && publish {
+                    let mut transfer = entry.transfer.clone();
+                    transfer.refresh_derived(now);
+                    changed.push(transfer);
+                }
+                let due = entry.dirty
+                    || entry.progress
+                        && (all
+                            || instant.duration_since(entry.persisted_at)
+                                >= PROGRESS_PERSIST_INTERVAL);
+                if !due {
+                    continue;
+                }
+                entry.dirty = false;
+                entry.progress = false;
+                entry.persisted_at = instant;
                 let transfer = &entry.transfer;
                 if transfer.state.is_complete() {
                     finished.push(transfer.id.clone());
                 }
-                Some(Snapshot::new(transfer, entry.offset))
-            })
-            .collect::<Vec<_>>();
+                updates.push(Snapshot::new(transfer, entry.offset));
+            }
+            if !changed.is_empty() {
+                // In list order, and under the runtime lock so that a snapshot taken
+                // concurrently is exactly before or after this batch.
+                changed
+                    .sort_unstable_by(|a, b| (a.requested_at, &a.id).cmp(&(b.requested_at, &b.id)));
+                bus.publish(&LiveEvent::TransferUpdated(changed));
+            }
+            updates
+        };
         if updates.is_empty() {
             return;
         }
@@ -1041,9 +1136,45 @@ impl TransferService {
         let mut runtime = self.runtime();
         for id in finished {
             // A cancel/remove request can update a snapshot while the write is running.
-            if runtime.active.get(&id).is_some_and(|entry| !entry.dirty) {
+            if runtime
+                .active
+                .get(&id)
+                .is_some_and(|entry| !entry.dirty && !entry.progress)
+            {
                 runtime.remove(&id);
             }
+        }
+    }
+
+    /// The transfers the daemon is working on, for the `transfers` topic snapshot, with
+    /// the bus sequence number they include.
+    pub(crate) fn snapshot(&self) -> (u64, Vec<Transfer>) {
+        // Batches are published under the runtime lock (see `flush_with`).
+        let runtime = self.runtime();
+        let seq = self.0.core.bus.seq();
+        let now = Utc::now();
+        let mut transfers = runtime
+            .active
+            .values()
+            .filter(|entry| entry.stored)
+            .map(|entry| {
+                let mut transfer = entry.transfer.clone();
+                transfer.refresh_derived(now);
+                transfer
+            })
+            .collect::<Vec<_>>();
+        drop(runtime);
+        transfers.sort_unstable_by(|a, b| (a.requested_at, &a.id).cmp(&(b.requested_at, &b.id)));
+        (seq, transfers)
+    }
+
+    /// Tells `transfers` subscribers that these transfers left the list.
+    fn publish_removed(&self, ids: Vec<String>) {
+        if !ids.is_empty() {
+            self.0
+                .core
+                .bus
+                .publish_with(Topic::Transfers, || LiveEvent::TransferRemoved { ids });
         }
     }
 
@@ -1132,7 +1263,9 @@ impl TransferService {
                     entry.user_cancelled = true;
                     entry.cancel.cancel();
                     entry.transfer.removed |= remove;
-                    entry.dirty |= remove;
+                    if remove {
+                        entry.touch();
+                    }
                     entry.done.clone()
                 })
         };
@@ -1141,7 +1274,8 @@ impl TransferService {
             done.cancelled().await;
         }
         if remove {
-            store::remove(self.database(), direction, Some(id)).await?;
+            let removed = store::remove(self.database(), direction, Some(id)).await?;
+            self.publish_removed(removed);
         }
         Ok(())
     }
@@ -1177,7 +1311,7 @@ impl TransferService {
                 })
                 .ok_or_else(inactive)?;
             entry.transfer.place_in_queue = Some(pos);
-            entry.dirty = true;
+            entry.touch();
         }
         store::set_position(self.database(), t.id.clone(), pos).await?;
         Ok(pos)
@@ -1325,5 +1459,131 @@ mod tests {
         runtime.remove(&second_id);
         assert!(!runtime.has(TransferDirection::Upload, "peer", file));
         assert!(runtime.files[direction_index(TransferDirection::Upload)].is_empty());
+    }
+
+    /// The `transfer_updated` batches of the published events (other events fail).
+    fn batches(
+        events: &mut tokio::sync::broadcast::Receiver<crate::realtime::Published>,
+    ) -> Vec<Vec<Transfer>> {
+        let mut batches = Vec::new();
+        while let Ok(published) = events.try_recv() {
+            match serde_json::from_str(published.frame.as_str()).unwrap() {
+                LiveEvent::TransferUpdated(batch) => batches.push(batch),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        batches
+    }
+
+    #[tokio::test]
+    async fn flush_publishes_every_change_and_throttles_progress_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::bootstrap::test_app(dir.path(), "[soulseek]\nconnect = false\n", &[])
+            .await
+            .unwrap();
+        let service = app.services.transfers.clone();
+        let filename = r"album\track.flac";
+        let transfer = new_transfer(
+            TransferDirection::Download,
+            "peer",
+            filename.into(),
+            100,
+            None,
+        );
+        let id = transfer.id.clone();
+        store::insert(service.database(), vec![transfer.clone()])
+            .await
+            .unwrap();
+        service
+            .runtime()
+            .insert(transfer, CancellationToken::new(), None, true);
+        let stored = || async {
+            store::find(service.database(), TransferDirection::Download, id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        // Without subscribers nothing is published, and the pending change is dropped.
+        let mut events = app.bus.receiver();
+        service.flush().await;
+        assert!(batches(&mut events).is_empty());
+
+        let mut connection = app.bus.connection();
+        connection.subscribe(Topic::Transfers);
+        let (seq, snapshot) = service.snapshot();
+        assert_eq!(seq, app.bus.seq());
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, id);
+
+        // A state change is published and persisted on the next flush.
+        let mut wire = soulseek::Transfer::new(
+            soulseek::TransferDirection::Download,
+            "peer",
+            filename,
+            1,
+            soulseek::TransferState::IN_PROGRESS,
+            100,
+            0,
+        );
+        wire.bytes_transferred = 10;
+        service.update(&id, &wire);
+        service.flush().await;
+        let published = batches(&mut events);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0][0].state, TransferState::InProgress);
+        assert_eq!(published[0][0].bytes_transferred, 10);
+        assert_eq!(stored().await.state, TransferState::InProgress);
+        assert_eq!(stored().await.bytes_transferred, 10);
+
+        // Byte progress is published at once but persisted only after the interval.
+        wire.bytes_transferred = 40;
+        service.update(&id, &wire);
+        service.update(&id, &wire);
+        service.flush().await;
+        let published = batches(&mut events);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0][0].bytes_transferred, 40);
+        assert_eq!(published[0][0].percent_complete, 40.0);
+        assert_eq!(stored().await.bytes_transferred, 10);
+        // Nothing changed: nothing is published.
+        service.flush().await;
+        assert!(batches(&mut events).is_empty());
+        service.runtime().active.get_mut(&id).unwrap().persisted_at -= PROGRESS_PERSIST_INTERVAL;
+        service.flush().await;
+        assert_eq!(stored().await.bytes_transferred, 40);
+        assert!(batches(&mut events).is_empty());
+
+        // Shutdown persists pending progress at once.
+        wire.bytes_transferred = 60;
+        service.update(&id, &wire);
+        service.flush_all().await;
+        assert_eq!(stored().await.bytes_transferred, 60);
+        batches(&mut events);
+
+        // Completion is persisted and published, then the entry is dropped.
+        wire.bytes_transferred = 100;
+        service.update(&id, &wire);
+        service.finish(&id, Ok(dir.path().join("track.flac"))).await;
+        let published = batches(&mut events);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0][0].state, TransferState::Succeeded);
+        let stored = stored().await;
+        assert_eq!(stored.state, TransferState::Succeeded);
+        assert_eq!(stored.bytes_transferred, 100);
+        assert!(service.runtime().active.is_empty());
+        assert!(service.snapshot().1.is_empty());
+
+        // Removals name the transfers that left the list.
+        let removed = store::remove(service.database(), TransferDirection::Download, None)
+            .await
+            .unwrap();
+        assert_eq!(removed, vec![id.clone()]);
+        service.publish_removed(removed);
+        let published = events.try_recv().unwrap();
+        assert_eq!(
+            serde_json::from_str::<LiveEvent>(published.frame.as_str()).unwrap(),
+            LiveEvent::TransferRemoved { ids: vec![id] }
+        );
     }
 }

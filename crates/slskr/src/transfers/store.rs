@@ -86,7 +86,42 @@ pub(crate) fn state_to_bits(state: TransferState) -> u32 {
     }
 }
 
-const FIELDS: &str = "id, batch_id, username, direction, filename, size, state, requested_at, enqueued_at,\n    started_at, ended_at, bytes_transferred, average_speed, place_in_queue, exception, attempts, next_attempt_at, removed, root";
+/// `SELECT <the columns [`transfer`] reads> FROM transfers <rest>`, as a constant for
+/// `prepare_cached`.
+macro_rules! select {
+    ($($rest:literal),+) => {
+        concat!(
+            "SELECT id, batch_id, username, direction, filename, size, state, requested_at, \
+             enqueued_at, started_at, ended_at, bytes_transferred, average_speed, place_in_queue, \
+             exception, attempts, next_attempt_at, removed, root FROM transfers ",
+            $($rest),+
+        )
+    };
+}
+
+// List queries per `(recent_completed, username)`. Separate statements, rather than
+// `(?n IS NULL OR username = ?n)`, let SQLite use the username and partial state indexes.
+const LIST: &str = select!("WHERE direction = ?1 AND (?2 OR NOT removed) ORDER BY rowid");
+const LIST_USER: &str =
+    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?3 ORDER BY rowid");
+const LIST_RECENT: &str = concat!(
+    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND (state & 16) = 0"),
+    " UNION ALL SELECT * FROM (",
+    select!(
+        "WHERE direction = ?1 AND (?2 OR NOT removed) AND (state & 16) != 0 ",
+        "ORDER BY ended_at DESC, rowid DESC LIMIT ?3"
+    ),
+    ")"
+);
+const LIST_RECENT_USER: &str = concat!(
+    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?4 AND (state & 16) = 0"),
+    " UNION ALL SELECT * FROM (",
+    select!(
+        "WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?4 AND (state & 16) != 0 ",
+        "ORDER BY ended_at DESC, rowid DESC LIMIT ?3"
+    ),
+    ")"
+);
 
 pub(super) fn direction_name(direction: TransferDirection) -> &'static str {
     match direction {
@@ -167,11 +202,11 @@ pub(super) async fn initialize(db: &Database) -> anyhow::Result<(Vec<Transfer>, 
             [timestamp(now)],
         )?;
         let history = {
-            let mut stmt = tx.prepare(&format!("SELECT {FIELDS} FROM transfers WHERE direction = 'Upload' AND started_at >= ?1"))?;
+            let mut stmt = tx.prepare(select!("WHERE direction = 'Upload' AND started_at >= ?1"))?;
             stmt.query_map([timestamp(now - chrono::TimeDelta::days(7))], transfer)?.collect::<rusqlite::Result<_>>()?
         };
         let downloads = {
-            let mut stmt = tx.prepare(&format!("SELECT {FIELDS} FROM transfers WHERE direction = 'Download' AND (state & 16) = 0 ORDER BY rowid"))?;
+            let mut stmt = tx.prepare(select!("WHERE direction = 'Download' AND (state & 16) = 0 ORDER BY rowid"))?;
             stmt.query_map([], transfer)?.collect::<rusqlite::Result<_>>()?
         };
         tx.commit()?;
@@ -179,22 +214,28 @@ pub(super) async fn initialize(db: &Database) -> anyhow::Result<(Vec<Transfer>, 
     }).await
 }
 
-pub(super) async fn insert(db: &Database, transfers: Vec<Transfer>) -> anyhow::Result<()> {
+/// Stores new transfers. Returns the ids of completed transfers of the same files that
+/// they superseded (now removed from the list).
+pub(super) async fn insert(db: &Database, transfers: Vec<Transfer>) -> anyhow::Result<Vec<String>> {
     db.call(move |db| {
         let tx = db.transaction()?;
+        let mut superseded = Vec::new();
         {
-            let mut supersede = tx.prepare("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND username = ?2
-                AND filename = ?3 AND removed = 0 AND (state & 16) != 0")?;
-            let mut insert = tx.prepare("INSERT INTO transfers (id, batch_id, username, direction, filename, size,
+            let mut supersede = tx.prepare_cached("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND username = ?2
+                AND filename = ?3 AND removed = 0 AND (state & 16) != 0 RETURNING id")?;
+            let mut insert = tx.prepare_cached("INSERT INTO transfers (id, batch_id, username, direction, filename, size,
                 state, state_description, requested_at, enqueued_at, removed, root) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)")?;
             for t in transfers {
                 let direction = direction_name(t.direction);
-                supersede.execute(params![direction, t.username, t.filename])?;
+                for id in supersede.query_map(params![direction, t.username, t.filename], |row| row.get(0))? {
+                    superseded.push(id?);
+                }
                 insert.execute(params![t.id, t.batch_id, t.username, direction, t.filename, t.size,
                     state_to_bits(t.state), t.state.as_str(), timestamp(t.requested_at), t.enqueued_at.map(timestamp), t.removed, t.root])?;
             }
         }
-        tx.commit()
+        tx.commit()?;
+        Ok(superseded)
     }).await
 }
 
@@ -240,7 +281,7 @@ pub(super) async fn save(db: &Database, snapshots: Vec<Snapshot>) -> anyhow::Res
     db.call(move |db| {
         let tx = db.transaction()?;
         {
-            let mut stmt = tx.prepare("UPDATE transfers SET size = ?2, start_offset = ?3, state = ?4, enqueued_at = ?5,
+            let mut stmt = tx.prepare_cached("UPDATE transfers SET size = ?2, start_offset = ?3, state = ?4, enqueued_at = ?5,
                 started_at = ?6, ended_at = ?7, bytes_transferred = ?8, average_speed = ?9, exception = ?10,
                 attempts = ?11, next_attempt_at = ?12, removed = MAX(removed, ?13), state_description = ?14, place_in_queue = ?15
                 WHERE id = ?1 AND (state & 16) = 0 AND attempts <= ?11")?;
@@ -262,18 +303,30 @@ pub(super) async fn list(
     recent_completed: Option<u32>,
 ) -> anyhow::Result<Vec<Transfer>> {
     db.call(move |db| {
-        if let Some(limit) = recent_completed {
-            let filter = "direction = ?1 AND (?2 IS NULL OR username = ?2) AND (?3 OR NOT removed)";
-            let mut stmt = db.prepare(&format!(
-                "SELECT {FIELDS} FROM transfers WHERE {filter} AND (state & 16) = 0
-                 UNION ALL SELECT * FROM (SELECT {FIELDS} FROM transfers WHERE {filter}
-                 AND (state & 16) != 0 ORDER BY ended_at DESC, rowid DESC LIMIT ?4)"
-            ))?;
-            return stmt.query_map(params![direction_name(direction), username, include_removed, limit], transfer)?.collect();
+        let direction = direction_name(direction);
+        match (recent_completed, username) {
+            (None, None) => db
+                .prepare_cached(LIST)?
+                .query_map(params![direction, include_removed], transfer)?
+                .collect(),
+            (None, Some(username)) => db
+                .prepare_cached(LIST_USER)?
+                .query_map(params![direction, include_removed, username], transfer)?
+                .collect(),
+            (Some(limit), None) => db
+                .prepare_cached(LIST_RECENT)?
+                .query_map(params![direction, include_removed, limit], transfer)?
+                .collect(),
+            (Some(limit), Some(username)) => db
+                .prepare_cached(LIST_RECENT_USER)?
+                .query_map(
+                    params![direction, include_removed, limit, username],
+                    transfer,
+                )?
+                .collect(),
         }
-        let mut stmt = db.prepare(&format!("SELECT {FIELDS} FROM transfers WHERE direction = ?1\n            AND (?2 IS NULL OR username = ?2) AND (?3 OR NOT removed) ORDER BY rowid"))?;
-        stmt.query_map(params![direction_name(direction), username, include_removed], transfer)?.collect()
-    }).await
+    })
+    .await
 }
 
 pub(super) async fn find(
@@ -282,12 +335,9 @@ pub(super) async fn find(
     id: String,
 ) -> anyhow::Result<Option<Transfer>> {
     db.call(move |db| {
-        db.query_row(
-            &format!("SELECT {FIELDS} FROM transfers WHERE id = ?1 AND direction = ?2"),
-            params![id, direction_name(direction)],
-            transfer,
-        )
-        .optional()
+        db.prepare_cached(select!("WHERE id = ?1 AND direction = ?2"))?
+            .query_row(params![id, direction_name(direction)], transfer)
+            .optional()
     })
     .await
 }
@@ -303,16 +353,26 @@ pub(super) async fn set_position(db: &Database, id: String, position: u32) -> an
     Ok(())
 }
 
+/// Removes one transfer, or every completed one, from the list. Returns the ids removed.
 pub(super) async fn remove(
     db: &Database,
     dir: TransferDirection,
     id: Option<String>,
-) -> anyhow::Result<()> {
-    db.call(move |db| match id {
-        Some(id) => db.execute("UPDATE transfers SET removed = 1 WHERE id = ?1 AND direction = ?2", params![id, direction_name(dir)]),
-        None => db.execute("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND NOT removed AND (state & 16) != 0", [direction_name(dir)]),
-    }).await?;
-    Ok(())
+) -> anyhow::Result<Vec<String>> {
+    db.call(move |db| {
+        let id_of = |row: &Row<'_>| row.get(0);
+        match id {
+            Some(id) => db
+                .prepare_cached("UPDATE transfers SET removed = 1 WHERE id = ?1 AND direction = ?2 RETURNING id")?
+                .query_map(params![id, direction_name(dir)], id_of)?
+                .collect(),
+            None => db
+                .prepare_cached("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND NOT removed AND (state & 16) != 0 RETURNING id")?
+                .query_map([direction_name(dir)], id_of)?
+                .collect(),
+        }
+    })
+    .await
 }
 
 pub(super) async fn create_batch(db: &Database, batch: Batch) -> anyhow::Result<bool> {
@@ -327,9 +387,7 @@ pub(super) async fn batch(db: &Database, id: String) -> anyhow::Result<Option<Ba
         let Some(mut batch) = batch_metadata(db, &id)? else {
             return Ok(None);
         };
-        let mut stmt = db.prepare(&format!(
-            "SELECT {FIELDS} FROM transfers WHERE batch_id = ?1 ORDER BY rowid"
-        ))?;
+        let mut stmt = db.prepare_cached(select!("WHERE batch_id = ?1 ORDER BY rowid"))?;
         batch.transfers = stmt
             .query_map([id], transfer)?
             .collect::<rusqlite::Result<_>>()?;
@@ -350,7 +408,9 @@ fn batch_metadata(db: &Connection, id: &str) -> rusqlite::Result<Option<Batch>> 
     })).optional()
 }
 
-pub(super) async fn prune(db: &Database, r: &RetentionConfig) -> anyhow::Result<()> {
+/// Removes completed transfers older than the retention rules allow from the list.
+/// Returns the ids removed.
+pub(super) async fn prune(db: &Database, r: &RetentionConfig) -> anyhow::Result<Vec<String>> {
     let rules = [
         (
             "Download",
@@ -374,21 +434,41 @@ pub(super) async fn prune(db: &Database, r: &RetentionConfig) -> anyhow::Result<
     db.call(move |db| {
         let tx = db.transaction()?;
         let now = Utc::now();
-        for (direction, [succeeded, cancelled, errored, failed]) in rules {
-            for (state, age) in [(48, succeeded), (80, cancelled), (272, errored),
-                (144, failed), (528, failed), (1040, failed)] {
-                let Some(cutoff) = age
-                    .and_then(|age| chrono::TimeDelta::from_std(age).ok())
-                    .and_then(|age| now.checked_sub_signed(age))
-                else {
-                    continue;
-                };
-                tx.execute("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND state = ?2 AND NOT removed AND ended_at <= ?3",
-                    params![direction, state, timestamp(cutoff)])?;
+        let mut removed = Vec::new();
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE transfers SET removed = 1 WHERE direction = ?1 AND state = ?2
+                AND NOT removed AND ended_at <= ?3 RETURNING id",
+            )?;
+            for (direction, [succeeded, cancelled, errored, failed]) in rules {
+                for (state, age) in [
+                    (48, succeeded),
+                    (80, cancelled),
+                    (272, errored),
+                    (144, failed),
+                    (528, failed),
+                    (1040, failed),
+                ] {
+                    let Some(cutoff) = age
+                        .and_then(|age| chrono::TimeDelta::from_std(age).ok())
+                        .and_then(|age| now.checked_sub_signed(age))
+                    else {
+                        continue;
+                    };
+                    for id in stmt
+                        .query_map(params![direction, state, timestamp(cutoff)], |row| {
+                            row.get(0)
+                        })?
+                    {
+                        removed.push(id?);
+                    }
+                }
             }
         }
-        tx.commit()
-    }).await
+        tx.commit()?;
+        Ok(removed)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -553,6 +633,75 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.root, t.root);
+    }
+
+    #[tokio::test]
+    async fn lists_filter_by_user_and_removals_report_their_ids() {
+        let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
+        let upload = |user: &str, file: &str| {
+            new_transfer(TransferDirection::Upload, user, file.into(), 1, None)
+        };
+        let mut done = upload("alice", "a\\1");
+        let live = upload("alice", "a\\2");
+        let other = upload("bob", "b\\1");
+        assert!(
+            insert(&db, vec![done.clone(), live.clone(), other.clone()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        done.state = TransferState::Succeeded;
+        done.ended_at = Some(Utc::now());
+        save(&db, vec![Snapshot::new(&done, 0)]).await.unwrap();
+
+        let ids = |list: Vec<Transfer>| list.into_iter().map(|t| t.id).collect::<Vec<_>>();
+        let list = |user: Option<&str>, recent: Option<u32>| {
+            list(
+                &db,
+                TransferDirection::Upload,
+                user.map(Into::into),
+                false,
+                recent,
+            )
+        };
+        assert_eq!(ids(list(None, None).await.unwrap()).len(), 3);
+        assert_eq!(
+            ids(list(Some("alice"), None).await.unwrap()),
+            vec![done.id.clone(), live.id.clone()]
+        );
+        assert_eq!(
+            ids(list(Some("alice"), Some(0)).await.unwrap()),
+            vec![live.id.clone()]
+        );
+        assert_eq!(
+            ids(list(Some("alice"), Some(5)).await.unwrap()),
+            vec![live.id.clone(), done.id.clone()]
+        );
+        assert_eq!(ids(list(None, Some(0)).await.unwrap()).len(), 2);
+        assert!(list(Some("carol"), None).await.unwrap().is_empty());
+
+        // Requesting the completed file again supersedes the finished transfer.
+        let again = upload("alice", "a\\1");
+        assert_eq!(
+            insert(&db, vec![again.clone()]).await.unwrap(),
+            vec![done.id.clone()]
+        );
+        assert_eq!(
+            remove(&db, TransferDirection::Upload, Some(other.id.clone()))
+                .await
+                .unwrap(),
+            vec![other.id.clone()]
+        );
+        assert!(
+            remove(&db, TransferDirection::Upload, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(list(None, None).await.unwrap()),
+            vec![live.id.clone(), again.id]
+        );
     }
 
     #[test]

@@ -569,24 +569,43 @@ pub(crate) fn credentials(options: &Config) -> Option<(&str, &str)> {
 }
 
 impl crate::realtime::Snapshots for AppState {
-    fn snapshot(&self, topic: Topic, bus: &EventBus) -> (u64, LiveEvent) {
-        // Read the sequence number first: the data then includes every event up to it.
-        let seq = bus.seq();
-        match topic {
-            Topic::State => (seq, LiveEvent::State(Box::new(self.state.get()))),
-            Topic::Settings => (
-                seq,
-                LiveEvent::Settings(Box::new(self.options.get().redact())),
-            ),
-            Topic::Metrics => (seq, LiveEvent::Metrics(self.services.telemetry.metrics())),
-            Topic::Searches => {
-                let (seq, searches) = self.services.search.snapshot();
-                (seq, LiveEvent::SearchList(searches))
+    fn snapshot<'a>(
+        &'a self,
+        topic: Topic,
+        bus: &'a EventBus,
+    ) -> futures::future::BoxFuture<'a, (u64, LiveEvent)> {
+        Box::pin(async move {
+            // Read the sequence number first: the data then includes every event up to it.
+            let seq = bus.seq();
+            match topic {
+                Topic::State => (seq, LiveEvent::State(Box::new(self.state.get()))),
+                Topic::Settings => (
+                    seq,
+                    LiveEvent::Settings(Box::new(self.options.get().redact())),
+                ),
+                Topic::Metrics => (seq, LiveEvent::Metrics(self.services.telemetry.metrics())),
+                Topic::Searches => {
+                    let (seq, searches) = self.services.search.snapshot();
+                    (seq, LiveEvent::SearchList(searches))
+                }
+                Topic::Logs => {
+                    let (seq, records) = self.logs.snapshot_with_seq();
+                    (seq, LiveEvent::LogBuffer(records))
+                }
+                Topic::Transfers => {
+                    let (seq, transfers) = self.services.transfers.snapshot();
+                    (seq, LiveEvent::TransferList(transfers))
+                }
+                Topic::Conversations => {
+                    let (seq, conversations) =
+                        self.services.messaging.conversations.snapshot().await;
+                    (seq, LiveEvent::ConversationList(conversations))
+                }
+                Topic::Rooms => {
+                    let (seq, rooms) = self.services.messaging.rooms.snapshot();
+                    (seq, LiveEvent::RoomList(rooms))
+                }
             }
-            Topic::Logs => {
-                let (seq, records) = self.logs.snapshot_with_seq();
-                (seq, LiveEvent::LogBuffer(records))
-            }
-        }
+        })
     }
 }

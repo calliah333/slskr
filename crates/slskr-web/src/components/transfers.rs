@@ -1,13 +1,16 @@
 //! Downloads and uploads (`/downloads`, `/uploads`).
 //!
-//! Rendering stays cheap with thousands of transfers: the page polls the full list, but
-//! each transfer lives in its own signal (`Page::rows`) that is only written when that
-//! transfer changed, so a progress tick re-renders one row. The grouped and filtered
+//! The list is fetched on load, on reconnect and every 30 s (every second while live
+//! updates are unavailable); the `transfers` topic applies changes in between
+//! (`live::LiveList`). Rendering stays cheap with thousands of transfers: each transfer
+//! lives in its own signal (`Page::rows`) that is only written when that transfer changed,
+//! so a progress tick re-renders one row. The grouped and filtered
 //! layout (`Page::layout`) is a memo over a slim index (id, user, path, size, state) that
 //! changes only when a transfer is added, removed or changes state; the keyed `For`
 //! lists below it keep existing rows in place.
 
 mod groups;
+mod live;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -22,7 +25,11 @@ use slskr_types::transfers::{
 use crate::{
     components::app::AppContext,
     config,
-    services::{api, util},
+    services::{
+        api,
+        events::{Event, Status as EventsStatus, Topic, use_events},
+        util,
+    },
     ui::{Alert, Badge, Button, DropdownMenu, EmptyState, Icon, Loading, Modal, ModalAction},
 };
 
@@ -398,49 +405,76 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     let upload_limit = RwSignal::new(UPLOAD_PAGE);
     let more_uploads = RwSignal::new(false);
     let history_revision = RwSignal::new(0_u64);
-    spawn_local_scoped_with_cancellation(async move {
-        let active_url = collection(direction);
-        let mut validator: Option<(String, u64, String)> = None;
-        let mut ticks = 0_u32;
-        loop {
-            if document().hidden() {
-                util::sleep(1_000).await;
-                continue;
-            }
-            let include_removed = history.get_untracked();
-            let revision = history_revision.get_untracked();
-            let limit = upload_limit.get_untracked();
-            let mut url = format!("{active_url}?include_removed={include_removed}");
-            if !is_download {
-                url.push_str(&format!("&recent_completed={limit}"));
-            }
-            let etag = validator
+
+    // Actions run in the page's owner, not the clicked control's: a menu, the selection
+    // bar or a row can unmount while the requests are still running.
+    let owner = StoredValue::new(Owner::current().expect("the page has an owner"));
+    let in_page = move |f: Box<dyn FnOnce()>| owner.with_value(|owner| owner.with(f));
+
+    // The list is fetched on load, on reconnect and every 30 s; the `transfers` topic
+    // keeps it current in between. A hidden page keeps the list but renders it when shown.
+    let live = StoredValue::new(live::LiveList::new(direction));
+    let stale = StoredValue::new(false);
+    let render = move || {
+        if document().hidden() {
+            stale.set_value(true);
+        } else {
+            stale.set_value(false);
+            live.with_value(|live| apply_snapshot(live.list(), rows, index, speed));
+        }
+    };
+    let validator = StoredValue::new(None::<(String, u64, String)>);
+    let fetches = StoredValue::new(0_u64);
+    let fetch = move || {
+        let ticket = fetches.get_value().wrapping_add(1);
+        fetches.set_value(ticket);
+        let include_removed = history.get_untracked();
+        let revision = history_revision.get_untracked();
+        let limit = upload_limit.get_untracked();
+        let mut url = format!(
+            "{}?include_removed={include_removed}",
+            collection(direction)
+        );
+        if !is_download {
+            url.push_str(&format!("&recent_completed={limit}"));
+        }
+        let etag = validator.with_value(|validator| {
+            validator
                 .as_ref()
                 .filter(|(path, version, _)| *path == url && *version == revision)
-                .map(|(_, _, etag)| etag.as_str());
-            let snapshot = api::get_if_changed::<Vec<Transfer>>(&url, etag).await;
-            if history_revision.get_untracked() == revision && upload_limit.get_untracked() == limit
-            {
+                .map(|(_, _, etag)| etag.clone())
+        });
+        live.update_value(live::LiveList::begin_fetch);
+        in_page(Box::new(move || {
+            spawn_local_scoped_with_cancellation(async move {
+                let snapshot = api::get_if_changed::<Vec<Transfer>>(&url, etag.as_deref()).await;
+                // A newer fetch (or a view change) supersedes this one.
+                if fetches.try_get_value() != Some(ticket) {
+                    return;
+                }
                 match snapshot {
-                    Ok(snapshot) => {
-                        if let Some((mut list, etag)) = snapshot {
-                            if !include_removed {
-                                list.retain(|file| !file.removed);
-                            }
-                            if !is_download {
-                                more_uploads.set(
-                                    list.iter().filter(|file| file.state.is_complete()).count()
-                                        >= limit as usize,
-                                );
-                            }
-                            apply_snapshot(list, rows, index, speed);
-                            validator = etag.map(|etag| (url, revision, etag));
+                    Ok(Some((list, etag))) => {
+                        if !is_download {
+                            more_uploads.set(
+                                list.iter().filter(|file| file.state.is_complete()).count()
+                                    >= limit as usize,
+                            );
                         }
+                        live.update_value(|live| live.finish_fetch(list));
+                        render();
+                        validator.set_value(etag.map(|etag| (url, revision, etag)));
+                        if load_error.with_untracked(Option::is_some) {
+                            load_error.set(None);
+                        }
+                    }
+                    Ok(None) => {
+                        live.update_value(live::LiveList::end_fetch);
                         if load_error.with_untracked(Option::is_some) {
                             load_error.set(None);
                         }
                     }
                     Err(error) => {
+                        live.update_value(live::LiveList::end_fetch);
                         let message = error.to_string();
                         if load_error.with_untracked(|previous| previous.as_ref() != Some(&message))
                         {
@@ -451,19 +485,59 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                 if loading.get_untracked() {
                     loading.set(false);
                 }
+            });
+        }));
+    };
+    // The first load, and again when the view changes.
+    Effect::new(move |_| {
+        history_revision.track();
+        upload_limit.track();
+        fetch();
+    });
+    let events = use_events();
+    events.on(Topic::Transfers, move |event| match event {
+        // (Re)subscribed: possibly after missed events, so fetch again too.
+        Event::TransferList(files) => {
+            live.update_value(|live| live.update(files));
+            render();
+            if !live.with_value(live::LiveList::is_fetching) {
+                fetch();
+            }
+        }
+        Event::TransferUpdated(files) => {
+            live.update_value(|live| live.update(files));
+            render();
+        }
+        Event::TransferRemoved { ids } => {
+            live.update_value(|live| live.remove(ids));
+            render();
+        }
+        _ => {}
+    });
+    let socket = events.status();
+    spawn_local_scoped_with_cancellation(async move {
+        let mut ticks = 0_u32;
+        let mut since_fetch = 0_u32;
+        loop {
+            util::sleep(1_000).await;
+            if document().hidden() {
+                continue;
             }
             ticks = ticks.wrapping_add(1);
+            since_fetch += 1;
             if ticks.is_multiple_of(30) {
                 now.set(Utc::now());
             }
-            util::sleep(1_000).await;
+            if stale.get_value() {
+                render();
+            }
+            // Without live updates, poll every second as a fallback.
+            if since_fetch >= 30 || socket.get_untracked() != EventsStatus::Open {
+                since_fetch = 0;
+                fetch();
+            }
         }
     });
-
-    // Actions run in the page's owner, not the clicked control's: a menu, the selection
-    // bar or a row can unmount while the requests are still running.
-    let owner = StoredValue::new(Owner::current().expect("the page has an owner"));
-    let in_page = move |f: Box<dyn FnOnce()>| owner.with_value(|owner| owner.with(f));
 
     let change = Callback::new(move |(operation, files): (Operation, Vec<Entry>)| {
         if working.with_untracked(Option::is_some)
@@ -641,10 +715,12 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     </div>
                     <label class="switch transfers-history">
                         <input type="checkbox" role="switch" prop:checked=history on:change=move |event| {
-                            history.set(event_target_checked(&event));
+                            let checked = event_target_checked(&event);
+                            history.set(checked);
+                            live.update_value(|live| live.reset(checked));
                             history_revision.update(|revision| *revision = revision.wrapping_add(1));
                             loading.set(true);
-                            apply_snapshot(Vec::new(), rows, index, speed);
+                            apply_snapshot(&[], rows, index, speed);
                             more_uploads.set(false);
                             load_error.set(None);
                         }/>
@@ -724,7 +800,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
 /// Writes a fresh snapshot into the per-row signals and the index, touching only what
 /// changed.
 fn apply_snapshot(
-    list: Vec<Transfer>,
+    list: &[Transfer],
     rows: StoredValue<HashMap<String, ArcRwSignal<Transfer>>>,
     index: RwSignal<Vec<Entry>>,
     speed: RwSignal<f64>,
@@ -733,7 +809,7 @@ fn apply_snapshot(
         let changed = current.len() != list.len()
             || current
                 .iter()
-                .zip(&list)
+                .zip(list)
                 .any(|(entry, file)| !entry.matches(file));
         changed.then(|| list.iter().map(Entry::new).collect::<Vec<_>>())
     });
@@ -752,11 +828,11 @@ fn apply_snapshot(
         }
         for file in list {
             if let Some(signal) = map.get(&file.id) {
-                if signal.with_untracked(|old| *old != file) {
-                    signal.set(file);
+                if signal.with_untracked(|old| old != file) {
+                    signal.set(file.clone());
                 }
             } else {
-                map.insert(file.id.clone(), ArcRwSignal::new(file));
+                map.insert(file.id.clone(), ArcRwSignal::new(file.clone()));
             }
         }
     });
