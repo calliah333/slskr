@@ -336,7 +336,6 @@ async fn enqueue_folder(
             shares
                 .directories
                 .iter()
-                .chain(&shares.locked_directories)
                 .filter(|directory| destination::relative_to(&root, &directory.name).is_some())
                 .cloned(),
         );

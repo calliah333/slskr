@@ -52,9 +52,14 @@ pub(super) fn plan(
             continue;
         }
         found = true;
+        let separator = if name.contains('/') && !name.contains('\\') {
+            '/'
+        } else {
+            '\\'
+        };
         for file in directory.files {
             // Browse and folder listings name files relative to their folder.
-            let filename = format!("{name}\\{}", file.filename);
+            let filename = format!("{name}{separator}{}", file.filename);
             if !seen.insert(filename.clone()) {
                 continue;
             }
@@ -148,6 +153,19 @@ mod tests {
         // An empty folder is found but plans nothing.
         let empty = super::plan("x", false, [dir("x", &[])]).unwrap();
         assert!(empty.files.is_empty() && empty.rejected.is_empty());
+    }
+
+    #[test]
+    fn preserves_slash_separated_remote_paths() {
+        let listing = [
+            dir("@@m/Album", &["cover.jpg"]),
+            dir("@@m/Album/CD1", &["01.flac"]),
+        ];
+        let plan = plan("@@m/Album", true, listing).unwrap();
+        assert_eq!(
+            names(&plan),
+            ["@@m/Album/cover.jpg", "@@m/Album/CD1/01.flac"]
+        );
     }
 
     #[test]
