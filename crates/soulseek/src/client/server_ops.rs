@@ -622,14 +622,14 @@ pub(super) fn dispatch(
     match msg {
         ServerIncoming::WatchUser(r) => {
             let k = username_key("watch_user", &r.username);
-            if !w.complete(&k, r.clone()) {
-                if let Some(d) = r.user_data {
-                    client.inner().emit(Event::UserStatusChanged(UserStatus {
-                        username: d.username,
-                        presence: d.status,
-                        is_privileged: false,
-                    }));
-                }
+            if !w.complete(&k, r.clone())
+                && let Some(d) = r.user_data
+            {
+                client.inner().emit(Event::UserStatusChanged(UserStatus {
+                    username: d.username,
+                    presence: d.status,
+                    is_privileged: false,
+                }));
             }
         }
         ServerIncoming::UserStatus(r) => {

@@ -626,6 +626,8 @@ async fn read_server(
             _ = cancel.cancelled() => return,
             body = incoming.recv() => body,
         };
+        // Decode before taking the lifecycle lock, which other tasks contend for.
+        let message = body.map(decode);
         let Some(inner) = client.upgrade() else {
             return;
         };
@@ -634,7 +636,7 @@ async fn read_server(
         if !lifecycle.current(generation) {
             return;
         }
-        let Some(body) = body else {
+        let Some(message) = message else {
             client.disconnect_locked(
                 &mut lifecycle,
                 "The server connection closed",
@@ -642,7 +644,7 @@ async fn read_server(
             );
             return;
         };
-        match decode(body) {
+        match message {
             Some(ServerIncoming::KickedFromServer) => {
                 client.inner.emit(Event::KickedFromServer);
                 client.disconnect_locked(

@@ -36,6 +36,75 @@ pub(crate) struct TransferManager {
 struct Registry {
     session: CancellationToken,
     active: HashMap<u32, Pending>,
+    /// Tokens in `active` by username, so peer messages need not scan every transfer.
+    by_user: HashMap<String, Vec<u32>>,
+}
+
+impl Registry {
+    fn insert(&mut self, token: u32, pending: Pending) {
+        self.by_user
+            .entry(pending.username.clone())
+            .or_default()
+            .push(token);
+        if let Some(old) = self.active.insert(token, pending) {
+            self.unindex(token, &old.username);
+        }
+    }
+
+    fn remove(&mut self, token: u32) {
+        if let Some(old) = self.active.remove(&token) {
+            self.unindex(token, &old.username);
+        }
+    }
+
+    fn unindex(&mut self, token: u32, username: &str) {
+        if let Some(tokens) = self.by_user.get_mut(username)
+            && let Some(index) = tokens.iter().position(|&t| t == token)
+        {
+            tokens.swap_remove(index);
+            if tokens.is_empty() {
+                self.by_user.remove(username);
+            }
+        }
+    }
+
+    /// Active transfers with `username`.
+    fn user<'a>(&'a self, username: &str) -> impl Iterator<Item = &'a Pending> + 'a {
+        self.by_user
+            .get(username)
+            .into_iter()
+            .flatten()
+            .filter_map(|token| self.active.get(token))
+    }
+
+    /// The first active transfer with `username` that matches `predicate`.
+    fn find_user_mut(
+        &mut self,
+        username: &str,
+        mut predicate: impl FnMut(&Pending) -> bool,
+    ) -> Option<&mut Pending> {
+        let token = *self
+            .by_user
+            .get(username)?
+            .iter()
+            .find(|token| self.active.get(token).is_some_and(&mut predicate))?;
+        self.active.get_mut(&token)
+    }
+
+    /// The first `Some` that `f` returns for an active transfer with `username`.
+    fn find_map_user<T>(
+        &mut self,
+        username: &str,
+        mut f: impl FnMut(&mut Pending) -> Option<T>,
+    ) -> Option<T> {
+        let Self {
+            active, by_user, ..
+        } = self;
+        by_user
+            .get(username)?
+            .iter()
+            .find_map(|token| active.get_mut(token).and_then(&mut f))
+    }
 }
 
 struct Pending {
@@ -77,11 +146,10 @@ impl TransferManager {
     ) {
         let session = {
             let registry = self.registry();
-            if !registry.active.values().any(|entry| {
-                entry.username == username
-                    && entry.incoming.is_some()
-                    && !entry.session.is_cancelled()
-            }) {
+            if !registry
+                .user(&username)
+                .any(|entry| entry.incoming.is_some() && !entry.session.is_cancelled())
+            {
                 return;
             }
             registry.session.clone()
@@ -112,11 +180,8 @@ impl TransferManager {
             if session.is_cancelled() {
                 return;
             }
-            let incoming = registry.active.values_mut().find_map(|entry| {
-                if entry.username == username
-                    && entry.remote_token == Some(token)
-                    && !entry.session.is_cancelled()
-                {
+            let incoming = registry.find_map_user(&username, |entry| {
+                if entry.remote_token == Some(token) && !entry.session.is_cancelled() {
                     entry.incoming.take()
                 } else {
                     None
@@ -154,21 +219,21 @@ impl TransferManager {
             PeerIncoming::TransferRequest(request) if request.direction == Direction::Upload => {
                 let mut registry = self.registry();
                 let token = request.token;
-                if let Some(entry) = registry.active.values().find(|entry| {
-                    entry.username == username
-                        && entry.remote_token == Some(token)
-                        && !entry.session.is_cancelled()
-                }) {
-                    let duplicate = entry.filename == request.filename;
+                let known = registry
+                    .user(username)
+                    .find(|entry| {
+                        entry.remote_token == Some(token) && !entry.session.is_cancelled()
+                    })
+                    .map(|entry| entry.filename == request.filename);
+                if let Some(duplicate) = known {
                     drop(registry);
                     if !duplicate {
                         self.respond(client, username, remote, Reply::RejectOffer(token));
                     }
                     return;
                 }
-                let entry = registry.active.values_mut().find(|entry| {
+                let entry = registry.find_user_mut(username, |entry| {
                     entry.direction == Direction::Download
-                        && entry.username == username
                         && entry.filename == request.filename
                         && !entry.session.is_cancelled()
                 });
@@ -239,9 +304,8 @@ impl TransferManager {
     }
 
     fn fail_download(&self, username: &str, filename: &str, error: Error) {
-        let sender = self.registry().active.values_mut().find_map(|entry| {
+        let sender = self.registry().find_map_user(username, |entry| {
             if entry.direction == Direction::Download
-                && entry.username == username
                 && entry.filename == filename
                 && !entry.session.is_cancelled()
             {
@@ -421,10 +485,8 @@ impl ActiveTransfer {
                 snapshot.token
             )));
         }
-        if registry.active.values().any(|entry| {
-            entry.direction == snapshot.direction
-                && entry.username == snapshot.username
-                && entry.filename == snapshot.filename
+        if registry.user(&snapshot.username).any(|entry| {
+            entry.direction == snapshot.direction && entry.filename == snapshot.filename
         }) {
             return Err(Error::DuplicateTransfer(format!(
                 "A {} of {} with user {} is already active",
@@ -432,7 +494,7 @@ impl ActiveTransfer {
             )));
         }
         let session = registry.session.clone();
-        registry.active.insert(
+        registry.insert(
             snapshot.token,
             Pending {
                 direction: snapshot.direction,
@@ -823,7 +885,7 @@ impl Drop for ActiveTransfer {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.snapshot.token);
-        registry.active.remove(&self.snapshot.token);
+        registry.remove(self.snapshot.token);
     }
 }
 
@@ -865,11 +927,9 @@ impl SoulseekClient {
         let session = {
             let registry = self.inner.transfers.registry();
             registry
-                .active
-                .values()
+                .user(username)
                 .find(|entry| {
                     entry.direction == Direction::Download
-                        && entry.username == username
                         && entry.filename == filename
                         && !entry.session.is_cancelled()
                 })

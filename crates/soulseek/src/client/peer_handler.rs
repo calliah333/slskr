@@ -14,12 +14,15 @@ use crate::model::{BrowseResponse, SearchQuery, UserInfo};
 use crate::net::connection::{FrameObserver, FrameProgress};
 use crate::net::message_connection::MessageConnection;
 use crate::net::waiter::WaitKey;
+use crate::protocol::ProtocolError;
 use crate::protocol::codes::PeerCode;
 use crate::protocol::peer::{FolderContentsResponse, PeerIncoming};
 use crate::resolvers::Resolvers;
 
 /// Requests answered concurrently per connection; further requests wait for a slot.
 const MAX_CONCURRENT_ANSWERS: usize = 4;
+/// Frames larger than this (compressed) are decoded off the async workers.
+pub(super) const BLOCKING_DECODE_LEN: u64 = 256 * 1024;
 
 // Responses are keyed by user, not socket: a peer may answer on another connection.
 
@@ -113,16 +116,26 @@ pub(super) fn spawn(
                     None => break,
                 },
             };
-            let Some(inner) = weak.upgrade() else { break };
-            let client = SoulseekClient::from_inner(inner);
-            let inner = client.inner();
             let size = frame.len() as u64;
             let code = frame.first_chunk::<4>().copied().map(u32::from_le_bytes);
             let code = code.and_then(|code| PeerCode::try_from(code).ok());
             if code == Some(PeerCode::BrowseResponse) {
                 lock(&tracking).frames.pop_front();
             }
-            let message = match PeerIncoming::decode(frame) {
+            let decoded = if size > BLOCKING_DECODE_LEN {
+                // Inflating and parsing a large share listing would stall this worker.
+                tokio::task::spawn_blocking(move || PeerIncoming::decode(frame))
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(ProtocolError::Invalid(format!("decoding stopped: {error}")))
+                    })
+            } else {
+                PeerIncoming::decode(frame)
+            };
+            let Some(inner) = weak.upgrade() else { break };
+            let client = SoulseekClient::from_inner(inner);
+            let inner = client.inner();
+            let message = match decoded {
                 Ok(message) => message,
                 Err(error) => {
                     tracing::debug!(%username, %remote, %error, "Invalid peer message");
@@ -235,13 +248,23 @@ async fn answer(
 ) {
     let remote = connection.remote();
     let frame = match request {
-        PeerIncoming::BrowseRequest(_) => match resolvers.browse(username.into(), remote).await {
-            Ok(response) => response.to_bytes(),
-            Err(error) => {
-                tracing::warn!(%username, %remote, %error, "Browse resolver failed");
-                BrowseResponse::default().to_bytes()
+        PeerIncoming::BrowseRequest(_) => {
+            let response = match resolvers.browse(username.into(), remote).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(%username, %remote, %error, "Browse resolver failed");
+                    BrowseResponse::default()
+                }
+            };
+            // Compressing a large share listing would stall this async worker.
+            match tokio::task::spawn_blocking(move || response.to_bytes()).await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    tracing::warn!(%username, %remote, %error, "Could not encode browse response");
+                    return;
+                }
             }
-        },
+        }
         PeerIncoming::InfoRequest(_) => match resolvers.user_info(username.into(), remote).await {
             Ok(response) => response.to_bytes(),
             Err(error) => {
