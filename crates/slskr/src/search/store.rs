@@ -92,69 +92,80 @@ pub(super) fn insert(db: &Connection, search: &Search) -> rusqlite::Result<bool>
     )? != 0)
 }
 
-pub(super) fn append(
+/// Stores `responses` in arrival order and the search's resulting `counts`, in one
+/// transaction.
+pub(super) fn append_many(
     db: &mut Connection,
     id: &str,
-    response: &SearchResponse,
-    [responses, files, locked_files]: [u32; 3],
+    responses: &[SearchResponse],
+    [response_count, files, locked_files]: [u32; 3],
 ) -> rusqlite::Result<()> {
     let transaction = db.transaction()?;
-    transaction.execute(
-        "INSERT INTO search_responses(search_id, response) VALUES (?1, ?2)",
-        params![id, encode(response)?],
-    )?;
-    transaction.execute(
-        "UPDATE searches SET record = json_set(record, '$.response_count', ?2, '$.file_count', ?3, '$.locked_file_count', ?4)
-         WHERE id = ?1",
-        params![id, responses, files, locked_files],
-    )?;
+    {
+        let mut insert = transaction
+            .prepare_cached("INSERT INTO search_responses(search_id, response) VALUES (?1, ?2)")?;
+        for response in responses {
+            insert.execute(params![id, encode(response)?])?;
+        }
+        transaction
+            .prepare_cached(
+                "UPDATE searches SET record = json_set(record, '$.response_count', ?2, '$.file_count', ?3, '$.locked_file_count', ?4)
+                 WHERE id = ?1",
+            )?
+            .execute(params![id, response_count, files, locked_files])?;
+    }
     transaction.commit()
 }
 
 pub(super) fn update(db: &Connection, search: &Search) -> rusqlite::Result<()> {
-    db.execute(
-        "UPDATE searches SET record = ?2 WHERE id = ?1",
-        params![search.id, encode(search)?],
-    )?;
+    db.prepare_cached("UPDATE searches SET record = ?2 WHERE id = ?1")?
+        .execute(params![search.id, encode(search)?])?;
     Ok(())
 }
 
 pub(super) fn get(db: &Connection, id: &str) -> rusqlite::Result<Option<Search>> {
-    db.query_row(
-        "SELECT record FROM searches WHERE id = ?1",
-        [id],
-        decode::<Search>,
-    )
-    .optional()
+    db.prepare_cached("SELECT record FROM searches WHERE id = ?1")?
+        .query_row([id], decode::<Search>)
+        .optional()
 }
 
-/// The responses of a search in arrival order; `None` when there is no such search.
-pub(super) fn responses(
-    db: &Connection,
-    id: &str,
-) -> rusqlite::Result<Option<Vec<SearchResponse>>> {
-    if get(db, id)?.is_none() {
+/// The API JSON array of a search's responses in arrival order, assembled from the stored
+/// JSON without decoding it; `None` when there is no such search.
+pub(super) fn responses_json(db: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    let exists = db
+        .prepare_cached("SELECT 1 FROM searches WHERE id = ?1")?
+        .exists([id])?;
+    if !exists {
         return Ok(None);
     }
-    let mut statement =
-        db.prepare("SELECT response FROM search_responses WHERE search_id = ?1 ORDER BY sequence")?;
-    statement
-        .query_map([id], decode)?
-        .collect::<rusqlite::Result<_>>()
-        .map(Some)
+    let mut statement = db.prepare_cached(
+        "SELECT response FROM search_responses WHERE search_id = ?1 ORDER BY sequence",
+    )?;
+    let mut rows = statement.query([id])?;
+    let mut json = String::from("[");
+    while let Some(row) = rows.next()? {
+        let value = row.get_ref(0)?;
+        let text = value.as_str().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, value.data_type(), Box::new(error))
+        })?;
+        if json.len() > 1 {
+            json.push(',');
+        }
+        json.push_str(text);
+    }
+    json.push(']');
+    Ok(Some(json))
 }
 
 pub(super) fn search_text(db: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
-    db.query_row(
-        "SELECT json_extract(record, '$.query') FROM searches WHERE id = ?1",
-        [id],
-        |row| row.get(0),
-    )
-    .optional()
+    db.prepare_cached("SELECT json_extract(record, '$.query') FROM searches WHERE id = ?1")?
+        .query_row([id], |row| row.get(0))
+        .optional()
 }
 
 pub(super) fn remove(db: &Connection, id: &str) -> rusqlite::Result<()> {
-    db.execute("DELETE FROM searches WHERE id = ?1", [id])?;
+    db.prepare_cached("DELETE FROM searches WHERE id = ?1")?
+        .execute([id])?;
     Ok(())
 }
 

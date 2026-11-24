@@ -8,7 +8,11 @@ use std::{
     time::Duration,
 };
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    extract::State,
+    http::{HeaderValue, StatusCode, header},
+    response::IntoResponse,
+};
 use chrono::Utc;
 use slskr_types::{
     realtime::{Event, Topic},
@@ -33,6 +37,8 @@ use crate::{
 /// Progress (counts and response batches) is published at most this often per search.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const RETENTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Most responses already waiting on the channel that are stored in one transaction.
+const RESPONSE_BATCH: usize = 256;
 
 #[derive(Clone)]
 pub struct SearchService(Arc<Inner>);
@@ -282,11 +288,18 @@ impl SearchService {
                     }
                     response = responses.recv() => {
                         let Some(response) = response else { break };
-                        self.append_response(&active, response).await.map(|stored| {
-                            if let Some(response) = stored {
+                        // Store whatever else already arrived with the same transaction.
+                        let mut batch = vec![response];
+                        while batch.len() < RESPONSE_BATCH
+                            && let Ok(response) = responses.try_recv()
+                        {
+                            batch.push(response);
+                        }
+                        self.append_responses(&active, batch).await.map(|stored| {
+                            if !stored.is_empty() {
                                 dirty = true;
                                 if self.0.bus.wants(Topic::Searches) {
-                                    pending.push(response);
+                                    pending.extend(stored);
                                 }
                             }
                         })
@@ -346,34 +359,37 @@ impl SearchService {
             .await
     }
 
-    async fn append_response(
+    /// Stores responses in arrival order with one transaction; returns those stored, none
+    /// when the search is no longer this task's.
+    async fn append_responses(
         &self,
         active: &ActiveSearch,
-        response: soulseek::SearchResponse,
-    ) -> anyhow::Result<Option<SearchResponse>> {
+        responses: Vec<soulseek::SearchResponse>,
+    ) -> anyhow::Result<Vec<SearchResponse>> {
         let inner = self.0.clone();
         let active = active.clone();
         self.0
             .db
             .call(move |db| {
-                let Some(counts) = active.entry(&inner.searches()).map(|entry| {
+                let Some(mut counts) = active.entry(&inner.searches()).map(|entry| {
                     [
-                        entry.search.response_count.saturating_add(1),
-                        entry
-                            .search
-                            .file_count
-                            .saturating_add(count(response.file_count())),
-                        entry
-                            .search
-                            .locked_file_count
-                            .saturating_add(count(response.locked_file_count())),
+                        entry.search.response_count,
+                        entry.search.file_count,
+                        entry.search.locked_file_count,
                     ]
                 }) else {
-                    return Ok(None);
+                    return Ok(Vec::new());
                 };
+                for response in &responses {
+                    let [total, files, locked_files] = &mut counts;
+                    *total = total.saturating_add(1);
+                    *files = files.saturating_add(count(response.file_count()));
+                    *locked_files =
+                        locked_files.saturating_add(count(response.locked_file_count()));
+                }
 
-                let response = map_response(response);
-                store::append(db, &active.id, &response, counts)?;
+                let responses: Vec<_> = responses.into_iter().map(map_response).collect();
+                store::append_many(db, &active.id, &responses, counts)?;
                 {
                     let mut searches = inner.searches();
                     let search = &mut searches
@@ -386,7 +402,7 @@ impl SearchService {
                         search.locked_file_count,
                     ] = counts;
                 }
-                Ok(Some(response))
+                Ok(responses)
             })
             .await
     }
@@ -442,11 +458,12 @@ impl SearchService {
             .ok_or_else(ApiError::not_found)
     }
 
-    async fn responses(&self, id: &str) -> ApiResult<Vec<SearchResponse>> {
+    /// The `[SearchResponse]` JSON array, as stored.
+    async fn responses_json(&self, id: &str) -> ApiResult<String> {
         let id = id.to_owned();
         self.0
             .db
-            .call(move |db| store::responses(db, &id))
+            .call(move |db| store::responses_json(db, &id))
             .await?
             .ok_or_else(ApiError::not_found)
     }
@@ -661,14 +678,20 @@ async fn responses(
     _: Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<Vec<SearchResponse>>> {
+) -> ApiResult<impl IntoResponse> {
     let id = search_id(&id)?;
-    state
+    let json = state
         .services
         .search
-        .responses(&id.to_string())
-        .await
-        .map(Json)
+        .responses_json(&id.to_string())
+        .await?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        json,
+    ))
 }
 
 async fn cancel(
@@ -845,11 +868,11 @@ mod tests {
         let sample = sample_search(&id, 7);
         let first = insert_active(&service, sample.clone()).await;
         assert!(
-            service
-                .append_response(&first, one_response(first.token))
+            !service
+                .append_responses(&first, vec![one_response(first.token)])
                 .await
                 .unwrap()
-                .is_some()
+                .is_empty()
         );
         service.remove(id.clone()).await.unwrap();
         assert!(service.0.list().is_empty());
@@ -862,11 +885,11 @@ mod tests {
 
         let second = insert_active(&service, sample).await;
         assert!(
-            !service
-                .append_response(&first, one_response(first.token))
+            service
+                .append_responses(&first, vec![one_response(first.token)])
                 .await
                 .unwrap()
-                .is_some()
+                .is_empty()
         );
         service
             .change_state(&first, SearchState::Cancelled)
@@ -882,11 +905,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            service
-                .append_response(&second, one_response(second.token))
+            !service
+                .append_responses(&second, vec![one_response(second.token)])
                 .await
                 .unwrap()
-                .is_some()
+                .is_empty()
         );
         let terminal = SearchState::ResponseLimitReached;
         service.change_state(&second, terminal).await.unwrap();
@@ -902,7 +925,7 @@ mod tests {
             ),
             (1, 1, 1)
         );
-        let responses = service.responses(&id).await.unwrap();
+        let responses = service.responses(&id).await;
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].files[0].filename, "music.flac");
         assert_eq!(responses[0].locked_files[0].filename, "locked.flac");
@@ -912,6 +935,62 @@ mod tests {
         service.cancel(&id).unwrap();
     }
 
+    impl SearchService {
+        async fn responses(&self, id: &str) -> Vec<SearchResponse> {
+            serde_json::from_str(&self.responses_json(id).await.unwrap()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_responses_is_stored_in_order_with_its_counts() {
+        let service = memory_service();
+        let id = Uuid::new_v4().to_string();
+        let active = insert_active(&service, sample_search(&id, 9)).await;
+        assert_eq!(service.responses_json(&id).await.unwrap(), "[]");
+        assert!(matches!(
+            service.responses_json(&Uuid::new_v4().to_string()).await,
+            Err(ApiError::NotFound(_))
+        ));
+
+        let batch = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| soulseek::SearchResponse {
+                    username: (*name).into(),
+                    ..one_response(active.token)
+                })
+                .collect::<Vec<_>>()
+        };
+        let stored = service
+            .append_responses(&active, batch(&["a", "b", "c"]))
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 3);
+        let stored = service
+            .append_responses(&active, batch(&["d"]))
+            .await
+            .unwrap();
+        assert_eq!(stored[0].username, "d");
+
+        let search = service.get(&id).await.unwrap();
+        assert_eq!(
+            (
+                search.response_count,
+                search.file_count,
+                search.locked_file_count
+            ),
+            (4, 4, 4)
+        );
+        let overview = &service.0.list()[0];
+        assert_eq!(overview.response_count, 4);
+        let json = service.responses_json(&id).await.unwrap();
+        let responses: Vec<SearchResponse> = serde_json::from_str(&json).unwrap();
+        let names: Vec<_> = responses.iter().map(|r| r.username.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        // The stored JSON is served as is: the same document the types would encode.
+        assert_eq!(json, serde_json::to_string(&responses).unwrap());
+    }
+
     #[tokio::test]
     async fn retention_removes_expired_results_but_keeps_active_and_recent_searches() {
         let service = memory_service();
@@ -919,11 +998,11 @@ mod tests {
         let current = insert_active(&service, sample_search(&Uuid::new_v4().to_string(), 2)).await;
         let active = insert_active(&service, sample_search(&Uuid::new_v4().to_string(), 3)).await;
         assert!(
-            service
-                .append_response(&expired, one_response(expired.token))
+            !service
+                .append_responses(&expired, vec![one_response(expired.token)])
                 .await
                 .unwrap()
-                .is_some()
+                .is_empty()
         );
         service
             .change_state(&current, SearchState::TimedOut)
@@ -1019,11 +1098,12 @@ mod tests {
                 .as_deref(),
             Some("example")
         );
-        let responses = db
-            .call(move |db| store::responses(db, &id))
+        let json = db
+            .call(move |db| store::responses_json(db, &id))
             .await
             .unwrap()
             .unwrap();
+        let responses: Vec<SearchResponse> = serde_json::from_str(&json).unwrap();
         assert_eq!(responses[0].username, "peer");
         assert!(responses[0].has_free_upload_slot);
         assert_eq!(responses[0].queue_length, 3);

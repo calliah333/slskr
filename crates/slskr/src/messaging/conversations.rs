@@ -158,7 +158,7 @@ impl ConversationService {
     ) -> anyhow::Result<Vec<Conversation>> {
         self.db
             .call(move |db| {
-                let mut stmt = db.prepare(
+                let mut stmt = db.prepare_cached(
                     "SELECT c.username, c.is_active, coalesce(unread.count, 0)
                  FROM conversations c
                  LEFT JOIN (
@@ -306,7 +306,7 @@ fn recent_messages(
     username: &str,
     unacknowledged: bool,
 ) -> rusqlite::Result<Vec<PrivateMessage>> {
-    let mut stmt = db.prepare(
+    let mut stmt = db.prepare_cached(
         "SELECT timestamp,id,username,direction,message,is_acknowledged,was_replayed
          FROM (SELECT rowid,* FROM private_messages WHERE username = ?1
                ORDER BY timestamp DESC, rowid DESC LIMIT ?2)
@@ -344,7 +344,7 @@ fn unacknowledged_messages(
     if !known {
         return Ok(None);
     }
-    let mut stmt = db.prepare(sql)?;
+    let mut stmt = db.prepare_cached(sql)?;
     let mut rows = if let Some(id) = id {
         stmt.query(params![username, id])?
     } else {
@@ -361,7 +361,7 @@ fn unacknowledged_messages(
 fn mark_acknowledged(db: &mut Connection, messages: &[(i64, i32, i64)]) -> rusqlite::Result<()> {
     let tx = db.transaction()?;
     {
-        let mut update = tx.prepare(
+        let mut update = tx.prepare_cached(
             "UPDATE private_messages SET is_acknowledged = 1 WHERE rowid = ?1 AND revision = ?2",
         )?;
         for &(rowid, _, revision) in messages {

@@ -17,7 +17,12 @@ use slskr_types::telemetry::{
 };
 use slskr_types::transfers::{TransferDirection, TransferState};
 
-const COMPLETED_STATES: &str = "16, 48, 80, 144, 272, 528, 1040";
+/// The completed transfer state bits, spliced into constant SQL with `concat!`.
+macro_rules! completed_states {
+    () => {
+        "16, 48, 80, 144, 272, 528, 1040"
+    };
+}
 // Reference genesis (2020-12-30 06:22 UTC) and DateTime's year 1–9999 bounds.
 const GENESIS: DateTime<Utc> = utc(1_609_309_320, 0);
 const MIN_TIME: DateTime<Utc> = utc(-62_135_596_800, 0);
@@ -135,12 +140,12 @@ impl ReportsService {
         let direction = direction.map(str::to_owned);
         let username = username.map(str::to_owned);
         self.database.call(move |db| {
-            let mut stmt = db.prepare(&format!(
+            let mut stmt = db.prepare_cached(concat!(
                 "SELECT direction, state, SUM(size), COUNT(*), COUNT(DISTINCT username), AVG(average_speed),
                     AVG(strftime('%s', started_at)-strftime('%s', enqueued_at)),
                     AVG(strftime('%s', ended_at)-strftime('%s', started_at))
                  FROM transfers WHERE ended_at BETWEEN ?1 AND ?2
-                    AND state IN ({COMPLETED_STATES}) AND (?3 IS NULL OR direction = ?3)
+                    AND state IN (", completed_states!(), ") AND (?3 IS NULL OR direction = ?3)
                     AND (?4 IS NULL OR username = ?4) GROUP BY direction, state"
             ))?;
             let mut rows = stmt.query(rusqlite::params![start, end, direction, username])?;
@@ -180,14 +185,14 @@ impl ReportsService {
         let username = username.map(str::to_owned);
         let mut histogram = empty_histogram(start, end, seconds);
         self.database.call(move |db| {
-            let mut stmt = db.prepare(&format!(
+            let mut stmt = db.prepare_cached(concat!(
                 "SELECT (CAST(strftime('%s', ended_at) AS INTEGER) / ?1) * ?1, direction, state,
                     SUM(size), COUNT(*), COUNT(DISTINCT username),
                     CAST(SUM(size) AS REAL) / NULLIF(SUM(strftime('%s', ended_at)-strftime('%s', started_at)), 0),
                     AVG(strftime('%s', started_at)-strftime('%s', enqueued_at)),
                     AVG(strftime('%s', ended_at)-strftime('%s', started_at))
                  FROM transfers WHERE ended_at BETWEEN ?2 AND ?3
-                    AND state IN ({COMPLETED_STATES}) AND (?4 IS NULL OR direction = ?4)
+                    AND state IN (", completed_states!(), ") AND (?4 IS NULL OR direction = ?4)
                     AND (?5 IS NULL OR username = ?5) GROUP BY 1, 2, 3"
             ))?;
             let mut rows = stmt.query(rusqlite::params![seconds, start_text, end_text, direction, username])?;
@@ -233,17 +238,17 @@ impl ReportsService {
         );
         self.database.call(move |db| {
             let mut histogram = empty_histogram(start, end, seconds);
-            let mut stmt = db.prepare_cached(&format!(
+            let mut stmt = db.prepare_cached(concat!(
                 "SELECT hour / ?1 * ?1, direction, state, SUM(bytes), SUM(files) FROM (
                     SELECT hour, direction, state, bytes, files FROM transfer_chart_hours
                     WHERE hour >= ?2 AND hour < ?3
                     UNION ALL
                     SELECT unixepoch(substr(ended_at, 1, 19)) / 3600 * 3600, direction, state, size, 1
                     FROM transfers WHERE ended_at BETWEEN ?4 AND ?5
-                      AND state IN ({COMPLETED_STATES})
+                      AND state IN (", completed_states!(), ")
                     UNION ALL
                     SELECT unixepoch(substr(ended_at, 1, 19)) / 3600 * 3600, direction, state, size, 1
-                    FROM transfers WHERE ended_at BETWEEN ?6 AND ?7 AND state IN ({COMPLETED_STATES})
+                    FROM transfers WHERE ended_at BETWEEN ?6 AND ?7 AND state IN (", completed_states!(), ")
                 ) GROUP BY 1, 2, 3"
             ))?;
             let mut rows = stmt.query(rusqlite::params![seconds, full_start, full_end, bounds.0, bounds.1, bounds.2, bounds.3])?;
@@ -293,7 +298,7 @@ impl ReportsService {
                  FROM transfers WHERE direction = ?1 AND state = 48 AND ended_at BETWEEN ?2 AND ?3
                  GROUP BY username ORDER BY {field} {ordering}, username DESC LIMIT ?4 OFFSET ?5"
             );
-            let mut stmt = db.prepare(&sql)?;
+            let mut stmt = db.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![dir, start, end, limit, offset])?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? { out.push(TransferSummary { username: row.get(0)?, total_bytes: row.get(1)?, count: row.get(2)?, average_speed: row.get::<_, Option<f64>>(3)?.unwrap_or_default(), average_wait_ms: ms(row.get(4)?), average_duration_ms: ms(row.get(5)?), ..Default::default() }); }
@@ -319,7 +324,7 @@ impl ReportsService {
         );
         self.database.call(move |db| {
             let sql = format!("SELECT id, username, direction, filename, size, state, requested_at, enqueued_at, started_at, ended_at, bytes_transferred, average_speed, CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) ORDER BY ended_at {} LIMIT ?5 OFFSET ?6", if order == SortOrder::Asc { "ASC" } else { "DESC" });
-            let mut stmt = db.prepare(&sql)?;
+            let mut stmt = db.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![direction, start, end, username, limit, offset])?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
@@ -351,7 +356,7 @@ impl ReportsService {
             username.map(str::to_owned),
         );
         self.database.call(move |db| {
-            let mut stmt = db.prepare("SELECT CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END, COUNT(*), COUNT(DISTINCT username) FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) GROUP BY 1 ORDER BY COUNT(*) DESC, 1 LIMIT ?5 OFFSET ?6")?;
+            let mut stmt = db.prepare_cached("SELECT CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END, COUNT(*), COUNT(DISTINCT username) FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) GROUP BY 1 ORDER BY COUNT(*) DESC, 1 LIMIT ?5 OFFSET ?6")?;
             let mut rows = stmt.query(rusqlite::params![direction, start, end, username, limit, offset])?;
             let mut out = Vec::new();
             while let Some(r) = rows.next()? { out.push(TransferErrorSummary { error: r.get(0)?, count: r.get(1)?, distinct_users: r.get(2)? }); }
@@ -422,7 +427,7 @@ impl ReportsService {
             username.map(str::to_owned),
         );
         self.database.call(move |db| {
-            let mut stmt = db.prepare("WITH dirs AS (SELECT rtrim(rtrim(filename, replace(replace(filename,'/',''),'\\','')), '/\\') AS directory, username FROM transfers WHERE direction='Upload' AND state=48 AND ended_at IS NOT NULL AND ended_at >= ?1 AND ended_at <= ?2 AND (?3 IS NULL OR username=?3)) SELECT directory, COUNT(*), COUNT(DISTINCT username) FROM dirs GROUP BY directory ORDER BY COUNT(DISTINCT username) DESC, COUNT(*) DESC, directory LIMIT ?4 OFFSET ?5")?;
+            let mut stmt = db.prepare_cached("WITH dirs AS (SELECT rtrim(rtrim(filename, replace(replace(filename,'/',''),'\\','')), '/\\') AS directory, username FROM transfers WHERE direction='Upload' AND state=48 AND ended_at IS NOT NULL AND ended_at >= ?1 AND ended_at <= ?2 AND (?3 IS NULL OR username=?3)) SELECT directory, COUNT(*), COUNT(DISTINCT username) FROM dirs GROUP BY directory ORDER BY COUNT(DISTINCT username) DESC, COUNT(*) DESC, directory LIMIT ?4 OFFSET ?5")?;
             let mut rows = stmt.query(rusqlite::params![start, end, username, limit, offset])?;
             let mut out = Vec::new();
             while let Some(r) = rows.next()? { out.push(TransferDirectorySummary { directory: r.get(0)?, count: r.get(1)?, distinct_users: r.get(2)? }); }
