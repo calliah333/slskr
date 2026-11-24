@@ -74,34 +74,62 @@ impl SearchQuery {
     /// any word characters are ignored; a query without effective terms matches
     /// nothing.
     pub fn matches(&self, filename: &str) -> bool {
-        let words = tokenize(filename);
+        self.matcher().matches(filename)
+    }
 
-        let mut any_term = false;
-        for term in &self.terms {
-            let phrase = tokenize(term);
-            if phrase.is_empty() {
-                continue;
-            }
-            any_term = true;
-            if !contains_phrase(&words, &phrase, term.starts_with('*')) {
-                return false;
-            }
+    /// Prepares the query once and reuses token storage across file matches.
+    pub fn matcher(&self) -> SearchMatcher {
+        SearchMatcher {
+            terms: self
+                .terms
+                .iter()
+                .map(|term| (tokenize(term), term.starts_with('*')))
+                .filter(|(phrase, _)| !phrase.is_empty())
+                .collect(),
+            exclusions: self
+                .exclusions
+                .iter()
+                .filter(|exclusion| !exclusion.is_empty())
+                .map(|exclusion| (exclusion.to_lowercase(), tokenize(exclusion)))
+                .collect(),
+            words: Vec::new(),
         }
+    }
+}
 
-        if !any_term {
+/// Prepared incoming search, with scratch space for one filename.
+pub struct SearchMatcher {
+    terms: Vec<(Vec<String>, bool)>,
+    exclusions: Vec<(String, Vec<String>)>,
+    words: Vec<String>,
+}
+
+impl SearchMatcher {
+    /// Whether no file can satisfy the query because it has no effective terms.
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// Tests a filename against the prepared query.
+    pub fn matches(&mut self, filename: &str) -> bool {
+        if self.is_empty() {
             return false;
         }
-
+        let words = tokenize_into(filename, &mut self.words);
+        if !self
+            .terms
+            .iter()
+            .all(|(phrase, wildcard)| contains_phrase(words, phrase, *wildcard))
+        {
+            return false;
+        }
+        if self.exclusions.is_empty() {
+            return true;
+        }
         let lower = filename.to_lowercase();
-        !self.exclusions.iter().any(|exclusion| {
-            if exclusion.is_empty() {
-                return false;
-            }
-            if lower.contains(&exclusion.to_lowercase()) {
-                return true;
-            }
-            let phrase = tokenize(exclusion);
-            !phrase.is_empty() && contains_phrase(&words, &phrase, false)
+        !self.exclusions.iter().any(|(substring, phrase)| {
+            lower.contains(substring)
+                || (!phrase.is_empty() && contains_phrase(words, phrase, false))
         })
     }
 }
@@ -131,20 +159,30 @@ fn build_search_text(terms: &[String], exclusions: &[String]) -> String {
 /// (equivalent to SQLite FTS5's default `unicode61` tokenizer used by slskd).
 fn tokenize(s: &str) -> Vec<String> {
     let mut words = Vec::new();
-    let mut current = String::new();
-    for c in s.chars() {
-        if c.is_alphanumeric() {
-            for lc in c.to_lowercase() {
-                current.push(fold_diacritic(lc));
-            }
-        } else if !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
+    tokenize_into(s, &mut words);
     words
+}
+
+fn tokenize_into<'a>(s: &str, words: &'a mut Vec<String>) -> &'a [String] {
+    let mut count = 0;
+    for token in s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        if count == words.len() {
+            words.push(String::new());
+        }
+        let word = &mut words[count];
+        word.clear();
+        word.extend(
+            token
+                .chars()
+                .flat_map(char::to_lowercase)
+                .map(fold_diacritic),
+        );
+        count += 1;
+    }
+    &words[..count]
 }
 
 /// Whether `phrase` appears as consecutive words; with `wildcard` the first
@@ -589,6 +627,16 @@ mod tests {
         assert!(!SearchQuery::parse("halo -beyonce").matches("Beyoncé - Halo.mp3"));
         // exclusions only
         assert!(!SearchQuery::parse("-bar").matches("foo.mp3"));
+    }
+
+    #[test]
+    fn reuses_matcher_with_paths_of_different_lengths() {
+        let mut matcher = SearchQuery::parse("*ello ac/dc -live").matcher();
+        assert!(matcher.matches("Music/Hello/AC-DC - Track.flac"));
+        assert!(!matcher.matches("Hello.mp3"));
+        assert!(!matcher.matches("Jello/AC-DC - lIvE.flac"));
+        assert!(matcher.matches("Jello/AC-DC.flac"));
+        assert!(SearchQuery::parse("! -live").matcher().is_empty());
     }
 
     #[test]

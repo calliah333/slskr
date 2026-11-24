@@ -484,12 +484,12 @@ impl ShareService {
         limit: usize,
     ) -> Result<Vec<soulseek::File>> {
         let mut collect = SearchMatches {
-            query,
+            matcher: query.matcher(),
             limit,
             filename: String::new(),
             matches: Vec::new(),
         };
-        if collect.is_full() {
+        if collect.is_full() || collect.matcher.is_empty() {
             return Ok(collect.matches);
         }
         if let Some(snapshot) = &self.snapshot() {
@@ -518,14 +518,14 @@ impl ShareService {
     }
 }
 
-struct SearchMatches<'a> {
-    query: &'a soulseek::SearchQuery,
+struct SearchMatches {
+    matcher: soulseek::SearchMatcher,
     limit: usize,
     filename: String,
     matches: Vec<soulseek::File>,
 }
 
-impl SearchMatches<'_> {
+impl SearchMatches {
     fn is_full(&self) -> bool {
         self.matches.len() >= self.limit
     }
@@ -539,7 +539,7 @@ impl SearchMatches<'_> {
     fn file(&mut self, name: &str, wire: impl FnOnce(String) -> soulseek::File) {
         let prefix = self.filename.len();
         self.filename.push_str(name);
-        if self.query.matches(&self.filename) {
+        if self.matcher.matches(&self.filename) {
             self.matches.push(wire(self.filename.clone()));
         }
         self.filename.truncate(prefix);
