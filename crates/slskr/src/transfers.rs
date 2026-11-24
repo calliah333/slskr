@@ -1040,9 +1040,9 @@ impl TransferService {
             (transfer, last)
         };
         self.flush().await;
-        match result {
-            Ok(local) => self.raise_completed(transfer, local, last),
-            Err(error) => tracing::debug!(%id, %error, "transfer ended unsuccessfully"),
+        log_outcome(&transfer, &result);
+        if let Ok(local) = result {
+            self.raise_completed(transfer, local, last);
         }
     }
 
@@ -1445,6 +1445,36 @@ fn failure_state(error: &Error) -> TransferState {
         Error::TransferRejected(_) => TransferState::Rejected,
         Error::TransferSizeMismatch { .. } => TransferState::Aborted,
         _ => TransferState::Errored,
+    }
+}
+
+/// One log line per finished transfer: successes and cancellations at info, failures at
+/// warn with the reason, so failed uploads can be found in the log.
+fn log_outcome(t: &Transfer, result: &soulseek::Result<PathBuf>) {
+    let direction = t.direction.as_str();
+    let username = t.username.as_str();
+    let filename = t.filename.as_str();
+    match result {
+        Ok(_) => tracing::info!(
+            direction,
+            username,
+            filename,
+            bytes = t.bytes_transferred,
+            speed_kib = (t.average_speed / 1024.0).round(),
+            "{direction} succeeded"
+        ),
+        Err(Error::Cancelled) => {
+            tracing::info!(direction, username, filename, "{direction} cancelled")
+        }
+        Err(error) => tracing::warn!(
+            direction,
+            username,
+            filename,
+            bytes = t.bytes_transferred,
+            size = t.size,
+            %error,
+            "{direction} failed"
+        ),
     }
 }
 

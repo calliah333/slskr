@@ -255,7 +255,12 @@ async fn socket_io<T>(
     io: impl Future<Output = io::Result<T>>,
 ) -> Result<T> {
     let result = match idle {
-        Some(limit) => timeout(limit, io).await?,
+        Some(limit) => timeout(limit, io).await.map_err(|_| {
+            Error::Timeout(format!(
+                "Transfer stalled: the peer moved no data for {} s",
+                limit.as_secs()
+            ))
+        })?,
         None => io.await,
     };
     result.map_err(|error| Error::Connection(format!("Transfer socket: {error}")))

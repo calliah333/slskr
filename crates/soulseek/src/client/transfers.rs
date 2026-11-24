@@ -800,7 +800,14 @@ impl ActiveTransfer {
                 response = receive(acknowledged) => response,
                 _ = peer.closed() => Err(Error::Connection("Peer closed the transfer negotiation connection".into())),
             }
-        }).await?
+        })
+        .await
+        .map_err(|_| {
+            Error::Timeout(format!(
+                "The peer did not answer the transfer request within {} s",
+                limit.as_secs()
+            ))
+        })?
     }
 
     async fn upload(
