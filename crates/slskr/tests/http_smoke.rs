@@ -254,7 +254,8 @@ async fn daemon_http_smoke() {
     // Both application state and report JSON negotiate compression.
     for path in ["/application", "/reports/transfers/histogram?buckets=60"] {
         for (accept, expected) in [
-            ("br", Some("br")),
+            ("br", None),
+            ("br, gzip", Some("gzip")),
             ("gzip", Some("gzip")),
             ("identity", None),
         ] {

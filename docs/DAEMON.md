@@ -226,7 +226,7 @@ Each service module exposes `pub fn routes() -> http::Routes`, built with
 modules and adds the events socket (`GET /api/events`), and a test compares that table
 with [API.md](API.md), so a route can not be added without documenting it. `bootstrap`
 adds catch-all JSON 404s for `/api` and `/api/{*rest}`, layers `json_errors` and response
-compression (brotli/gzip, fastest level) over them, merges the events socket without
+compression (gzip, fastest level) over them, merges the events socket without
 compression, adds `/health` and the Prometheus path, and nests the whole set under
 `web.url_base` (keeping the root reachable for proxies that strip the prefix). The web UI
 router (`web.rs`) is merged beside it and never answers `{url_base}/api/...` with

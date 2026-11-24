@@ -12,7 +12,7 @@ keeps it in step with the router.
 - **JSON**: requests and responses are JSON (`Content-Type: application/json`). Field
   names and enum values are `snake_case`. Responses include every field, with `null` for
   absent values; request fields marked optional may be left out. Responses are compressed
-  with brotli or gzip when the request's `Accept-Encoding` allows it.
+  with gzip when the request's `Accept-Encoding` allows it.
 - **Request compression** accepts `Content-Encoding: gzip` on REST requests. Body
   size limits apply to the decompressed JSON.
 - **Timestamps** are RFC 3339 UTC strings (`"2026-01-01T12:00:00.123Z"`). **Sizes** are
@@ -118,7 +118,6 @@ purpose, so keep administrator access to trusted people.
 | POST | `/api/application/shutdown` | admin session | | 204 |
 | POST | `/api/application/restart` | admin session | | 204 |
 | GET | `/api/application/version` | readonly | | `VersionState` |
-| POST | `/api/application/version/check` | readwrite | | `VersionState`, after asking GitHub for the latest release |
 | GET | `/api/server` | readonly | | `ServerState` |
 | POST | `/api/server/connect` | readwrite | | 204; 409 when no Soulseek credentials are set |
 | POST | `/api/server/disconnect` | readwrite | optional `{message}` | 204 |

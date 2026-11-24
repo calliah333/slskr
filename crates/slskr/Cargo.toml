@@ -14,11 +14,11 @@ serde_json.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 thiserror.workspace = true
 tracing.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 bytes.workspace = true
 anyhow = "1"
-axum = { version = "0.8", features = ["ws", "macros"] }
-tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "decompression-gzip", "trace"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 toml = "1"
@@ -34,13 +34,13 @@ sha1 = "0.10"
 sha2 = "0.10"
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 cap-std = "3"
 cap-fs-ext = "3"
 
 [dev-dependencies]
 flate2 = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
+tokio = { workspace = true, features = ["process"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 tokio-tungstenite = "0.29"

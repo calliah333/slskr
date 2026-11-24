@@ -16,15 +16,26 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 thiserror = "2"
-tracing = "0.1"
-tokio = { version = "1", features = ["full"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 bytes = "1"
+
+# Line tables keep file:line backtraces but skip variable/type debug info, which made the
+# dev binary ~275 MB and dominated link time. Dependencies carry none at all.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"
+strip = "debuginfo"
 
+# Smaller WASM: size-optimized and in one codegen unit so wasm-opt has less to undo.
 [profile.release.package.slskr-web]
 opt-level = "z"
+codegen-units = 1
 
 # Password hashing is deliberately expensive; unoptimized it makes sign-in and tests slow.
 [profile.dev.package.argon2]

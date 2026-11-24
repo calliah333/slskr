@@ -108,6 +108,8 @@
             ];
             doCheck = false;
             env.SLSKR_EMBED_UI = "${slskr-web}";
+            # nixpkgs' cargo setup hook sets LIBSQLITE3_SYS_USE_PKG_CONFIG=1, so the package
+            # links this SQLite rather than rusqlite's bundled copy (Docker still bundles it).
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [
               pkgs.sqlite
@@ -146,6 +148,10 @@
             pkgs.sqlite
             pkgs.pkg-config
           ];
+          # Link the shell's SQLite instead of compiling the bundled amalgamation on every
+          # cold build, as the nix package does; this overrides rusqlite's `bundled` feature.
+          # Plain `cargo` outside the shell, and the Docker image, still bundle it.
+          LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
         };
       });
 

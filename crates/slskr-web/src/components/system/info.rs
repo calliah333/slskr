@@ -3,7 +3,7 @@
 
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use slskr_types::{
-    application::{State, VersionState},
+    application::State,
     config::Config,
     server::ConnectionState,
 };
@@ -81,59 +81,9 @@ pub fn Info() -> impl IntoView {
 
 #[component]
 fn VersionCard(state: RwSignal<State>) -> impl IntoView {
-    // The result of "Check for updates", until the state carries a newer answer.
-    let checked = RwSignal::new(None::<VersionState>);
-    let checking = RwSignal::new(false);
-    let error = RwSignal::new(None::<String>);
-    let version = Memo::new(move |_| {
-        let current = state.with(|s| s.version.clone());
-        match checked.get() {
-            Some(checked) if current.latest.is_none() => checked,
-            _ => current,
-        }
-    });
-    let check = move |_| {
-        checking.set(true);
-        error.set(None);
-        leptos::task::spawn_local(async move {
-            match api::post_empty::<VersionState>("/application/version/check").await {
-                Ok(result) => {
-                    checked.try_set(Some(result));
-                }
-                Err(err) => {
-                    error.try_set(Some(err.to_string()));
-                }
-            }
-            checking.try_set(false);
-        });
-    };
-    let status = move || {
-        let v = version.get();
-        match v.is_update_available {
-            Some(true) => {
-                view! { <Badge variant="warning" icon="megaphone" text="Update available"/> }
-                    .into_any()
-            }
-            Some(false) => {
-                view! { <Badge variant="success" icon="circle-check" text="Up to date"/> }
-                    .into_any()
-            }
-            None => view! { <Badge text="Not checked"/> }.into_any(),
-        }
-    };
+    let version = Memo::new(move |_| state.with(|s| s.version.clone()));
     view! {
-        <Card title="Version" description="The running build and the latest release."
-            actions=ViewFn::from(move || view! {
-                <button type="button" class="btn btn--sm" on:click=check
-                    disabled=move || checking.get() aria-busy=move || checking.get().then_some("true")>
-                    {move || if checking.get() {
-                        view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
-                    } else {
-                        view! { <Icon name="refresh-cw"/> }.into_any()
-                    }}
-                    "Check for updates"
-                </button>
-            })>
+        <Card title="Version" description="The running build.">
             <dl class="dl">
                 <dt>"Current"</dt>
                 <dd class="cluster">
@@ -141,18 +91,11 @@ fn VersionCard(state: RwSignal<State>) -> impl IntoView {
                     {move || version.with(|v| v.is_canary).then(|| view! { <Badge variant="purple" text="Canary"/> })}
                     {move || version.with(|v| v.is_development).then(|| view! { <Badge variant="outline" text="Development"/> })}
                 </dd>
-                <dt>"Latest"</dt>
-                <dd class="mono">{move || version.with(|v| v.latest.clone().unwrap_or_else(|| "—".into()))}</dd>
-                <dt>"Status"</dt>
-                <dd>{status}</dd>
                 {move || version.with(|v| (v.full != v.current).then(|| v.full.clone())).map(|full| view! {
                     <dt>"Build"</dt>
                     <dd class="mono text-sm">{full}</dd>
                 })}
             </dl>
-            {move || error.get().map(|message| view! {
-                <Alert variant="danger" class="system-info__error">{message}</Alert>
-            })}
         </Card>
     }
 }

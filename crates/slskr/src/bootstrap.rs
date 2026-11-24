@@ -269,7 +269,6 @@ pub(crate) fn router(app: &AppState) -> Router {
     let not_found = || async { http::error_response(StatusCode::NOT_FOUND, "") };
     // Compress JSON responses cheaply; the WebSocket is merged in after the layer.
     let compression = CompressionLayer::new()
-        .br(true)
         .gzip(true)
         .no_deflate()
         .no_zstd()

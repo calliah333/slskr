@@ -1,7 +1,5 @@
 //! Application, sign-in, server connection, configuration and settings endpoints.
 
-use std::time::Duration;
-
 use axum::{
     body::Bytes,
     extract::State,
@@ -31,7 +29,6 @@ pub fn routes() -> Routes {
         .post("/api/application/shutdown", shutdown)
         .post("/api/application/restart", restart)
         .get("/api/application/version", version)
-        .post("/api/application/version/check", check_version)
         .get("/api/auth", auth_info)
         .get("/api/session", check_session)
         .post("/api/session", login)
@@ -64,81 +61,6 @@ async fn restart(_: RequireAdminSession, State(app): State<AppState>) -> StatusC
 
 async fn version(_: Authenticated, State(app): State<AppState>) -> Json<VersionState> {
     Json(app.state.get().version)
-}
-
-/// Asks GitHub for the latest release and records the result in the application state.
-async fn check_version(
-    _: RequireReadWrite,
-    State(app): State<AppState>,
-) -> ApiResult<Json<VersionState>> {
-    let version = app.state.get().version;
-    if !version.is_development && !version.is_canary {
-        let (latest, available) = check_release(&version).await?;
-        app.state.update(move |state| {
-            state.version.latest = Some(latest);
-            state.version.is_update_available = Some(available);
-        });
-    }
-    Ok(Json(app.state.get().version))
-}
-
-async fn check_release(version: &VersionState) -> anyhow::Result<(String, bool)> {
-    use anyhow::{Context, ensure};
-
-    #[derive(Deserialize)]
-    struct Release {
-        tag_name: String,
-    }
-
-    // A build must identify its own upstream; a slskd release is not a slskr update.
-    let repository = env!("CARGO_PKG_REPOSITORY")
-        .strip_prefix("https://github.com/")
-        .context("No GitHub release repository declared for slskr")?
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
-    ensure!(
-        repository.split('/').count() == 2,
-        "Invalid GitHub release repository"
-    );
-    let release = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent(format!("slskr/{}", version.full))
-        .build()?
-        .get(format!(
-            "https://api.github.com/repos/{repository}/releases/latest"
-        ))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Release>()
-        .await?;
-    let latest = release.tag_name.trim_start_matches(['v', 'V']);
-    let available = release_number(latest)? > release_number(&version.current)?;
-    Ok((
-        if available {
-            latest.to_owned()
-        } else {
-            version.current.clone()
-        },
-        available,
-    ))
-}
-
-fn release_number(version: &str) -> anyhow::Result<[u32; 3]> {
-    use anyhow::{Context, ensure};
-    let mut parts = version.split('.');
-    let mut number = [0; 3];
-    for slot in &mut number {
-        *slot = parts
-            .next()
-            .context("Incomplete release version")?
-            .parse()?;
-    }
-    ensure!(
-        parts.next().is_none(),
-        "Unexpected release version component"
-    );
-    Ok(number)
 }
 
 async fn auth_info(State(app): State<AppState>) -> Json<AuthInfo> {
