@@ -157,3 +157,47 @@ async fn in_memory_reader_is_the_same_database() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn existing_files_switch_to_incremental_vacuum_and_return_free_pages() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vacuum.db");
+    // A database written before incremental vacuum, with 4 MB of rows.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE item (value BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+             INSERT INTO item SELECT zeroblob(4096) FROM n;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    let db = Database::open(&path, &["CREATE TABLE item (value BLOB);"]).unwrap();
+    let pragma = |name: &'static str| {
+        let db = db.clone();
+        async move {
+            db.call(move |connection| {
+                connection.pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+            })
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(pragma("auto_vacuum").await, 2);
+    assert_eq!(
+        db.call(|connection| connection
+            .query_row("SELECT count(*) FROM item", [], |row| row.get::<_, i64>(0)))
+            .await
+            .unwrap(),
+        1000,
+        "VACUUM keeps the rows"
+    );
+
+    db.call(|connection| connection.execute("DELETE FROM item", []))
+        .await
+        .unwrap();
+    assert!(pragma("freelist_count").await > 900);
+    db.maintain_now().await.unwrap();
+    assert_eq!(pragma("freelist_count").await, 0);
+    assert!(pragma("page_count").await < 50);
+}
