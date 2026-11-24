@@ -34,6 +34,8 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
      CREATE INDEX ix_transfers_report_errors_end ON transfers(direction, ended_at)
          WHERE (state & ~48) != 0 AND ended_at IS NOT NULL;",
     include_str!("migrations/chart.sql"),
+    // Lets `MIN(requested_at)` (the reports' earliest date) read one index entry.
+    "CREATE INDEX ix_transfers_requested_at ON transfers(requested_at);",
 ];
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
