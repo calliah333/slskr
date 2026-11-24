@@ -9,11 +9,11 @@ use slskr_types::setup::{
 };
 
 use crate::{
-    components::{app::AuthLayout, directory_picker::DirectoryPicker},
+    components::{app::AuthLayout, directory_picker::FolderList},
     services::{api, forms},
     ui::{
         Icon, Loading,
-        form::{Field, FormMessage, ListEditor, PasswordInput, TextInput, focus_first_invalid},
+        form::{Field, FormMessage, PasswordInput, TextInput, focus_first_invalid},
     },
 };
 
@@ -50,6 +50,16 @@ impl Step {
         }
     }
 
+    fn description(self) -> &'static str {
+        match self {
+            Step::Welcome => "slskr is almost ready to use.",
+            Step::Web => "You sign in to this web UI with these.",
+            Step::Soulseek => "Optional: the account slskr uses on the Soulseek network.",
+            Step::Shares => "Optional: folders other users can browse and download from.",
+            Step::Review => "Check your choices, then finish. Everything can be changed later.",
+        }
+    }
+
     fn index(self) -> usize {
         Step::ALL.iter().position(|s| *s == self).unwrap_or(0)
     }
@@ -78,8 +88,8 @@ impl Step {
     }
 }
 
-/// A friendly sentence for a failed Soulseek login test.
-fn login_test_message(result: &LoginTestResult) -> String {
+/// A friendly sentence for a Soulseek login test.
+pub(crate) fn login_test_message(result: &LoginTestResult) -> String {
     let detail = result.message.clone().unwrap_or_default();
     match result.reason {
         None => "Logged in to Soulseek.".to_owned(),
@@ -106,6 +116,22 @@ fn login_test_message(result: &LoginTestResult) -> String {
         }
         Some(LoginTestFailure::Timeout) => "The Soulseek server did not answer in time.".to_owned(),
         Some(LoginTestFailure::Error) => format!("The login test failed: {detail}"),
+    }
+}
+
+/// Runs `POST /api/soulseek/test-login` and turns every outcome into `(ok, message)`.
+pub(crate) async fn test_login(credentials: Credentials) -> (bool, String) {
+    match api::post::<_, LoginTestResult>("/soulseek/test-login", &credentials).await {
+        Ok(result) => (result.ok, login_test_message(&result)),
+        Err(error) if error.status == 429 => (
+            false,
+            "Another login test is running; try again in a moment.".to_owned(),
+        ),
+        Err(error) if error.status == 409 => (
+            false,
+            format!("Can not test the login now: {}", error.message),
+        ),
+        Err(error) => (false, error.message),
     }
 }
 
@@ -148,10 +174,10 @@ pub fn SetupWizard(on_done: Callback<()>) -> impl IntoView {
     });
     view! {
         <AuthLayout wide=true>
-            <div class="setup stack">
-                <div>
-                    <h1 class="page-header__title setup-title">"Set up slskr"</h1>
-                    <p class="page-header__description">"A few steps and slskr is ready to use."</p>
+            <div class="setup stack stack--lg">
+                <div class="setup-intro">
+                    <h1 class="setup-title">"Set up slskr"</h1>
+                    <p class="muted">"A few steps and slskr is ready to use."</p>
                 </div>
                 {move || load_error.get().map(|message| view! {
                     <FormMessage kind="danger"><p>{"Could not load the setup status: "}{message}</p></FormMessage>
@@ -182,7 +208,6 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
     let test_result = RwSignal::new(None::<(bool, String)>);
     let testing = RwSignal::new(false);
     let shares = RwSignal::new(Vec::<String>::new());
-    let picking = RwSignal::new(false);
     let heading = NodeRef::<leptos::html::H2>::new();
 
     let error_of =
@@ -390,7 +415,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
         }
     };
 
-    let test_login = move |_| {
+    let test = move |_| {
         if !validate(Step::Soulseek) || !soulseek_given() {
             if !soulseek_given() {
                 set_errors(vec![(
@@ -407,20 +432,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
         testing.set(true);
         test_result.set(None);
         spawn_local_scoped_with_cancellation(async move {
-            let result =
-                api::post::<_, LoginTestResult>("/soulseek/test-login", &credentials).await;
-            test_result.set(Some(match result {
-                Ok(result) => (result.ok, login_test_message(&result)),
-                Err(error) if error.status == 429 => (
-                    false,
-                    "Another login test is running; try again in a moment.".to_owned(),
-                ),
-                Err(error) if error.status == 409 => (
-                    false,
-                    format!("Can not test the login now: {}", error.message),
-                ),
-                Err(error) => (false, error.message),
-            }));
+            test_result.set(Some(test_login(credentials).await));
             testing.set(false);
         });
     };
@@ -429,37 +441,45 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
         let current = step.get();
         let body = match current {
             Step::Welcome => view! {
-                <p>"slskr is almost ready. Set up a web sign-in, optionally connect your Soulseek account and choose folders to share. Everything can be changed later in Settings."</p>
+                <ul class="setup-overview">
+                    <li><span class="setup-overview__icon"><Icon name="lock"/></span>
+                        <div><p class="font-medium">"A web sign-in"</p><p class="help">"So only you can use this UI."</p></div></li>
+                    <li><span class="setup-overview__icon"><Icon name="plug"/></span>
+                        <div><p class="font-medium">"Your Soulseek account"</p><p class="help">"Optional; connect later in Settings."</p></div></li>
+                    <li><span class="setup-overview__icon"><Icon name="folder-open"/></span>
+                        <div><p class="font-medium">"Folders to share"</p><p class="help">"Optional; add more at any time."</p></div></li>
+                </ul>
                 {status.code_required.then(|| view! {
                     <Field id="setup-code" label="Setup code" error=error_of("code")
                         help="This browser is not on the slskr machine, so prove you can read its log: the code is printed in the daemon log (with Docker: docker compose logs slskr).">
                         <TextInput value=code on_input=move |t: String| { code.set(t); clear_error("code"); }
-                            placeholder="XXXX-XXXX-XXXX" autocomplete="one-time-code" name="code"/>
+                            placeholder="XXXX-XXXX-XXXX" autocomplete="one-time-code" name="code" mono=true/>
                     </Field>
                 })}
             }.into_any(),
             Step::Web => {
                 let username_lock = Signal::derive(move || status.web_username_pinned
-                    .then(|| "Set in slskr.toml or environment (web.username)".to_owned()));
+                    .then(|| "Set in slskr.toml or SLSKR_WEB_USERNAME (web.username)".to_owned()));
                 let password_lock = Signal::derive(move || status.web_password_pinned
-                    .then(|| "Set in slskr.toml or environment (web.password)".to_owned()));
+                    .then(|| "Set in slskr.toml or SLSKR_WEB_PASSWORD (web.password)".to_owned()));
                 view! {
-                    <p>"You sign in to this web UI with these."</p>
                     <Field id="setup-web-username" label="Username" error=error_of("web.username") locked_reason=username_lock>
                         <TextInput value=Signal::derive(move || if status.web_username_pinned { String::new() } else { web_username.get() })
                             placeholder=if status.web_username_pinned { "(configured)" } else { "" }
                             on_input=move |t: String| { web_username.set(t); clear_error("web.username"); }
                             autocomplete="username" name="username"/>
                     </Field>
-                    <Field id="setup-web-password" label="Password" error=error_of("web.password") locked_reason=password_lock
-                        help="At least 8 characters.">
-                        <PasswordInput value=web_password name="password"
-                            on_input=move |t: String| { web_password.set(t); clear_error("web.password"); }/>
-                    </Field>
-                    <Field id="setup-web-confirm" label="Repeat the password" error=error_of("web.confirm") locked_reason=password_lock>
-                        <PasswordInput value=web_confirm name="confirm"
-                            on_input=move |t: String| { web_confirm.set(t); clear_error("web.confirm"); }/>
-                    </Field>
+                    <div class="form-grid">
+                        <Field id="setup-web-password" label="Password" error=error_of("web.password") locked_reason=password_lock
+                            help="At least 8 characters.">
+                            <PasswordInput value=web_password name="password"
+                                on_input=move |t: String| { web_password.set(t); clear_error("web.password"); }/>
+                        </Field>
+                        <Field id="setup-web-confirm" label="Repeat the password" error=error_of("web.confirm") locked_reason=password_lock>
+                            <PasswordInput value=web_confirm name="confirm"
+                                on_input=move |t: String| { web_confirm.set(t); clear_error("web.confirm"); }/>
+                        </Field>
+                    </div>
                 }.into_any()
             }
             Step::Soulseek if status.soulseek_pinned => view! {
@@ -468,19 +488,20 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                 </FormMessage>
             }.into_any(),
             Step::Soulseek => view! {
-                <p>"Optional: the account slskr uses on the Soulseek network. You can skip this and connect later in Settings."</p>
-                <Field id="setup-soulseek-username" label="Soulseek username" error=error_of("soulseek.username")
-                    help="If the username isn't registered yet, logging in creates it.">
-                    <TextInput value=soulseek_username name="soulseek-username" autocomplete="off"
-                        on_input=move |t: String| { soulseek_username.set(t); clear_error("soulseek.username"); test_result.set(None); }/>
-                </Field>
-                <Field id="setup-soulseek-password" label="Soulseek password" error=error_of("soulseek.password")>
-                    <PasswordInput value=soulseek_password name="soulseek-password" autocomplete="off"
-                        on_input=move |t: String| { soulseek_password.set(t); clear_error("soulseek.password"); test_result.set(None); }/>
-                </Field>
-                <div class="form-actions">
-                    <button type="button" class="btn setup-test-login" disabled=testing
-                        aria-busy=move || testing.get().then_some("true") on:click=test_login>
+                <div class="form-grid">
+                    <Field id="setup-soulseek-username" label="Soulseek username" error=error_of("soulseek.username")
+                        help="If the username isn't registered yet, logging in creates it.">
+                        <TextInput value=soulseek_username name="soulseek-username" autocomplete="off"
+                            on_input=move |t: String| { soulseek_username.set(t); clear_error("soulseek.username"); test_result.set(None); }/>
+                    </Field>
+                    <Field id="setup-soulseek-password" label="Soulseek password" error=error_of("soulseek.password")>
+                        <PasswordInput value=soulseek_password name="soulseek-password" autocomplete="off"
+                            on_input=move |t: String| { soulseek_password.set(t); clear_error("soulseek.password"); test_result.set(None); }/>
+                    </Field>
+                </div>
+                <div class="setup-test">
+                    <button type="button" class="btn btn--sm setup-test-login" disabled=testing
+                        aria-busy=move || testing.get().then_some("true") on:click=test>
                         {move || if testing.get() {
                             view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
                         } else {
@@ -489,7 +510,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                         "Test login"
                     </button>
                     {move || test_result.get().map(|(ok, message)| view! {
-                        <span class=if ok { "badge badge--success setup-test-result" } else { "badge badge--danger setup-test-result" }
+                        <span class=if ok { "setup-test-result text-success" } else { "setup-test-result text-danger" }
                             role=if ok { "status" } else { "alert" }>
                             <Icon name=if ok { "circle-check" } else { "circle-x" }/>{message}
                         </span>
@@ -497,37 +518,49 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                 </div>
             }.into_any(),
             Step::Shares => view! {
-                <p>"Optional: folders other users can browse and download from. You can add more later."</p>
                 <Field id="setup-shares" label="Shared folders" error=error_of("shares")
-                    help="Absolute paths on the slskr machine. Choose with Browse or type a path.">
-                    <ListEditor items=shares placeholder="/path/to/music"
-                        on_change=Callback::new(move |items: Vec<String>| { shares.set(items); clear_error("shares"); })
-                        extra=ViewFn::from(move || view! {
-                            <button type="button" class="btn directory-browse" on:click=move |_| picking.set(true)>
-                                <Icon name="folder-open"/>"Browse…"
-                            </button>
-                        })/>
+                    help="Folders on the slskr machine. In the folder dialog you can also type a path.">
+                    <FolderList items=shares
+                        on_change=Callback::new(move |items: Vec<String>| { shares.set(items); clear_error("shares"); })/>
                 </Field>
             }.into_any(),
-            Step::Review => view! {
-                <dl class="setup-review">
-                    <dt>"Web sign-in"</dt>
-                    <dd>{if status.web_username_pinned { "the configured username".to_owned() } else { web_username.get_untracked().trim().to_owned() }}</dd>
-                    <dt>"Soulseek"</dt>
-                    <dd>{if status.soulseek_pinned {
-                        "set in slskr.toml or the environment".to_owned()
-                    } else if soulseek_given() {
-                        soulseek_username.get_untracked()
-                    } else {
-                        "not set up: connect later in Settings".to_owned()
-                    }}</dd>
-                    <dt>"Shares"</dt>
-                    <dd>{move || {
-                        let list = shares.get();
-                        if list.is_empty() { "none".to_owned() } else { list.join(", ") }
-                    }}</dd>
-                </dl>
-            }.into_any(),
+            Step::Review => {
+                let edit = move |target: Step| view! {
+                    <button type="button" class="btn btn--ghost btn--xs setup-edit"
+                        aria-label=format!("Change {}", target.title())
+                        on:click=move |_| { errors.set(BTreeMap::new()); step.set(target); }>
+                        <Icon name="pencil"/>"Change"
+                    </button>
+                };
+                view! {
+                    <dl class="setup-review">
+                        <div class="setup-review__row">
+                            <dt><Icon name="lock"/>"Web sign-in"</dt>
+                            <dd>{if status.web_username_pinned { "the configured username".to_owned() } else { web_username.get_untracked().trim().to_owned() }}</dd>
+                            {edit(Step::Web)}
+                        </div>
+                        <div class="setup-review__row">
+                            <dt><Icon name="plug"/>"Soulseek"</dt>
+                            <dd>{if status.soulseek_pinned {
+                                "set in slskr.toml or the environment".to_owned()
+                            } else if soulseek_given() {
+                                soulseek_username.get_untracked()
+                            } else {
+                                "not set up: connect later in Settings".to_owned()
+                            }}</dd>
+                            {edit(Step::Soulseek)}
+                        </div>
+                        <div class="setup-review__row">
+                            <dt><Icon name="folder-open"/>"Shares"</dt>
+                            <dd class="mono">{move || {
+                                let list = shares.get();
+                                if list.is_empty() { "none".to_owned() } else { list.join(", ") }
+                            }}</dd>
+                            {edit(Step::Shares)}
+                        </div>
+                    </dl>
+                }.into_any()
+            }
         };
         let optional = matches!(current, Step::Soulseek | Step::Shares)
             && !(current == Step::Soulseek && status.soulseek_pinned);
@@ -547,9 +580,13 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                 aria-labelledby="setup-step-title"
                 on:submit=move |event| { event.prevent_default(); advance(); }>
                 <div class="card__header">
-                    <h2 class="card__title" id="setup-step-title" tabindex="-1" node_ref=heading>{current.title()}</h2>
+                    <div>
+                        <p class="setup-step-count">{format!("Step {} of {}", current.index() + 1, Step::ALL.len())}</p>
+                        <h2 class="card__title" id="setup-step-title" tabindex="-1" node_ref=heading>{current.title()}</h2>
+                        <p class="card__description">{current.description()}</p>
+                    </div>
                 </div>
-                <div class="card__content">{body}</div>
+                <div class="card__content setup-step-body">{body}</div>
                 <div class="card__footer setup-actions">
                     {(current != Step::Welcome).then(|| view! {
                         <button type="button" class="btn btn--ghost setup-back" disabled=busy
@@ -557,8 +594,9 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                             <Icon name="arrow-left"/>"Back"
                         </button>
                     })}
+                    <span class="grow"></span>
                     {optional.then(|| view! {
-                        <button type="button" class="btn setup-skip" disabled=busy on:click=skip>"Skip"</button>
+                        <button type="button" class="btn btn--ghost setup-skip" disabled=busy on:click=skip>"Skip"</button>
                     })}
                     <button type="submit" class="btn btn--primary setup-next" disabled=busy
                         aria-busy=move || busy.get().then_some("true")>
@@ -577,28 +615,31 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
     };
 
     view! {
-        <ol class="setup-steps" aria-label="Setup progress">
+        <ol class="stepper setup-steps" aria-label="Setup progress">
             {Step::ALL.into_iter().map(|s| {
                 let state = move || {
                     let current = step.get();
-                    if s == current { "is-current" } else if s < current { "is-done" } else { "" }
+                    if s == current { "stepper__step is-current" } else if s < current { "stepper__step is-done" } else { "stepper__step" }
                 };
                 view! {
                     <li class=state aria-current=move || (step.get() == s).then_some("step")>
-                        <span class="title">{s.title()}</span>
+                        <span class="stepper__marker" aria-hidden="true">
+                            {move || if s < step.get() {
+                                view! { <Icon name="check" size="sm"/> }.into_any()
+                            } else {
+                                (s.index() + 1).to_string().into_any()
+                            }}
+                        </span>
+                        <span class="stepper__title title">{s.title()}</span>
                     </li>
                 }
             }).collect_view()}
         </ol>
-        <p class="visually-hidden" aria-live="polite">
+        <p class="sr-only" aria-live="polite">
             {move || format!("Step {} of {}: {}", step.get().index() + 1, Step::ALL.len(), step.get().title())}
         </p>
         {move || top_error.get().map(|message| view! { <FormMessage kind="danger"><p>{message}</p></FormMessage> })}
         {step_view}
-        <DirectoryPicker open=picking on_pick=Callback::new(move |path: String| {
-            shares.update(|list| if !list.contains(&path) { list.push(path) });
-            clear_error("shares");
-        })/>
     }
 }
 

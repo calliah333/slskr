@@ -183,3 +183,21 @@ pub async fn patch<B: Serialize + ?Sized, T: DeserializeOwned>(
 pub async fn delete<T: DeserializeOwned>(path: &str) -> Result<T, ApiError> {
     request(Method::DELETE, path, None).await
 }
+
+/// Enqueues every file of a peer's folder (and its subfolders when `recursive`), saved
+/// under `<downloads>/<last path component>/…` (`POST /transfers/downloads/folder`).
+pub async fn download_folder(
+    username: &str,
+    path: &str,
+    recursive: bool,
+) -> Result<slskr_types::transfers::EnqueuedDownloads, ApiError> {
+    post(
+        "/transfers/downloads/folder",
+        &slskr_types::transfers::EnqueueFolder {
+            username: username.to_owned(),
+            path: path.to_owned(),
+            recursive,
+        },
+    )
+    .await
+}

@@ -1,331 +1,593 @@
-use std::{collections::BTreeSet, time::Duration};
+//! A user's card (collapsible header, directory sections, file rows) and the details
+//! dialog. Every row reads only its own transfer signal (see the module docs of
+//! `transfers`).
 
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use chrono::{DateTime, Utc};
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use slskr_types::transfers::{QueuePosition, Transfer, TransferDirection, TransferState as State};
 
-use crate::services::{api, util};
+use crate::{
+    services::{api, util},
+    ui::{Avatar, Badge, Button, DropdownMenu, Icon, Modal},
+};
 
-use super::{Change, Operation, UserResponse, transfer_url};
+use super::{Category, Entry, FileRef, Operation, Page, UserLayout, transfer_url};
 
-type Groups = RwSignal<Vec<UserResponse>>;
-type Selection = RwSignal<BTreeSet<String>>;
+static NEXT_GROUP: AtomicUsize = AtomicUsize::new(0);
 
-fn in_user<T>(
-    users: Groups,
-    user: StoredValue<String>,
-    f: impl FnOnce(Option<&UserResponse>) -> T,
-) -> T {
-    user.with_value(|name| users.with(|users| f(users.iter().find(|user| &user.username == name))))
+/// Selectable (not removed) ids of a set of files.
+fn selectable<'a>(files: impl IntoIterator<Item = &'a FileRef>) -> Vec<String> {
+    files
+        .into_iter()
+        .filter(|file| !file.removed)
+        .map(|file| file.id.clone())
+        .collect()
 }
 
-fn in_directory<T>(
-    users: Groups,
-    user: StoredValue<String>,
-    dir: StoredValue<String>,
-    f: impl FnOnce(&[Transfer]) -> T,
-) -> T {
-    in_user(users, user, |user| {
-        dir.with_value(|name| {
-            f(user
-                .and_then(|user| user.directories.iter().find(|dir| &dir.directory == name))
-                .map_or(&[], |dir| dir.files.as_slice()))
-        })
-    })
-}
-
+/// A header checkbox that selects or clears `ids`: checked when all are selected,
+/// indeterminate when some are.
 #[component]
-pub(super) fn TransferGroup(
-    username: String,
-    users: Groups,
-    direction: TransferDirection,
-    connected: Signal<bool>,
-    working: RwSignal<Option<Operation>>,
-    change: Change,
+fn SelectAll(
+    ids: Memo<Vec<String>>,
+    selected: RwSignal<HashSet<String>>,
+    label: String,
 ) -> impl IntoView {
-    let user = StoredValue::new(username.clone());
-    let selected = RwSignal::new(BTreeSet::new());
-    let folded = RwSignal::new(false);
-    let info = Memo::new(move |_| {
-        in_user(users, user, |user| {
+    let state = Memo::new(move |_| {
+        ids.with(|ids| {
             selected.with(|selected| {
-                let mut count = 0;
-                let mut any_cancel = false;
-                let mut all_retry = direction == TransferDirection::Download;
-                let mut all_remove = true;
-                for file in user
-                    .into_iter()
-                    .flat_map(|user| &user.directories)
-                    .flat_map(|dir| &dir.files)
-                    .filter(|file| !file.removed && selected.contains(&file.id))
-                {
-                    count += 1;
-                    any_cancel |= Operation::Cancel.allows(file);
-                    all_retry &= Operation::Retry.allows(file);
-                    all_remove &= Operation::Remove.allows(file);
-                }
-                (count, all_retry, any_cancel, all_remove)
+                let chosen = ids.iter().filter(|id| selected.contains(*id)).count();
+                (chosen, ids.len())
             })
         })
     });
-    let run = move |operation| {
-        let files = untrack(|| {
-            in_user(users, user, |user| {
-                selected.with(|selected| {
-                    user.into_iter()
-                        .flat_map(|user| &user.directories)
-                        .flat_map(|dir| &dir.files)
-                        .filter(|file| selected.contains(&file.id))
-                        .cloned()
-                        .collect()
+    view! {
+        <input type="checkbox" class="checkbox" aria-label=label
+            disabled=move || state.with(|(_, total)| *total == 0)
+            prop:checked=move || state.with(|(chosen, total)| *total > 0 && chosen == total)
+            prop:indeterminate=move || state.with(|(chosen, total)| *chosen > 0 && chosen < total)
+            on:change=move |event| {
+                let checked = event_target_checked(&event);
+                ids.with_untracked(|ids| selected.update(|selected| {
+                    for id in ids {
+                        if checked { selected.insert(id.clone()); } else { selected.remove(id); }
+                    }
+                }));
+            }/>
+    }
+}
+
+#[component]
+pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
+    let Page {
+        direction,
+        layout,
+        selected,
+        working,
+        connected,
+        change,
+        ..
+    } = page;
+    let name = StoredValue::new(username.clone());
+    let user = Memo::new(move |_| {
+        name.with_value(|name| {
+            layout.with(|layout| layout.iter().find(|user| &user.username == name).cloned())
+        })
+    });
+    let ids = Memo::new(move |_| {
+        user.with(|user| {
+            selectable(
+                user.iter()
+                    .flat_map(|user| &user.directories)
+                    .flat_map(|directory| &directory.files),
+            )
+        })
+    });
+    let folded = RwSignal::new(false);
+    let content_id = format!(
+        "transfer-group-{}",
+        NEXT_GROUP.fetch_add(1, Ordering::Relaxed)
+    );
+    let base = page.base();
+    let encoded = util::encode_uri_component(&username);
+    let user_href = format!("{base}/users?username={encoded}");
+    let browse_href = format!("{base}/browse?username={encoded}");
+    let busy = move || working.with(Option::is_some);
+    let has = move |operation: Operation, keep: fn(&Entry) -> bool| {
+        name.with_value(|name| {
+            page.index.with(|index| {
+                index.iter().any(|entry| {
+                    &entry.username == name && operation.allows(direction, entry) && keep(entry)
                 })
             })
-        });
+        })
+    };
+    let run = move |operation: Operation, keep: fn(&Entry) -> bool| {
+        let files = name.with_value(|name| page.targets(operation, Some(name), keep));
         change.run((operation, files));
     };
+    let is_download = direction == TransferDirection::Download;
+
     view! {
-        <div class="ui raised card transfer-card">
-            <div class="content">
-                <div class="header">
-                    <button type="button" class="ui mini basic icon button" aria-label="Fold transfer group" aria-expanded=move || !folded.get()
-                        on:click=move |_| folded.update(|folded| *folded = !*folded)>
-                        <i class=move || if folded.get() { "chevron right icon" } else { "chevron down icon" } aria-hidden="true"></i>
-                    </button>{username}
+        <section class="card transfer-group" class:is-folded=folded>
+            <div class="transfer-group__header">
+                <button type="button" class="btn btn--ghost btn--icon btn--sm transfer-group__toggle"
+                    aria-expanded=move || (!folded.get()).to_string() aria-controls=content_id.clone()
+                    aria-label=format!("Show {username}'s transfers") title="Collapse or expand"
+                    on:click=move |_| folded.update(|folded| *folded = !*folded)>
+                    <Icon name=Signal::derive(move || if folded.get() { "chevron-right".to_owned() } else { "chevron-down".to_owned() })/>
+                </button>
+                <Avatar name=username.clone() size="sm"/>
+                <div class="transfer-group__title">
+                    <a class="transfer-group__user" href=user_href.clone()>{username.clone()}</a>
+                    <span class="transfer-group__totals muted text-xs tabular">
+                        {move || user.with(|user| user.as_ref().map(totals))}
+                    </span>
                 </div>
-                <Show when=move || !folded.get()>
-                    <For each=move || in_user(users, user, |user| user.map(|user| user.directories.iter().map(|dir| dir.directory.clone()).collect::<Vec<_>>()).unwrap_or_default())
-                        key=String::clone children=move |directory: String| view! {
-                            <TransferDirectory directory user users direction connected selected working change/>
-                        }/>
-                </Show>
+                <div class="cluster transfer-group__badges">
+                    {move || user.with(|user| user.as_ref().map(group_badges))}
+                </div>
+                <div class="transfer-group__menu">
+                    <DropdownMenu label=format!("Actions for {username}") icon="ellipsis" variant="ghost" size="sm" align="end">
+                        {is_download.then(|| view! {
+                            <button type="button" class="menu__item" role="menuitem"
+                                disabled=move || busy() || !connected.get() || !has(Operation::Retry, |entry| entry.category() == Category::Failed)
+                                on:click=move |_| run(Operation::Retry, |entry| entry.category() == Category::Failed)>
+                                <Icon name="rotate-cw"/>"Retry failed"
+                            </button>
+                        })}
+                        <button type="button" class="menu__item menu__item--danger" role="menuitem"
+                            disabled=move || busy() || !has(Operation::Cancel, |_| true)
+                            on:click=move |_| run(Operation::Cancel, |_| true)>
+                            <Icon name="circle-x"/>"Cancel all"
+                        </button>
+                        <button type="button" class="menu__item" role="menuitem"
+                            disabled=move || busy() || !has(Operation::Remove, |_| true)
+                            on:click=move |_| run(Operation::Remove, |_| true)>
+                            <Icon name="trash-2"/>"Clear completed"
+                        </button>
+                        <div class="menu__separator"></div>
+                        <a class="menu__item" role="menuitem" href=browse_href.clone()>
+                            <Icon name="folder-open"/>"Browse files"
+                        </a>
+                        <a class="menu__item" role="menuitem" href=user_href.clone()>
+                            <Icon name="user"/>"User info"
+                        </a>
+                    </DropdownMenu>
+                </div>
             </div>
-            <Show when=move || info.with(|(count, ..)| *count != 0)>
-                <div class="extra content"><div class="ui buttons">
-                    <Show when=move || info.with(|(_, retry, _, _)| *retry)>
-                        <button type="button" class="ui green button" disabled=move || !connected.get() || working.with(Option::is_some)
-                            on:click=move |_| run(Operation::Retry)><i class="redo icon" aria-hidden="true"></i>"Retry Selected"</button>
-                    </Show>
-                    <Show when=move || info.with(|(_, _, cancel, _)| *cancel)>
-                        <button type="button" class="ui red button" disabled=move || working.with(Option::is_some)
-                            on:click=move |_| run(Operation::Cancel)><i class="x icon" aria-hidden="true"></i>"Cancel Selected"</button>
-                    </Show>
-                    <Show when=move || info.with(|(_, _, _, remove)| *remove)>
-                        <button type="button" class="ui button" disabled=move || working.with(Option::is_some)
-                            on:click=move |_| run(Operation::Remove)><i class="trash alternate icon" aria-hidden="true"></i>"Remove Selected"</button>
-                    </Show>
-                </div></div>
-            </Show>
-        </div>
+            <div class="table-wrap transfer-group__content" id=content_id hidden=folded>
+                <table class="table table--compact transfer-table">
+                    <thead><tr>
+                        <th class="check-col">
+                            <SelectAll ids selected label=format!("Select all transfers from {username}")/>
+                        </th>
+                        <th class="transfer-table__name">"File"</th>
+                        <th class="num transfer-table__size">"Size"</th>
+                        <th class="transfer-table__progress">"Progress"</th>
+                        <th class="transfer-table__status">"Status"</th>
+                        <th class="actions"><span class="sr-only">"Actions"</span></th>
+                    </tr></thead>
+                    <For each=move || user.with(|user| user.iter().flat_map(|user| &user.directories).map(|dir| dir.directory.clone()).collect::<Vec<_>>())
+                        key=String::clone children=move |directory: String| view! {
+                            <TransferDirectory directory user page/>
+                        }/>
+                </table>
+            </div>
+        </section>
     }
+}
+
+fn totals(user: &UserLayout) -> String {
+    let counts = user.counts;
+    let folders = user.directories.len();
+    format!(
+        "{} {} in {} {} · {}",
+        counts.files,
+        if counts.files == 1 { "file" } else { "files" },
+        folders,
+        if folders == 1 { "folder" } else { "folders" },
+        util::format_bytes(counts.bytes as f64)
+    )
+}
+
+fn group_badges(user: &UserLayout) -> impl IntoView + use<> {
+    let counts = user.counts;
+    let mut badges = Vec::new();
+    for (count, variant, label) in [
+        (counts.active, "primary", "active"),
+        (counts.queued, "warning", "queued"),
+        (counts.failed, "danger", "failed"),
+    ] {
+        if count > 0 {
+            badges.push(view! { <Badge variant=variant text=format!("{count} {label}")/> });
+        }
+    }
+    badges.collect_view()
 }
 
 #[component]
 fn TransferDirectory(
     directory: String,
-    user: StoredValue<String>,
-    users: Groups,
-    direction: TransferDirection,
-    connected: Signal<bool>,
-    selected: Selection,
-    working: RwSignal<Option<Operation>>,
-    change: Change,
+    user: Memo<Option<UserLayout>>,
+    page: Page,
 ) -> impl IntoView {
     let title = if directory.is_empty() {
-        "(root)".into()
+        "(root)".to_owned()
     } else {
         directory.clone()
     };
     let dir = StoredValue::new(directory);
-    let folded = RwSignal::new(false);
-    let ids = Memo::new(move |_| {
-        in_directory(users, user, dir, |files| {
-            let mut ordered = files.iter().collect::<Vec<_>>();
-            ordered.sort_unstable_by(|a, b| {
-                util::get_file_name(&a.filename)
-                    .cmp(util::get_file_name(&b.filename))
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            ordered
-                .into_iter()
-                .map(|file| file.id.clone())
-                .collect::<Vec<_>>()
+    let files = Memo::new(move |_| {
+        dir.with_value(|dir| {
+            user.with(|user| {
+                user.iter()
+                    .flat_map(|user| &user.directories)
+                    .find(|directory| &directory.directory == dir)
+                    .map(|directory| directory.files.clone())
+                    .unwrap_or_default()
+            })
         })
     });
+    let ids = Memo::new(move |_| files.with(|files| selectable(files)));
+    let folded = RwSignal::new(false);
+    let short = util::get_file_name(&title).to_owned();
     view! {
-        <div>
-            <h4 class="ui small header filelist-header">
-                <button type="button" class="ui mini basic icon button" aria-label="Fold directory" aria-expanded=move || !folded.get()
-                    on:click=move |_| folded.update(|folded| *folded = !*folded)>
-                    <i class=move || if folded.get() { "folder icon" } else { "folder open icon" } aria-hidden="true"></i>
-                </button>{title}
-            </h4>
+        <tbody class="transfer-dir" class:is-folded=folded>
+            <tr class="transfer-dir__row">
+                <td class="check-col">
+                    <SelectAll ids selected=page.selected label=format!("Select all transfers in {short}")/>
+                </td>
+                <td colspan="5">
+                    <button type="button" class="transfer-dir__toggle"
+                        aria-expanded=move || (!folded.get()).to_string()
+                        on:click=move |_| folded.update(|folded| *folded = !*folded)>
+                        <Icon name=Signal::derive(move || if folded.get() { "folder".to_owned() } else { "folder-open".to_owned() }) class="transfer-dir__icon"/>
+                        <span class="transfer-dir__path truncate" title=title.clone()>{title.clone()}</span>
+                        <span class="transfer-dir__count muted text-xs tabular">
+                            {move || files.with(|files| {
+                                let n = files.len();
+                                format!("{n} {}", if n == 1 { "file" } else { "files" })
+                            })}
+                        </span>
+                    </button>
+                </td>
+            </tr>
             <Show when=move || !folded.get()>
-                <table class="ui table">
-                    <thead><tr>
-                        <th class="transferlist-selector"><input type="checkbox" aria-label="Select all transfers in directory"
-                            disabled=move || !in_directory(users, user, dir, |files| files.iter().any(|file| !file.removed))
-                            prop:checked=move || in_directory(users, user, dir, |files| selected.with(|selected| {
-                                files.iter().any(|file| !file.removed) && files.iter().filter(|file| !file.removed).all(|file| selected.contains(&file.id))
-                            }))
-                            on:change=move |event| {
-                                let checked = event_target_checked(&event);
-                                untrack(|| in_directory(users, user, dir, |files| selected.update(|selected| {
-                                    for file in files.iter().filter(|file| !file.removed) {
-                                        if checked { selected.insert(file.id.clone()); } else { selected.remove(&file.id); }
-                                    }
-                                })));
-                            }/>
-                        </th>
-                        <th class="transferlist-filename">"File"</th>
-                        <th class="transferlist-progress">"Progress"</th>
-                        <th class="transferlist-size">"Size"</th>
-                        <th class="transferlist-detail"><i class="small info circle icon" title="Details"></i></th>
-                    </tr></thead>
-                    <tbody>
-                        <For each=move || ids.get() key=String::clone children=move |id: String| {
-                            let id = StoredValue::new(id);
-                            let file = Memo::new(move |_| in_directory(users, user, dir, |files| {
-                                id.with_value(|id| files.iter().find(|file| &file.id == id).cloned())
-                            }));
-                            view! { <TransferRow id file direction connected selected working change/> }
-                        }/>
-                    </tbody>
-                </table>
+                <For each=move || files.with(|files| files.iter().map(|file| file.id.clone()).collect::<Vec<_>>())
+                    key=String::clone children=move |id: String| view! { <TransferRow id page/> }/>
             </Show>
-        </div>
+        </tbody>
+    }
+}
+
+/// What the progress cell shows; the cell is rebuilt only when this changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Connecting,
+    Transferring,
+    Waiting,
+    Finished,
+}
+
+fn phase(state: State) -> Phase {
+    match state {
+        State::Initializing => Phase::Connecting,
+        State::InProgress => Phase::Transferring,
+        State::Requested | State::QueuedLocally | State::QueuedRemotely => Phase::Waiting,
+        _ => Phase::Finished,
+    }
+}
+
+/// `(variant, icon)` of a state badge.
+pub(super) fn state_badge(state: State) -> (&'static str, &'static str) {
+    match Category::of(state) {
+        Category::Active if state == State::Requested => ("neutral", "clock"),
+        Category::Active => ("primary", "activity"),
+        Category::Queued => ("warning", "clock"),
+        Category::Succeeded => ("success", "circle-check"),
+        Category::Cancelled => ("outline", "ban"),
+        Category::Failed => ("danger", "circle-alert"),
+    }
+}
+
+fn file_icon(filename: &str) -> &'static str {
+    let extension = filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "mp3" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wav" | "aiff" | "aif" | "alac"
+        | "wma" | "ape" | "wv" => "file-audio",
+        "txt" | "nfo" | "log" | "cue" | "md" | "pdf" => "file-text",
+        _ => "file",
     }
 }
 
 #[component]
-fn TransferRow(
-    id: StoredValue<String>,
-    file: Memo<Option<Transfer>>,
-    direction: TransferDirection,
-    connected: Signal<bool>,
-    selected: Selection,
-    working: RwSignal<Option<Operation>>,
-    change: Change,
-) -> impl IntoView {
-    let open = RwSignal::new(false);
-    let position = RwSignal::new(None::<i64>);
+fn TransferRow(id: String, page: Page) -> impl IntoView {
+    let Some(signal) = page.rows.with_value(|rows| rows.get(&id).cloned()) else {
+        return ().into_any();
+    };
+    let Page {
+        direction,
+        selected,
+        working,
+        connected,
+        change,
+        details,
+        now,
+        ..
+    } = page;
+    // An arena handle owned by this row: the row keeps its signal while it is mounted.
+    let file = RwSignal::from(signal);
+    let id = StoredValue::new(id);
+    let (path, name) = file.with_untracked(|file| {
+        (
+            file.filename.clone(),
+            util::get_file_name(&file.filename).to_owned(),
+        )
+    });
+    let icon = file_icon(&name);
+    let state = Memo::new(move |_| file.with(|file| file.state));
+    let removed = Memo::new(move |_| file.with(|file| file.removed));
+    let stage = Memo::new(move |_| phase(state.get()));
+    let is_selected =
+        Memo::new(move |_| id.with_value(|id| selected.with(|selected| selected.contains(id))));
+    let position = RwSignal::new(None::<u32>);
     let refreshing = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
-    let title = Memo::new(move |_| {
-        file.with(|file| {
-            file.as_ref()
-                .map(|file| util::get_file_name(&file.filename).to_owned())
-                .unwrap_or_default()
-        })
-    });
-    let state = Memo::new(move |_| file.with(|file| file.as_ref().map(|file| file.state)));
-    let active = Memo::new(move |_| state.get() == Some(State::InProgress));
-    let queued = Memo::new(move |_| state.get().is_some_and(State::is_queued));
-    let can_retry = move || {
-        file.with(|file| {
-            file.as_ref()
-                .is_some_and(|file| Operation::Retry.allows(file))
-        })
-    };
     let is_download = direction == TransferDirection::Download;
-    let removed = move || file.with(|file| file.as_ref().is_none_or(|file| file.removed));
-    let interactive = move || is_download && !removed() && (queued.get() || can_retry());
-    let click = move |_| {
-        if refreshing.get_untracked()
-            || working.with_untracked(Option::is_some)
-            || !connected.get_untracked()
-        {
-            return;
-        }
-        let Some(file) = file.get_untracked() else {
-            return;
-        };
-        if is_download && !file.removed && file.state.is_queued() {
-            refreshing.set(true);
-            error.set(None);
-            spawn_local_scoped_with_cancellation(async move {
-                let url = format!("{}/position", transfer_url(direction, &file.id));
-                match api::get::<QueuePosition>(&url).await {
-                    Ok(place) => position.set(Some(i64::from(place.place_in_queue))),
-                    Err(err) => error.set(Some(err.to_string())),
-                }
-                refreshing.set(false);
-            });
-        } else if Operation::Retry.allows(&file) {
-            change.run((Operation::Retry, vec![file]));
-        }
+    let actions = Memo::new(move |_| {
+        let (state, removed) = (state.get(), removed.get());
+        (
+            Operation::Retry.permits(direction, state, removed),
+            Operation::Cancel.permits(direction, state, removed),
+            Operation::Remove.permits(direction, state, removed),
+            is_download && !removed && state.is_queued(),
+            is_download && !removed && state == State::Succeeded,
+        )
+    });
+    let busy = Signal::derive(move || working.with(Option::is_some));
+    let act = move |operation: Operation| {
+        let entry = file.with_untracked(Entry::new);
+        change.run((operation, vec![entry]));
     };
+    // The request belongs to the row, not to the button (rebuilt when the state changes).
+    let owner = StoredValue::new(Owner::current().expect("the row has an owner"));
+    let refresh_position = move || {
+        if refreshing.get_untracked() || !connected.get_untracked() {
+            return;
+        }
+        refreshing.set(true);
+        error.set(None);
+        let url = format!(
+            "{}/position",
+            id.with_value(|id| transfer_url(direction, id))
+        );
+        owner.with_value(|owner| {
+            owner.with(|| {
+                spawn_local_scoped_with_cancellation(async move {
+                    match api::get::<QueuePosition>(&url).await {
+                        Ok(place) => position.set(Some(place.place_in_queue)),
+                        Err(err) => error.set(Some(err.to_string())),
+                    }
+                    refreshing.set(false);
+                });
+            });
+        });
+    };
+    let base = page.base();
+    let reveal_href = format!("{base}/system/files/downloads");
+
+    let size = move || {
+        file.with(|file| {
+            if matches!(stage.get(), Phase::Transferring) {
+                bytes_transferred(file)
+            } else {
+                util::format_bytes(file.size as f64)
+            }
+        })
+    };
+    let progress = move || {
+        match stage.get() {
+        Phase::Transferring => {
+            let percent = Memo::new(move |_| {
+                file.with(|file| file.percent_complete.round().clamp(0.0, 100.0) as u32)
+            });
+            view! {
+                <div class="transfer-progress">
+                    <div class="progress" role="progressbar" aria-label="Transfer progress"
+                        aria-valuemin="0" aria-valuemax="100" aria-valuenow=move || percent.get()>
+                        <div class="progress__bar" style:width=move || format!("{}%", percent.get())></div>
+                    </div>
+                    <div class="transfer-progress__meta tabular">
+                        <span class="font-medium">{move || format!("{}%", percent.get())}</span>
+                        <span>{move || file.with(|file| util::format_speed(file.average_speed))}</span>
+                        <span>{move || file.with(|file| file.remaining_ms.map(|ms| format!("{} left", short_duration(ms))))}</span>
+                    </div>
+                </div>
+            }
+            .into_any()
+        }
+        Phase::Connecting => view! {
+            <div class="transfer-progress">
+                <div class="progress progress--indeterminate" role="progressbar" aria-label="Connecting">
+                    <div class="progress__bar"></div>
+                </div>
+                <div class="transfer-progress__meta"><span>"Connecting to the peer…"</span></div>
+            </div>
+        }
+        .into_any(),
+        Phase::Waiting => view! {
+            <span class="transfer-note muted text-xs">
+                {move || file.with(|file| waiting_note(file, position.get(), now.get()))}
+            </span>
+        }
+        .into_any(),
+        Phase::Finished => view! {
+            <span class="transfer-note text-xs" class:text-danger=move || state.get().is_failed() && state.get() != State::Cancelled
+                class:muted=move || !state.get().is_failed() || state.get() == State::Cancelled
+                title=move || file.with(finished_title)>
+                {move || file.with(|file| finished_note(file, now.get()))}
+            </span>
+        }
+        .into_any(),
+    }
+    };
+
     view! {
-        <tr>
-            <td class="transferlist-selector"><input type="checkbox" aria-label=move || format!("Select {}", title.get())
-                disabled=removed prop:checked=move || !removed() && selected.with(|selected| id.with_value(|id| selected.contains(id)))
-                on:change=move |event| selected.update(|selected| {
-                    if event_target_checked(&event) { selected.insert(id.get_value()); }
-                    else { id.with_value(|id| selected.remove(id)); }
-                })/>
+        <tr class="transfer-row" class:is-selected=is_selected class:is-removed=removed
+            data-state=move || state.get().as_str()>
+            <td class="check-col">
+                <input type="checkbox" class="checkbox" aria-label=format!("Select {name}")
+                    disabled=removed prop:checked=move || is_selected.get() && !removed.get()
+                    on:change=move |event| {
+                        let checked = event_target_checked(&event);
+                        selected.update(|selected| {
+                            if checked { selected.insert(id.get_value()); }
+                            else { id.with_value(|id| selected.remove(id)); }
+                        });
+                    }/>
             </td>
-            <td class="transferlist-filename">{move || title.get()} {move || removed().then_some(" (removed)")}</td>
-            <td class="transferlist-progress">
-                <Show when=move || active.get() fallback=move || view! {
-                    <button type="button" class=move || file.with(|file| state_button(file.as_ref()))
-                        class:loading=refreshing disabled=move || !interactive() || !connected.get() || refreshing.get() || working.with(Option::is_some)
-                        title=move || if interactive() && queued.get() { "Refresh queue position" } else if interactive() { "Retry download" } else { "Transfer state" }
-                        on:click=click>
-                        {move || interactive().then(|| view! { <i class=if queued.get() { "refresh icon" } else { "redo icon" } aria-hidden="true"></i> })}
-                        {move || file.with(|file| file.as_ref().map(|file| {
-                            let mut label = file.state.label().to_owned();
-                            let position = if file.state.is_queued() { file.place_in_queue.map(i64::from).or_else(|| position.get()) } else { None };
-                            if let Some(position) = position.filter(|&position| position > 0) { label.push_str(&format!(" (#{position})")); }
-                            if file.attempts > 1 { label.push_str(&format!(" (Retry #{})", file.attempts)); }
-                            label
-                        }))}
-                    </button>
-                }>
-                    <div class="ui active blue progress" style="margin:0" role="progressbar" aria-label="Transfer progress"
-                        aria-valuemin="0" aria-valuemax="100" aria-valuenow=move || percent(file)>
-                        <div class="bar" style:width=move || format!("{}%", percent(file))><div class="progress">{move || format!("{}%", percent(file))}</div></div>
-                    </div>
-                </Show>
-                {move || error.get().map(|error| view! { <small role="alert">{error}</small> })}
+            <td class="transfer-table__name">
+                <div class="transfer-name">
+                    <Icon name=icon class="transfer-name__icon"/>
+                    <span class="truncate" title=path>{name.clone()}</span>
+                    {move || removed.get().then(|| view! { <Badge variant="outline" text="Removed"/> })}
+                </div>
+                {move || error.get().map(|error| view! { <div class="text-xs text-danger" role="alert">{error}</div> })}
             </td>
-            <td class="transferlist-size">{move || file.with(|file| file.as_ref().map(bytes_transferred))}</td>
-            <td class="transferlist-detail" style="position:relative">
-                <button type="button" class="ui mini basic icon button" aria-label="Transfer details" aria-expanded=open
-                    on:click=move |_| open.update(|open| *open = !*open)><i class="small grey info circle icon" aria-hidden="true"></i></button>
-                <Show when=move || open.get()>
-                    <div class="ui flowing left center popup visible" style="right:100%;left:auto;top:0;max-width:600px;z-index:3">
-                        {move || file.with(|file| file.as_ref().map(transfer_details))}
-                    </div>
-                </Show>
+            <td class="num transfer-table__size">{size}</td>
+            <td class="transfer-table__progress">{progress}</td>
+            <td class="transfer-table__status">
+                {move || {
+                    let state = state.get();
+                    let (variant, icon) = state_badge(state);
+                    view! { <Badge variant=variant icon=icon text=state.label() class="transfer-state"/> }
+                }}
+            </td>
+            <td class="actions">
+                <div class="transfer-actions">
+                    {move || {
+                        let (retry, cancel, remove, queue, reveal) = actions.get();
+                        view! {
+                            {queue.then(|| view! {
+                                <Button variant="action" icon="refresh-cw" label="Refresh queue position"
+                                    loading=refreshing disabled=Signal::derive(move || !connected.get())
+                                    on_click=Callback::new(move |_| refresh_position())/>
+                            })}
+                            {retry.then(|| view! {
+                                <Button variant="action" icon="rotate-cw" label="Retry download"
+                                    disabled=Signal::derive(move || busy.get() || !connected.get())
+                                    on_click=Callback::new(move |_| act(Operation::Retry))/>
+                            })}
+                            {cancel.then(|| view! {
+                                <Button variant="action" icon="circle-x" label="Cancel transfer" class="is-danger"
+                                    disabled=busy on_click=Callback::new(move |_| act(Operation::Cancel))/>
+                            })}
+                            {reveal.then(|| view! {
+                                <Button variant="action" icon="folder-open" label="Show in the downloads folder"
+                                    href=reveal_href.clone()/>
+                            })}
+                            {remove.then(|| view! {
+                                <Button variant="action" icon="trash-2" label="Remove from list" class="is-danger"
+                                    disabled=busy on_click=Callback::new(move |_| act(Operation::Remove))/>
+                            })}
+                        }
+                    }}
+                    <Button variant="action" icon="info" label="Transfer details"
+                        on_click=Callback::new(move |_| details.set(Some(id.get_value())))/>
+                </div>
             </td>
         </tr>
     }
+    .into_any()
 }
 
-fn percent(file: Memo<Option<Transfer>>) -> u32 {
-    file.with(|file| {
-        file.as_ref().map_or(0, |file| {
-            file.percent_complete.round().clamp(0.0, 100.0) as u32
-        })
-    })
-}
-
-fn state_button(file: Option<&Transfer>) -> &'static str {
-    let Some(file) = file else {
-        return "ui fluid mini button";
+fn waiting_note(file: &Transfer, refreshed: Option<u32>, now: DateTime<Utc>) -> String {
+    let place = file.place_in_queue.or(refreshed).filter(|place| *place > 0);
+    let mut note = match (file.state, place) {
+        (_, Some(place)) => format!("#{place} in queue"),
+        (State::QueuedRemotely, None) => "Waiting in the peer's queue".to_owned(),
+        (State::QueuedLocally, None) => "Waiting for a free slot".to_owned(),
+        _ => format!("Requested {}", relative(file.requested_at, now)),
     };
-    let state = file.state;
-    if state.is_complete() {
-        if state == State::Succeeded {
-            "ui fluid mini green button"
-        } else {
-            "ui fluid mini red button"
-        }
-    } else if state == State::Initializing {
-        "ui fluid mini teal button"
-    } else if file.attempts > 1 {
-        "ui fluid mini yellow button"
-    } else {
-        "ui fluid mini button"
+    if file.attempts > 1 {
+        note.push_str(&format!(" · attempt {}", file.attempts));
     }
+    note
+}
+
+fn finished_note(file: &Transfer, now: DateTime<Utc>) -> String {
+    let when = file
+        .ended_at
+        .map(|ended| relative(ended, now))
+        .unwrap_or_default();
+    let mut note = match file.state {
+        State::Succeeded => format!("Finished {when}"),
+        State::Cancelled => format!("Cancelled {when}"),
+        _ => match &file.error {
+            Some(error) if !error.is_empty() => format!("{error} · {when}"),
+            _ => format!("{} {when}", file.state.label()),
+        },
+    };
+    if file.attempts > 1 {
+        note.push_str(&format!(" · attempt {}", file.attempts));
+    }
+    note.trim_end_matches([' ', '·']).to_owned()
+}
+
+fn finished_title(file: &Transfer) -> String {
+    let when = file
+        .ended_at
+        .map(|ended| date(Some(ended)))
+        .unwrap_or_default();
+    match &file.error {
+        Some(error) if !error.is_empty() => format!("{error}\n{when}"),
+        _ => when,
+    }
+}
+
+/// "just now", "5m ago", "2h ago", "3d ago" (or "in 5m" for future times).
+fn relative(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = (now - then).num_seconds();
+    let (amount, future) = (seconds.unsigned_abs(), seconds < 0);
+    if amount < 45 {
+        return "just now".to_owned();
+    }
+    let text = if amount < 3_600 {
+        format!("{}m", (amount / 60).max(1))
+    } else if amount < 86_400 {
+        format!("{}h", amount / 3_600)
+    } else {
+        format!("{}d", amount / 86_400)
+    };
+    if future {
+        format!("in {text}")
+    } else {
+        format!("{text} ago")
+    }
+}
+
+/// "45s", "3m 10s", "1h 5m".
+fn short_duration(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+fn date(value: Option<DateTime<Utc>>) -> String {
+    value.map_or_else(|| "—".into(), |date| util::format_date(&date.to_rfc3339()))
 }
 
 fn bytes_transferred(file: &Transfer) -> String {
@@ -337,55 +599,75 @@ fn bytes_transferred(file: &Transfer) -> String {
     } else {
         &transferred
     };
-    format!("{transferred}/{size} {unit}")
+    format!("{transferred} / {size} {unit}")
+}
+
+/// The details dialog for `Page::details`; it follows the live transfer.
+#[component]
+pub(super) fn DetailsDialog(page: Page) -> impl IntoView {
+    let details = page.details;
+    let file = Signal::derive(move || {
+        details
+            .get()
+            .and_then(|id| page.rows.with_value(|rows| rows.get(&id).cloned()))
+            .map(|signal| signal.get())
+    });
+    view! {
+        <Modal open=Signal::derive(move || details.with(Option::is_some)) size="lg"
+            on_close=Callback::new(move |()| details.set(None))
+            title="Transfer details">
+            {move || match file.get() {
+                Some(file) => transfer_details(&file).into_any(),
+                None => view! { <p class="muted">"This transfer is no longer listed."</p> }.into_any(),
+            }}
+        </Modal>
+    }
 }
 
 fn transfer_details(file: &Transfer) -> impl IntoView + use<> {
-    let date = |value: Option<chrono::DateTime<chrono::Utc>>| {
-        value.map_or_else(|| "—".into(), |date| util::format_date(&date.to_rfc3339()))
-    };
-    let time = |value: Option<u64>| {
-        value.map_or_else(
-            || "—".into(),
-            |ms| util::format_seconds(Duration::from_millis(ms).as_secs_f64()),
-        )
-    };
+    let time = |value: Option<u64>| value.map_or_else(|| "—".into(), short_duration);
+    let (variant, icon) = state_badge(file.state);
     let fields = [
-        ("ID", file.id.clone()),
         ("Username", file.username.clone()),
-        ("Direction", format!("{:?}", file.direction)),
         ("Filename", file.filename.clone()),
         ("Size", util::format_bytes(file.size as f64)),
-        ("State", file.state.label().to_owned()),
-        ("Requested At", date(Some(file.requested_at))),
-        ("Enqueued At", date(file.enqueued_at)),
-        ("Started At", date(file.started_at)),
-        ("Ended At", date(file.ended_at)),
+        ("Requested", date(Some(file.requested_at))),
+        ("Enqueued", date(file.enqueued_at)),
+        ("Started", date(file.started_at)),
+        ("Ended", date(file.ended_at)),
         (
-            "Bytes Transferred",
-            util::format_bytes(file.bytes_transferred as f64),
+            "Transferred",
+            format!(
+                "{} ({:.1}%)",
+                util::format_bytes(file.bytes_transferred as f64),
+                file.percent_complete
+            ),
         ),
+        ("Remaining", util::format_bytes(file.bytes_remaining as f64)),
+        ("Average speed", util::format_speed(file.average_speed)),
+        ("Elapsed", time(file.elapsed_ms)),
+        ("Time left", time(file.remaining_ms)),
         (
-            "Average Speed",
-            format!("{}/s", util::format_bytes(file.average_speed)),
+            "Place in queue",
+            file.place_in_queue
+                .map_or_else(|| "—".into(), |place| place.to_string()),
         ),
-        (
-            "Bytes Remaining",
-            util::format_bytes(file.bytes_remaining as f64),
-        ),
-        ("Elapsed Time", time(file.elapsed_ms)),
-        ("Percent Complete", format!("{:.2}%", file.percent_complete)),
-        ("Remaining Time", time(file.remaining_ms)),
         ("Attempts", file.attempts.to_string()),
-        ("Next Attempt At", date(file.next_attempt_at)),
-        (
-            "Exception",
-            file.error.clone().unwrap_or_else(|| "—".into()),
-        ),
+        ("Next attempt", date(file.next_attempt_at)),
+        ("Error", file.error.clone().unwrap_or_else(|| "—".into())),
+        ("ID", file.id.clone()),
     ];
     view! {
-        <table class="ui very basic compact small table">
-            <tbody>{fields.into_iter().map(|(field, value)| view! { <tr><th scope="row">{field}</th><td>{value}</td></tr> }).collect_view()}</tbody>
-        </table>
+        <div class="stack stack--sm transfer-details">
+            <div class="cluster">
+                <Badge variant=variant icon=icon text=file.state.label()/>
+                {file.removed.then(|| view! { <Badge variant="outline" text="Removed"/> })}
+            </div>
+            <dl class="dl">
+                {fields.into_iter().map(|(field, value)| view! {
+                    <dt>{field}</dt><dd class="break-all">{value}</dd>
+                }).collect_view()}
+            </dl>
+        </div>
     }
 }

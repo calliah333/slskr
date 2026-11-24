@@ -1,0 +1,162 @@
+/* ---------- page: transfers (downloads, uploads) ---------- */
+
+.transfers-header { margin-bottom: 0; }
+.transfers-summary:empty { display: none; }
+
+/* Toolbar: search grows, the state filter and the history switch wrap below it on phones. */
+.transfers-toolbar .toolbar { margin-bottom: 0; }
+.transfers-toolbar .input-icon { flex-basis: 16rem; }
+.transfers-filter { max-width: 100%; }
+.transfers-tab-count {
+  min-width: 1.25rem;
+  padding: 0 0.3125rem;
+  border-radius: var(--radius-full);
+  background: hsl(var(--muted-foreground) / 0.12);
+  color: hsl(var(--muted-foreground));
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.125rem;
+  text-align: center;
+}
+.transfers-filter .tabs__tab.is-active .transfers-tab-count {
+  background: hsl(var(--primary) / 0.12);
+  color: hsl(var(--primary));
+}
+.transfers-history { margin-left: auto; white-space: nowrap; }
+@media (max-width: 639px) {
+  .transfers-toolbar .input-icon { flex-basis: 100%; }
+  .transfers-history { margin-left: 0; }
+}
+
+.transfers-empty .empty-state { padding-block: var(--space-10); }
+
+/* While a bulk action runs, the page dims its controls a little. */
+.transfers--busy .transfer-group { opacity: 0.85; transition: opacity var(--duration); }
+
+/* ----- user group card ----- */
+.transfer-group { overflow: visible; }
+.transfer-group__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+}
+.transfer-group__toggle { margin-left: calc(var(--space-2) * -1); }
+.transfer-group__toggle .icon { transition: transform var(--duration); }
+.transfer-group__title { display: flex; flex-direction: column; min-width: 0; flex: 1 1 12rem; }
+.transfer-group__user {
+  font-weight: 600;
+  color: hsl(var(--foreground));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.transfer-group__user:hover { color: hsl(var(--primary)); }
+.transfer-group__badges:empty { display: none; }
+.transfer-group__menu { margin-left: auto; }
+.transfer-group > .table-wrap {
+  /* Contain absolutely positioned bits (sr-only labels) so they scroll with the table. */
+  position: relative;
+  border-width: 1px 0 0;
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+.transfer-group.is-folded .transfer-group__header { border-radius: var(--radius); }
+
+/* ----- the file table ----- */
+/* Fixed columns; below ~56rem the table scrolls inside its card and the name keeps 16rem. */
+.transfer-table { min-width: 56rem; table-layout: fixed; }
+.transfer-table .check-col { width: 2.5rem; }
+.transfer-table__name { width: auto; }
+.transfer-table__size { width: 8.5rem; }
+.transfer-table__progress { width: 13rem; }
+.transfer-table__status { width: 10rem; }
+.transfer-table th.actions,
+.transfer-table .actions { width: 8rem; }
+
+.transfer-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 0.125rem; }
+.transfer-actions .btn--action { width: 2rem; height: 2rem; padding: 0; }
+
+/* Directory sub-header rows. */
+.transfer-dir__row,
+.table tbody tr.transfer-dir__row:hover { background: hsl(var(--secondary) / 0.6); }
+.transfer-dir__row > td { padding-top: 0.375rem; padding-bottom: 0.375rem; }
+.transfer-dir__toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-width: 0;
+  padding: 0.125rem 0;
+  border: 0;
+  background: transparent;
+  color: hsl(var(--foreground));
+  font-size: 0.8125rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+.transfer-dir__toggle:hover .transfer-dir__path { text-decoration: underline; text-underline-offset: 2px; }
+.transfer-dir__icon { color: hsl(var(--warning)); flex-shrink: 0; }
+.transfer-dir__path { direction: rtl; text-align: left; unicode-bidi: plaintext; }
+.transfer-dir__count { margin-left: auto; flex-shrink: 0; font-weight: 400; }
+
+/* File rows. */
+.transfer-row > td { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+.transfer-table thead .check-col,
+.transfer-row .check-col,
+.transfer-dir__row .check-col { padding-left: var(--space-4); }
+.transfer-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+.transfer-name__icon { flex-shrink: 0; color: hsl(var(--muted-foreground)); }
+.transfer-name > .truncate { flex: 0 1 auto; }
+.transfer-name > .badge { flex-shrink: 0; }
+.transfer-row.is-removed .transfer-name > .truncate { color: hsl(var(--muted-foreground)); text-decoration: line-through; }
+.transfer-row.is-removed { opacity: 0.8; }
+
+.transfer-progress { display: flex; flex-direction: column; gap: 0.3125rem; min-width: 0; }
+.transfer-progress__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--space-2);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: hsl(var(--muted-foreground));
+}
+.transfer-progress__meta > span:empty { display: none; }
+.transfer-progress__meta > span + span::before { content: "·"; margin-right: var(--space-2); }
+.transfer-note {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.transfer-row .transfer-state { max-width: 100%; }
+
+/* ----- floating selection bar ----- */
+.transfers-selection {
+  position: fixed;
+  z-index: 80;
+  left: 0;
+  right: 0;
+  bottom: var(--space-4);
+  margin-inline: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  width: max-content;
+  max-width: calc(100% - 2rem);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  background: hsl(var(--popover));
+  color: hsl(var(--popover-foreground));
+  box-shadow: var(--shadow-lg);
+  animation: modal-in 200ms ease-out;
+}
+.transfers-selection__count { font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.transfers-selection__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+/* Leave room so the bar never covers the last rows. */
+.transfers:has(.transfers-selection) { padding-bottom: 4.5rem; }
+
+.transfer-details .dl { font-size: 0.8125rem; }

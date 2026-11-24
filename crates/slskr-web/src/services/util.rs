@@ -131,7 +131,7 @@ pub fn format_bytes_with(
     padding: usize,
     padding_character: char,
 ) -> String {
-    if !(bytes >= 1.0) {
+    if bytes.is_nan() || bytes < 1.0 {
         return "0 B".to_string();
     }
     let index = ((bytes.ln() / 1_024f64.ln()).floor() as usize).min(SIZES.len() - 1);
@@ -166,27 +166,6 @@ pub fn format_speed_with(bytes_per_second: f64, decimals: i32) -> String {
     )
 }
 
-/// JavaScript `Math.round` (ties toward positive infinity).
-fn js_round(value: f64) -> f64 {
-    let floor = value.floor();
-    if value - floor >= 0.5 {
-        floor + 1.0
-    } else {
-        floor
-    }
-}
-
-/// Formats a wait time: `"12s"` below a minute, otherwise minutes with one decimal (`"1.5m"`).
-pub fn format_wait(seconds: f64) -> String {
-    if seconds == 0.0 || seconds.is_nan() {
-        return "0s".to_string();
-    }
-    if seconds < 60.0 {
-        return format!("{}s", js_number_to_string(js_round(seconds)));
-    }
-    format!("{}m", to_fixed(seconds / 60.0, 1))
-}
-
 /// `new Date(date).toLocaleString()` in the browser's locale.
 pub fn format_date(date: &str) -> String {
     let value = js_sys::Date::new(&JsValue::from_str(date));
@@ -211,18 +190,6 @@ pub fn truncate(text: &str, max_length: usize) -> String {
 pub fn get_file_name(full_path: &str) -> &str {
     let name = full_path.rsplit('\\').next().unwrap_or(full_path);
     name.rsplit('/').next().unwrap_or(name)
-}
-
-/// Everything before the last `\` (then the last `/`), ignoring separators at index 0.
-pub fn get_directory_name(full_path: &str) -> &str {
-    let mut path = full_path;
-    if let Some(index) = path.rfind('\\').filter(|index| *index > 0) {
-        path = &path[..index];
-    }
-    if let Some(index) = path.rfind('/').filter(|index| *index > 0) {
-        path = &path[..index];
-    }
-    path
 }
 
 /// Formats audio attributes: `24/96kHz` for lossless, `320 Kbps` / `245 Kbps, VBR` for lossy.
@@ -360,12 +327,9 @@ mod tests {
     }
 
     #[test]
-    fn formats_speed_and_wait() {
+    fn formats_speed() {
         assert_eq!(format_speed(0.0), "0 B/s");
         assert_eq!(format_speed(1_536.0), "1.5 KB/s");
-        assert_eq!(format_wait(0.0), "0s");
-        assert_eq!(format_wait(12.5), "13s");
-        assert_eq!(format_wait(90.0), "1.5m");
     }
 
     #[test]
@@ -379,9 +343,6 @@ mod tests {
     fn splits_paths() {
         assert_eq!(get_file_name("@@a\\b\\c.mp3"), "c.mp3");
         assert_eq!(get_file_name("a/b/c.mp3"), "c.mp3");
-        assert_eq!(get_directory_name("@@a\\b\\c.mp3"), "@@a\\b");
-        assert_eq!(get_directory_name("a/b/c.mp3"), "a/b");
-        assert_eq!(get_directory_name("\\c.mp3"), "\\c.mp3");
     }
 
     #[test]

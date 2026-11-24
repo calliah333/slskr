@@ -1,11 +1,20 @@
+pub mod actions;
 pub mod selection;
 pub mod tree;
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
+use self::actions::BrowseActions;
 use self::selection::Selection;
-use self::tree::{DirectoryTree, TreeNode, build_tree, detect_separator};
-use crate::services::{api, util};
+use self::tree::{DirectoryTree, Shares, build_tree, detect_separator};
+use crate::{
+    config,
+    services::{api, util},
+    ui::{
+        Alert, Avatar, Button, Card, ContextMenu, ContextMenuState, EmptyState, Icon, PageHeader,
+        Progress, Toast,
+    },
+};
 use leptos::prelude::*;
 use leptos_router::{
     NavigateOptions,
@@ -13,53 +22,92 @@ use leptos_router::{
 };
 use slskr_types::users::{BrowseResponse, BrowseStatus};
 
-fn find_directory<'a>(nodes: &'a [TreeNode], name: &str) -> Option<&'a TreeNode> {
-    for node in nodes {
-        if node.directory.name == name {
-            return Some(node);
-        }
-        if let Some(found) = find_directory(&node.children, name) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-/// Summary counts and separator of the current browse result.
+/// Summary counts of the current browse result.
 #[derive(Clone, Copy, Default)]
 struct BrowseInfo {
-    directories: u32,
-    files: u32,
-    locked_directories: u32,
-    locked_files: u32,
-    separator: char,
+    directories: usize,
+    files: usize,
+    size: u64,
+    locked_directories: usize,
+}
+
+/// Formats a count with thousands separators: `12,345`.
+pub(crate) fn group_digits(value: impl ToString) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+fn count(value: usize, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        group_digits(value),
+        if value == 1 { one } else { many }
+    )
+}
+
+/// Below this width the folder tree is a collapsible panel above the files.
+const NARROW: &str = "(max-width: 899px)";
+
+fn is_narrow() -> bool {
+    window()
+        .match_media(NARROW)
+        .ok()
+        .flatten()
+        .is_some_and(|query| query.matches())
 }
 
 #[component]
 pub fn Browse() -> impl IntoView {
     let url = use_url();
-    let initial_user = url.with_untracked(|url| {
-        web_sys::UrlSearchParams::new_with_str(url.search())
-            .ok()
-            .and_then(|params| params.get("username"))
-            .unwrap_or_default()
+    let query = Memo::new(move |_| {
+        url.with(|url| {
+            let params = web_sys::UrlSearchParams::new_with_str(url.search()).ok();
+            let user = params
+                .as_ref()
+                .and_then(|params| params.get("username"))
+                .unwrap_or_default();
+            let path = params.and_then(|params| params.get("path"));
+            (user, path)
+        })
     });
+    let query_user = Memo::new(move |_| query.with(|(user, _)| user.clone()));
     // `username` is the browsed user; `input` is the text box, applied only on submit.
-    let username = RwSignal::new(initial_user.clone());
-    let input = RwSignal::new(initial_user.clone());
-    let results = RwSignal::new(Vec::<TreeNode>::new());
+    let username = RwSignal::new(String::new());
+    let input = RwSignal::new(query_user.get_untracked());
+    let results = RwSignal::new(None::<Arc<Shares>>);
     let info = RwSignal::new(BrowseInfo::default());
-    let selected = RwSignal::new(None::<String>);
+    let selected = RwSignal::new(None::<usize>);
     let loading = RwSignal::new(false);
     let progress = RwSignal::new(None::<BrowseStatus>);
-    let error = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<(String, String)>);
     let generation = RwSignal::new(0u64);
     let navigate = StoredValue::new_local(use_navigate());
+    // The user whose shares `results` holds (`username` changes as soon as a browse starts).
+    let browsed = RwSignal::new(String::new());
+    let actions = BrowseActions {
+        username: browsed,
+        results,
+        pending: RwSignal::new(false),
+        notice: RwSignal::new(None),
+        menu: RwSignal::new(None::<ContextMenuState>),
+    };
+    provide_context(actions);
 
     let start = move |name: String| {
         let ticket = generation.get_untracked().wrapping_add(1);
         generation.set(ticket);
+        actions.menu.set(None);
+        selected.set(None);
+        results.set(None);
         username.set(name.clone());
+        input.set(name.clone());
         progress.set(None);
         loading.set(true);
         error.set(None);
@@ -91,22 +139,26 @@ pub fn Browse() -> impl IntoView {
             }
             match result {
                 Ok(response) => {
-                    let separator =
-                        detect_separator(response.directories.iter().map(|d| d.name.as_str()));
-                    let summary = BrowseInfo {
-                        directories: response.directories.len() as u32,
-                        files: response
+                    let separator = detect_separator(
+                        response
                             .directories
                             .iter()
-                            .map(|d| d.files.len() as u32)
-                            .sum(),
-                        locked_directories: response.locked_directories.len() as u32,
-                        locked_files: response
-                            .locked_directories
+                            .chain(&response.locked_directories)
+                            .map(|d| d.name.as_str()),
+                    );
+                    let all_files = || {
+                        response
+                            .directories
                             .iter()
-                            .map(|d| d.files.len() as u32)
-                            .sum(),
-                        separator,
+                            .chain(&response.locked_directories)
+                            .flat_map(|d| &d.files)
+                    };
+                    let summary = BrowseInfo {
+                        directories: response.directories.len() + response.locked_directories.len(),
+                        files: all_files().count(),
+                        size: all_files()
+                            .fold(0_u64, |total, file| total.saturating_add(file.size)),
+                        locked_directories: response.locked_directories.len(),
                     };
                     let all = response
                         .directories
@@ -114,24 +166,52 @@ pub fn Browse() -> impl IntoView {
                         .map(|d| (d, false))
                         .chain(response.locked_directories.into_iter().map(|d| (d, true)))
                         .collect();
+                    let shares = Shares::new(build_tree(all, separator), separator);
                     let _ = info.try_set(summary);
-                    let _ = results.try_set(build_tree(all, separator));
-                    let _ = selected.try_set(None);
+                    let _ = browsed.try_set(name.clone());
+                    let _ = results.try_set(Some(Arc::new(shares)));
                 }
                 Err(problem) => {
-                    let _ = error.try_set(Some(format!("Failed to browse {name}: {problem}")));
+                    let _ = results.try_set(None);
+                    let _ = error.try_set(Some((name, problem.to_string())));
                 }
             }
             let _ = progress.try_set(None);
             let _ = loading.try_set(false);
         });
     };
-    if !initial_user.is_empty() {
-        start(initial_user);
-    }
+    // The `username` query parameter drives the page, so links to `/browse?username=…`
+    // work while the page is open.
+    Effect::new(move |_| {
+        let name = query_user.get();
+        if !name.is_empty() && name != username.get_untracked() {
+            start(name);
+        }
+    });
+    Effect::new(move |_| {
+        let (user, path) = query.get();
+        let index = results.with(|shares| {
+            let path = path.as_deref()?;
+            let shares = shares.as_ref()?;
+            if user != browsed.get_untracked() {
+                return None;
+            }
+            let path = path.trim_end_matches(['\\', '/']);
+            shares
+                .nodes
+                .iter()
+                .position(|node| node.path.trim_end_matches(['\\', '/']) == path)
+        });
+        actions.menu.set(None);
+        selected.set(index);
+    });
     let submit = move || {
         let name = input.get_untracked().trim().to_owned();
         if name.is_empty() {
+            return;
+        }
+        if name == query_user.get_untracked() {
+            start(name);
             return;
         }
         // Client-side navigation keeps the SPA (and `web.url_base`) intact.
@@ -144,45 +224,203 @@ pub fn Browse() -> impl IntoView {
                 },
             )
         });
-        start(name);
     };
-    let on_select = Callback::new(move |name: String| selected.set(Some(name)));
+    let tree_open = RwSignal::new(true);
+    let filter = RwSignal::new(String::new());
+    let tree_scroll = NodeRef::<leptos::html::Div>::new();
+    let on_select = Callback::new(move |index: usize| {
+        actions.menu.set(None);
+        selected.set(Some(index));
+        // On phones, picking a folder without subfolders closes the folder panel; folders
+        // with subfolders keep it open for drilling down.
+        let leaf = results.with_untracked(|shares| {
+            shares
+                .as_ref()
+                .is_some_and(|shares| !shares.has_children(index))
+        });
+        if leaf && is_narrow() {
+            tree_open.set(false);
+        }
+    });
+    let base = config::url_base().trim_end_matches('/').to_owned();
+
+    let progress_view = move || {
+        loading.get().then(|| {
+            let percent = progress.with(|status| status.as_ref().map(|s| s.percent_complete));
+            let user = username.get();
+            let (title, detail) = match progress.get() {
+                Some(status) if status.size > 0 => (
+                    format!("Downloading {user}'s share list"),
+                    format!(
+                        "{} of {} · {}%",
+                        util::format_bytes(status.bytes_transferred as f64),
+                        util::format_bytes(status.size as f64),
+                        status.percent_complete.round()
+                    ),
+                ),
+                _ => (format!("Connecting to {user}…"), String::new()),
+            };
+            view! {
+                <div class="browse-progress" role="status" aria-live="polite">
+                    <div class="progress-label">
+                        <span>{title}</span>
+                        <span>{detail}</span>
+                    </div>
+                    {match percent {
+                        Some(p) => view! { <Progress value=Signal::derive(move || p) label="Share list download"/> }.into_any(),
+                        None => view! { <Progress label="Share list download"/> }.into_any(),
+                    }}
+                </div>
+            }
+        })
+    };
+
+    let result_view = move || {
+        let shares = results.get()?;
+        let user = browsed.get_untracked();
+        let BrowseInfo {
+            directories,
+            files,
+            size,
+            locked_directories,
+        } = info.get_untracked();
+        let encoded = util::encode_uri_component(&user);
+        let user_href = format!("{base}/users?username={encoded}");
+        let chat_href = format!("{base}/chat?username={encoded}");
+        let tree_shares = shares.clone();
+        let selection_shares = shares.clone();
+        let selected_label = move || {
+            selected
+                .get()
+                .map(|index| tree_shares.nodes[index].label.clone())
+        };
+        let user_name = user.clone();
+        Some(view! {
+            <div class="browse-result stack">
+                <div class="browse-summary">
+                    <Avatar name=user.clone()/>
+                    <div class="browse-summary__text">
+                        <h2 class="browse-summary__name">{user.clone()}</h2>
+                        <p class="muted text-sm">
+                            {format!("{} in {} · {}", count(files, "file", "files"), count(directories, "folder", "folders"), util::format_bytes(size as f64))}
+                            {(locked_directories > 0).then(|| view! {
+                                " · "<span class="browse-summary__locked"><Icon name="lock" size="xs"/>{format!("{locked_directories} locked")}</span>
+                            })}
+                        </p>
+                    </div>
+                    <div class="browse-summary__actions">
+                        <Button size="sm" icon="user" text="Profile" href=user_href/>
+                        <Button size="sm" icon="message-square" text="Message" href=chat_href/>
+                        <Button size="sm" icon="refresh-cw" label="Browse again" disabled=loading
+                            on_click=Callback::new(move |_| start(user_name.clone()))/>
+                    </div>
+                </div>
+                <div class="browse-layout">
+                    <section class="card browse-tree-card" class:is-collapsed=move || !tree_open.get() aria-label="Folders">
+                        <button type="button" class="browse-tree-card__toggle" aria-expanded=move || tree_open.get().to_string()
+                            aria-controls="browse-tree-body" on:click=move |_| tree_open.update(|open| *open = !*open)>
+                            <Icon name="folder"/>
+                            <span class="grow truncate">
+                                {move || match selected_label() {
+                                    Some(label) => view! { "Folders" <span class="muted">{format!(" · {label}")}</span> }.into_any(),
+                                    None => "Folders".into_any(),
+                                }}
+                            </span>
+                            <Icon name="chevron-down" class="browse-tree-card__chevron"/>
+                        </button>
+                        <div class="browse-tree-card__body" id="browse-tree-body">
+                            <div class="browse-tree-card__filter">
+                                <div class="input-icon">
+                                    <Icon name="filter"/>
+                                    <input class="input input--sm browse-filter" type="search" placeholder="Filter folders"
+                                        aria-label="Filter folders" prop:value=move || filter.get()
+                                        on:input=move |event| {
+                                            filter.set(event_target_value(&event));
+                                            if let Some(scroll) = tree_scroll.get_untracked() { scroll.set_scroll_top(0); }
+                                        }/>
+                                </div>
+                            </div>
+                            <div class="browse-tree-card__scroll" node_ref=tree_scroll>
+                                <DirectoryTree shares=shares selected=selected on_select=on_select filter=filter/>
+                            </div>
+                        </div>
+                    </section>
+                    <div class="browse-files-pane">
+                        {move || match selected.get() {
+                            Some(index) => view! {
+                                <Selection shares=selection_shares.clone() index=index
+                                    on_navigate=on_select/>
+                            }.into_any(),
+                            None => view! {
+                                <Card>
+                                    <EmptyState icon="folder-open" title="Select a folder"
+                                        description="Pick a folder on the left to see its files. Use the arrow keys to move through the tree."/>
+                                </Card>
+                            }.into_any(),
+                        }}
+                    </div>
+                </div>
+            </div>
+        })
+    };
+
     view! {
-        <div class="search-container browse-container">
-            <section class="ui raised segment browse-segment">
-                <span class="browse-segment-icon" aria-hidden="true">"Browse"</span>
-                <input class="ui input" type="search" placeholder="Username" prop:value=move || input.get()
-                    on:input=move |event| input.set(event_target_value(&event))
-                    on:keydown=move |event: web_sys::KeyboardEvent| if event.key() == "Enter" { submit(); }/>
-                <button type="button" class="ui button" disabled=move || loading.get() on:click=move |_| submit()>
-                    {move || if loading.get() { "Browsing…" } else { "Browse" }}
-                </button>
-            </section>
-            {move || progress.get().map(|status| view! { <div class="ui active progress"><div class="bar" style:width=format!("{}%", status.percent_complete.round())></div><div class="label">{format!("Downloaded {}% of response", status.percent_complete.round())}</div></div> })}
-            {move || error.get().map(|message| view! { <p class="browse-error" role="alert">{message}</p> })}
-            // The tree is rebuilt only when results change; selection only toggles row classes.
+        <div class="browse stack">
+            <PageHeader title="Browse" description="Look through the folders a user shares and download what you want."/>
+            <Card class="browse-form" title="Browse a user's shares" description="Downloading a large share list can take a minute.">
+                <form class="input-group" on:submit=move |event| { event.prevent_default(); submit(); }>
+                    <div class="input-icon grow">
+                        <Icon name="user"/>
+                        <input class="input browse-username" type="search" placeholder="Username" aria-label="Username"
+                            autocomplete="off" spellcheck="false"
+                            prop:value=move || input.get()
+                            on:input=move |event| input.set(event_target_value(&event))/>
+                    </div>
+                    <Button variant="primary" button_type="submit" icon="folder-open" text="Browse"
+                        loading=loading/>
+                </form>
+                {progress_view}
+                {move || error.get().map(|(name, message)| view! {
+                    <Alert variant="danger" title=format!("Could not browse {name}") class="browse-error">
+                        <p>{message}</p>
+                        <p class="muted">"The user may be offline, or their client is not accepting connections. Try again later."</p>
+                    </Alert>
+                })}
+            </Card>
             {move || {
-                let tree = results.get();
-                if tree.is_empty() { return ().into_any(); }
-                let user = username.get_untracked();
-                let BrowseInfo { directories, files, locked_directories, locked_files, .. } = info.get_untracked();
-                view! {
-                    <section class="ui raised card browse-tree-card"><div class="content">
-                        <div class="header">{user}</div>
-                        <div class="meta browse-meta">{format!("{} files in {} directories (including {} files in {} locked directories)", files + locked_files, directories + locked_directories, locked_files, locked_directories)}</div>
-                        <div class="browse-tree-wrapper"><DirectoryTree tree=tree selected=selected on_select=on_select/></div>
-                    </div></section>
-                }.into_any()
+                let showing = results.with(Option::is_some);
+                (!showing && !loading.get() && error.with(Option::is_none)).then(|| view! {
+                    <Card>
+                        <EmptyState icon="folder-open" title="No user selected"
+                            description="Enter a username above to see the folders they share."/>
+                    </Card>
+                })
             }}
-            {move || {
-                let name = selected.get()?;
-                let node = results.with(|tree| {
-                    find_directory(tree, &name).map(|node| (node.directory.files.clone(), node.locked))
-                });
-                let (files, locked) = node?;
-                let separator = info.with_untracked(|info| info.separator).to_string();
-                Some(view! { <Selection username=username.get_untracked() directory=name separator=separator files=files locked=locked/> })
-            }}
+            {result_view}
+            <ContextMenu state=actions.menu/>
+            <div class="toast-region" role="status" aria-live="polite">
+                {move || actions.notice.get().map(|notice| {
+                    let href = format!("{}/downloads", config::url_base().trim_end_matches('/'));
+                    view! {
+                        <Toast variant=notice.variant on_dismiss=Callback::new(move |()| actions.notice.set(None))>
+                            <div class="font-medium">{notice.title}</div>
+                            {(!notice.body.is_empty()).then(|| view! { <div class="muted">{notice.body}</div> })}
+                            {notice.link.then(|| view! { <a href=href>"View downloads"</a> })}
+                        </Toast>
+                    }
+                })}
+            </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn groups_digits() {
+        assert_eq!(super::group_digits(0), "0");
+        assert_eq!(super::group_digits(999), "999");
+        assert_eq!(super::group_digits(1000), "1,000");
+        assert_eq!(super::group_digits(12_345_678u64), "12,345,678");
     }
 }

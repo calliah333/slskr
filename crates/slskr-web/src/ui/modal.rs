@@ -129,7 +129,7 @@ pub fn Modal(
         });
         // Focus the dialog itself so Escape and Tab start inside it.
         request_animation_frame(move || {
-            if let Some(modal) = modal_ref.get_untracked() {
+            if let Some(modal) = modal_ref.try_get_untracked().flatten() {
                 let already_inside = document()
                     .active_element()
                     .is_some_and(|a| modal.contains(Some(&a)));
@@ -140,7 +140,7 @@ pub fn Modal(
         });
         let inside = move |ev: &MouseEvent| {
             let target = ev.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok());
-            match (modal_ref.get_untracked(), target) {
+            match (modal_ref.try_get_untracked().flatten(), target) {
                 (Some(modal), Some(node)) => modal.contains(Some(&node)),
                 _ => false,
             }

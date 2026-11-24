@@ -1,13 +1,34 @@
+//! Private messages (`/chat`), IRC style: the buffer list beside the open query.
+
 use leptos::prelude::*;
 use leptos::task::spawn_local_scoped_with_cancellation;
 use leptos_router::{
     NavigateOptions,
     hooks::{use_navigate, use_url},
 };
-use slskr_types::conversations::{Conversation, PrivateMessage};
+use slskr_types::{
+    conversations::{Conversation, MessageDirection},
+    rooms::RoomInfo,
+    users::{Status, UserPresence},
+};
 use wasm_bindgen_futures::spawn_local;
 
-mod conversation;
+use crate::{
+    components::app::AppContext,
+    config,
+    services::util,
+    ui::{Button, EmptyState, Icon, Loading, StatusDot},
+};
+
+pub(crate) mod buffer;
+pub(crate) mod sidebar;
+
+use buffer::{
+    BufferView, Command, Entry, Events, HELP, InputLine, OFFLINE_REASON, PollProblem, Tone,
+    announce_connection, merge, parse_command, push_event, set_if_changed, use_logged_in,
+    use_own_nick,
+};
+use sidebar::{BufferList, NewMessage, QueryRow, RoomRow};
 
 const ACTIVE_CHAT_KEY: &str = "slskr.activeChat";
 
@@ -21,33 +42,52 @@ fn stored_username() -> Option<String> {
         .flatten()
 }
 
+pub(crate) fn presence_dot(presence: UserPresence) -> (&'static str, &'static str) {
+    match presence {
+        UserPresence::Online => ("online", "Online"),
+        UserPresence::Away => ("away", "Away"),
+        UserPresence::Offline => ("offline", "Offline"),
+    }
+}
+
 #[component]
 pub fn Chat() -> impl IntoView {
     let url = use_url();
     // UrlSearchParams percent-decodes the query exactly once.
-    let initial = url
-        .with_untracked(|url| {
-            web_sys::UrlSearchParams::new_with_str(url.search())
-                .ok()
-                .and_then(|params| params.get("username"))
-        })
-        .or_else(stored_username)
-        .unwrap_or_default();
+    let from_url = url.with_untracked(|url| {
+        web_sys::UrlSearchParams::new_with_str(url.search())
+            .ok()
+            .and_then(|params| params.get("username"))
+            .filter(|name| !name.is_empty())
+    });
+    // Phones show the buffer list first unless a conversation was linked.
+    let show_buffer = RwSignal::new(from_url.is_some());
+    // A linked user without a conversation opens a new one once the list is loaded.
+    let pending_link = StoredValue::new(from_url.clone());
+    let initial = from_url.or_else(stored_username).unwrap_or_default();
     let navigate = StoredValue::new_local(use_navigate());
     let conversations = RwSignal::new(Vec::<Conversation>::new());
+    let loaded = RwSignal::new(false);
     let active = RwSignal::new(initial);
+    // A new conversation with someone not in the list yet.
+    let compose_to = RwSignal::new(None::<String>);
     let draft = RwSignal::new(String::new());
-    let recipient = RwSignal::new(String::new());
-    let error = RwSignal::new(None::<String>);
+    // Polling errors clear themselves; action errors become lines in the buffer.
+    let poll_error = RwSignal::new(None::<String>);
+    let events: Events = RwSignal::new(Vec::new());
+    let new_open = RwSignal::new(false);
+    let join_open = RwSignal::new(false);
+    let room_list = RwSignal::new(Vec::<RoomInfo>::new());
+    let status = RwSignal::new(None::<(String, UserPresence)>);
     // Each refresh takes a ticket; only the latest one may apply its result.
     let generation = RwSignal::new(0u64);
     let in_flight = RwSignal::new(false);
     // Acknowledging needs the Soulseek server; unread messages are acknowledged by the
     // first refresh after logging in.
-    let logged_in = use_context::<crate::components::app::AppContext>()
-        .map(|context| context.state)
-        .map(|state| Signal::derive(move || state.with(|s| s.server.state.is_logged_in())))
-        .unwrap_or_default();
+    let logged_in = use_logged_in();
+    let own_nick = use_own_nick();
+    announce_connection(events, logged_in);
+
     let refresh = move || {
         let selected = active.get_untracked();
         let ticket = generation.get_untracked().wrapping_add(1);
@@ -62,21 +102,21 @@ pub fn Chat() -> impl IntoView {
             }
             let _ = in_flight.try_set(false);
             match result {
-                Ok((selected, value, problem)) => {
-                    if let Some(problem) = problem {
-                        let _ = error.try_set(Some(problem));
+                Ok((selected, list, problem)) => {
+                    set_if_changed(poll_error, problem);
+                    if let Some(link) = pending_link.try_update_value(Option::take).flatten()
+                        && !list.iter().any(|c| c.username == link)
+                    {
+                        let _ = compose_to.try_set(Some(link));
                     }
                     if active.try_get_untracked().is_some_and(|a| a != selected) {
                         let _ = active.try_set(selected);
                     }
                     // Unchanged polls must not notify, or the open conversation re-renders.
-                    if conversations.try_with_untracked(|c| *c != value) == Some(true) {
-                        let _ = conversations.try_set(value);
-                    }
+                    set_if_changed(conversations, list);
+                    set_if_changed(loaded, true);
                 }
-                Err(e) => {
-                    let _ = error.try_set(Some(e));
-                }
+                Err(e) => set_if_changed(poll_error, Some(e)),
             }
         });
     };
@@ -90,18 +130,35 @@ pub fn Chat() -> impl IntoView {
         }
     });
 
-    let select = move |username: String| {
-        active.set(username.clone());
+    // The open buffer: a new conversation, the selected one, or "" (none).
+    let target = Memo::new(move |_| compose_to.get().unwrap_or_else(|| active.get()));
+    // The partner's presence, when the server can tell.
+    Effect::new(move |_| {
+        let username = target.get();
+        if !logged_in.get() || username.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            let path = format!("/users/{}/status", util::encode_uri_component(&username));
+            if let Ok(value) = crate::services::api::get::<Status>(&path).await
+                && target.try_get_untracked().as_deref() == Some(username.as_str())
+            {
+                let _ = status.try_set(Some((username, value.presence)));
+            }
+        });
+    });
+
+    let go = move |path: String| {
+        navigate.with_value(|navigate| navigate(&path, NavigateOptions::default()));
+    };
+    let remember = move |username: &str| {
         if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
-            let _ = storage.set_item(ACTIVE_CHAT_KEY, &username);
+            let _ = storage.set_item(ACTIVE_CHAT_KEY, username);
         }
         // The router resolves the path under `web.url_base`.
         navigate.with_value(|navigate| {
             navigate(
-                &format!(
-                    "/chat?username={}",
-                    crate::services::util::encode_uri_component(&username)
-                ),
+                &format!("/chat?username={}", util::encode_uri_component(username)),
                 NavigateOptions {
                     replace: true,
                     scroll: false,
@@ -109,45 +166,36 @@ pub fn Chat() -> impl IntoView {
                 },
             )
         });
-        refresh();
     };
-    let send = move |_| {
-        let username = if active.get_untracked().is_empty() {
-            recipient.get_untracked()
-        } else {
-            active.get_untracked()
-        };
-        let text = draft.get_untracked();
-        if username.trim().is_empty() || text.trim().is_empty() || username == ".." {
-            return;
+    let select = move |username: String| {
+        compose_to.set(None);
+        show_buffer.set(true);
+        if active.get_untracked() != username {
+            draft.set(String::new());
         }
-        draft.set(String::new());
-        spawn_local(async move {
-            let path = format!(
-                "/conversations/{}/messages",
-                crate::services::util::encode_uri_component(&username)
-            );
-            let body = slskr_types::conversations::SendMessage { message: text };
-            match crate::services::api::post_text(&path, &body).await {
-                Ok(_) => {
-                    let _ = recipient.try_set(String::new());
-                    // `try_set` returns `None` once the value was stored (component still alive).
-                    if active.try_set(username).is_none() {
-                        refresh();
-                    }
-                }
-                Err(e) => {
-                    let _ = error.try_set(Some(e.to_string()));
-                }
-            }
-        });
+        active.set(username.clone());
+        remember(&username);
+        refresh();
+        buffer::focus_later("chat-message-input");
+    };
+    let start = Callback::new(move |username: String| {
+        let exists = conversations.with_untracked(|c| c.iter().any(|c| c.username == username));
+        if exists {
+            select(username);
+        } else {
+            compose_to.set(Some(username.clone()));
+            draft.set(String::new());
+            show_buffer.set(true);
+            remember(&username);
+            buffer::focus_later("chat-message-input");
+        }
+    });
+    let error_line = move |buffer: String, text: String| {
+        push_event(events, Some(buffer), Tone::Error, true, text);
     };
     let remove = move |username: String| {
         spawn_local(async move {
-            let path = format!(
-                "/conversations/{}",
-                crate::services::util::encode_uri_component(&username)
-            );
+            let path = format!("/conversations/{}", util::encode_uri_component(&username));
             match crate::services::api::request_text(gloo_net::http::Method::DELETE, &path, None)
                 .await
             {
@@ -157,15 +205,82 @@ pub fn Chat() -> impl IntoView {
                     };
                     if current == username {
                         let _ = active.try_set(String::new());
+                        let _ = show_buffer.try_set(false);
                     }
                     refresh();
                 }
+                Err(e) => error_line(username, format!("Could not close the conversation: {e}")),
+            }
+        });
+    };
+    let say = move |username: String, text: String| {
+        if username.is_empty() {
+            error_line(
+                username,
+                "Open a conversation first (/query nick)".to_owned(),
+            );
+            draft.set(text);
+            return;
+        }
+        if !logged_in.get_untracked() {
+            error_line(username, format!("Not sent: {OFFLINE_REASON}"));
+            draft.set(text);
+            return;
+        }
+        spawn_local(async move {
+            match buffer::send_private(&username, &text).await {
+                Ok(()) => {
+                    if compose_to.try_get_untracked().flatten().as_deref() == Some(&username) {
+                        let _ = compose_to.try_set(None);
+                    }
+                    // `try_set` returns `None` once the value was stored (component still alive).
+                    if active.try_set(username).is_none() {
+                        refresh();
+                    }
+                }
                 Err(e) => {
-                    let _ = error.try_set(Some(e.to_string()));
+                    error_line(username, format!("Not sent: {e}"));
+                    // Give the text back unless something new was typed meanwhile.
+                    if draft.try_with_untracked(String::is_empty) == Some(true) {
+                        let _ = draft.try_set(text);
+                    }
                 }
             }
         });
     };
+    let submit = Callback::new(move |text: String| {
+        let here = target.get_untracked();
+        match parse_command(&text) {
+            Command::Say(text) => say(here, text),
+            Command::Join(room) => spawn_local(async move {
+                match buffer::join_room(&room).await {
+                    Ok(()) => go(format!("/rooms?room={}", util::encode_uri_component(&room))),
+                    Err(e) => error_line(here, format!("Could not join #{room}: {e}")),
+                }
+            }),
+            Command::Part => {
+                if compose_to.get_untracked().is_some() {
+                    compose_to.set(None);
+                } else if !here.is_empty() {
+                    remove(here);
+                }
+            }
+            Command::Query(nick) => start.run(nick),
+            Command::Msg(nick, text) => spawn_local(async move {
+                match buffer::send_private(&nick, &text).await {
+                    Ok(()) => select(nick),
+                    Err(e) => error_line(here, format!("Not sent to {nick}: {e}")),
+                }
+            }),
+            Command::Help => {
+                for line in HELP {
+                    push_event(events, Some(here.clone()), Tone::Info, true, line);
+                }
+            }
+            Command::Invalid(problem) => error_line(here, problem),
+        }
+    });
+
     let messages = Memo::new(move |_| {
         let name = active.get();
         conversations.with(|items| {
@@ -175,43 +290,187 @@ pub fn Chat() -> impl IntoView {
                 .and_then(|c| c.messages.clone())
         })
     });
-    let has_conversation = Memo::new(move |_| messages.with(Option::is_some));
-    let messages = Signal::derive(move || messages.get().unwrap_or_default());
+    let entries = Signal::derive(move || {
+        let here = target.get();
+        let lines = if compose_to.with(Option::is_some) {
+            Vec::new()
+        } else {
+            let own = own_nick.get();
+            messages.with(|m| {
+                m.as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|m| {
+                        let mine = m.direction == MessageDirection::Out;
+                        Entry::message(
+                            format!("{}:{}", m.timestamp.timestamp_millis(), m.id),
+                            m.timestamp,
+                            if mine {
+                                own.clone()
+                            } else {
+                                m.username.clone()
+                            },
+                            mine,
+                            m.message.clone(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        merge(lines, events, &here)
+    });
+    let buffer_loaded =
+        Memo::new(move |_| compose_to.with(Option::is_some) || messages.with(Option::is_some));
+
+    let queries = Memo::new(move |_| {
+        let mut rows: Vec<QueryRow> = conversations.with(|list| {
+            list.iter()
+                .map(|c| QueryRow {
+                    nick: c.username.clone(),
+                    unread: c.unacknowledged_count,
+                })
+                .collect()
+        });
+        if let Some(nick) = compose_to.get()
+            && !rows.iter().any(|r| r.nick == nick)
+        {
+            rows.push(QueryRow { nick, unread: 0 });
+        }
+        rows.sort_by_key(|r| r.nick.to_lowercase());
+        rows
+    });
+    let joined_rooms = use_context::<AppContext>().map(|c| c.state);
+    let rooms = Signal::derive(move || {
+        let mut rows: Vec<RoomRow> = joined_rooms
+            .map(|state| {
+                state.with(|s| {
+                    s.rooms
+                        .iter()
+                        .map(|name| RoomRow {
+                            name: name.clone(),
+                            users: None,
+                            unread: 0,
+                            private: false,
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        rows.sort_by_key(|r| r.name.to_lowercase());
+        rows
+    });
+    let joined_names = Signal::derive(move || {
+        rooms.with(|r| r.iter().map(|r| r.name.clone()).collect::<Vec<_>>())
+    });
+
+    let presence = Signal::derive(move || {
+        let name = target.get();
+        status.with(|s| match s {
+            Some((user, presence)) if *user == name => Some(*presence),
+            _ => None,
+        })
+    });
+    let offline_reason =
+        Signal::derive(move || (!logged_in.get()).then(|| OFFLINE_REASON.to_owned()));
+    let base = StoredValue::new(config::url_base().trim_end_matches('/').to_owned());
+    let user_link = move |page: &str| {
+        format!(
+            "{}/{page}?username={}",
+            base.get_value(),
+            util::encode_uri_component(&target.get())
+        )
+    };
+    let browse_link = move || user_link("browse");
+    let info_link = move || user_link("users");
+    let has_target = Memo::new(move |_| !target.with(String::is_empty));
 
     view! {
-        <section class="chat">
-            <nav class="conversation-menu">
-                <For each=move || conversations.get() key=|item| (
-                    item.username.clone(), item.unacknowledged_count
-                ) children=move |item| {
-                    let name = item.username.clone();
-                    let username = item.username.clone();
-                    let unread = item.unacknowledged_count;
-                    let has_unread = unread > 0;
-                    view! { <button class:menu-active=move || active.get() == name class="menu-item" on:click=move |_| select(username.clone())>
-                        {item.username} <Show when=move || has_unread><span class="label red">{unread}</span></Show>
-                    </button> }
-                }/>
-            </nav>
-            <Show when=move || error.get().is_some()><p class="error">{move || error.get().unwrap_or_default()}</p></Show>
-            <div class="chat-active-card">
-                <Show when=move || !active.get().is_empty() fallback=|| view! { <p class="placeholder-segment">"Select a conversation or start a message."</p> }>
-                    <Show when=move || has_conversation.get()>
-                        <conversation::ConversationView messages=messages/>
+        <div class="messenger chat" data-view=move || if show_buffer.get() { "buffer" } else { "list" }>
+            <BufferList title="Chat" rooms=rooms queries=queries
+                active_room=Signal::derive(|| None::<String>)
+                active_query=Signal::derive(move || Some(target.get()).filter(|t| !t.is_empty()))
+                rooms_loaded=Signal::derive(|| true) queries_loaded=loaded
+                on_room=Callback::new(move |room: String| go(format!("/rooms?room={}", util::encode_uri_component(&room))))
+                on_query=Callback::new(move |nick: String| select(nick))
+                on_join=Callback::new(move |()| join_open.set(true))
+                on_new=Callback::new(move |()| new_open.set(true))/>
+
+            <section class="messenger__main chat-active-card" aria-label="Conversation">
+                <header class="topic">
+                    <Button variant="ghost" size="sm" icon="arrow-left" label="Back to buffers"
+                        class="messenger__back" on_click=Callback::new(move |_| show_buffer.set(false))/>
+                    <Show when=move || has_target.get() fallback=|| view! {
+                        <h2 class="topic__name">"Chat"</h2>
+                        <span class="topic__text truncate">"Private messages \u{b7} open one on the left or type /query nick"</span>
+                    }>
+                        <h2 class="topic__name">
+                            <span class=move || format!("truncate {}", buffer::nick_color(&target.get()))>{move || target.get()}</span>
+                            {move || presence.get().map(|p| {
+                                let (dot, text) = presence_dot(p);
+                                view! { <StatusDot status=dot label=text.to_owned()/> }
+                            })}
+                        </h2>
+                        <span class="topic__text truncate">
+                            {move || if compose_to.with(Option::is_some) {
+                                "New conversation".to_owned()
+                            } else {
+                                match presence.get() {
+                                    Some(p) => format!("{} \u{b7} private conversation", presence_dot(p).1),
+                                    None => "Private conversation".to_owned(),
+                                }
+                            }}
+                        </span>
+                        <div class="topic__actions">
+                            <a class="btn btn--ghost btn--icon btn--sm" href=browse_link
+                                aria-label="Browse files" title="Browse files"><Icon name="folder-open"/></a>
+                            <a class="btn btn--ghost btn--icon btn--sm hide-sm" href=info_link
+                                aria-label="User info" title="User info"><Icon name="user"/></a>
+                            <Show when=move || compose_to.with(Option::is_none) fallback=move || view! {
+                                <Button variant="ghost" size="sm" icon="x" label="Discard new conversation"
+                                    on_click=Callback::new(move |_| compose_to.set(None))/>
+                            }>
+                                <Button variant="ghost" size="sm" icon="x" label="Close conversation"
+                                    class="chat-close-button"
+                                    on_click=Callback::new(move |_| remove(active.get_untracked()))/>
+                            </Show>
+                        </div>
                     </Show>
-                </Show>
-                <form class="chat-input" on:submit=move |ev| { ev.prevent_default(); send(()); }>
-                    <Show when=move || active.get().is_empty()>
-                        <input prop:value=move || recipient.get() on:input=move |ev| recipient.set(event_target_value(&ev)) placeholder="Username"/>
-                    </Show>
-                    <input id="chat-message-input" prop:value=move || draft.get() on:input=move |ev| draft.set(event_target_value(&ev)) placeholder="Message"/>
-                    <button class="chat-message-button" type="submit">"Send"</button>
-                </form>
-                <Show when=move || !active.get().is_empty()>
-                    <button type="button" on:click=move |_| remove(active.get_untracked())>"Close conversation"</button>
-                </Show>
-            </div>
-        </section>
+                </header>
+                <PollProblem poll_error=poll_error/>
+                <BufferView entries=entries scope=target own_nick=own_nick
+                    label=Signal::derive(move || format!("Messages with {}", target.get()))
+                    empty=ViewFn::from(move || {
+                        if !has_target.get() {
+                            view! {
+                                <div class="buffer__empty">
+                                    <EmptyState icon="message-square" title="No conversation open"
+                                        description="Pick a conversation, or type /query nick below to message any Soulseek user.">
+                                        <Button variant="primary" size="sm" icon="plus" text="New message"
+                                            on_click=Callback::new(move |_| new_open.set(true))/>
+                                    </EmptyState>
+                                </div>
+                            }.into_any()
+                        } else if buffer_loaded.get() {
+                            view! {
+                                <div class="buffer__empty">
+                                    <p class="buffer__hint">{format!("* This is the start of your conversation with {}.", target.get_untracked())}</p>
+                                </div>
+                            }.into_any()
+                        } else {
+                            view! { <div class="buffer__empty"><Loading label="Loading messages"/></div> }.into_any()
+                        }
+                    })/>
+                <InputLine draft=draft on_submit=submit offline_reason=offline_reason nick=own_nick
+                    input_id="chat-message-input"
+                    placeholder=Signal::derive(move || {
+                        let t = target.get();
+                        if t.is_empty() { "Type /query nick to start".to_owned() } else { format!("Message {t}") }
+                    })/>
+            </section>
+        </div>
+        <NewMessage open=new_open on_start=start/>
+        <crate::components::rooms::RoomJoin open=join_open rooms=room_list joined=joined_names
+            on_join=Callback::new(move |room: String| go(format!("/rooms?room={}", util::encode_uri_component(&room))))/>
     }
 }
 
@@ -221,25 +480,19 @@ async fn load_conversations(
     selected: String,
     acknowledge: bool,
 ) -> Result<(String, Vec<Conversation>, Option<String>), String> {
-    let mut value = crate::services::api::get::<Vec<Conversation>>("/conversations")
+    let mut list = crate::services::api::get::<Vec<Conversation>>("/conversations")
         .await
         .map_err(|e| e.to_string())?;
-    value.retain(|conversation| conversation.username != "..");
-    let selected = if value.iter().any(|c| c.username == selected) {
+    list.retain(|conversation| conversation.username != "..");
+    let selected = if list.iter().any(|c| c.username == selected) {
         selected
     } else {
-        value
-            .first()
-            .map(|c| c.username.clone())
-            .unwrap_or_default()
+        list.first().map(|c| c.username.clone()).unwrap_or_default()
     };
     let mut problem = None;
     if !selected.is_empty() {
-        let path = format!(
-            "/conversations/{}",
-            crate::services::util::encode_uri_component(&selected)
-        );
-        let unread = value
+        let path = format!("/conversations/{}", util::encode_uri_component(&selected));
+        let unread = list
             .iter()
             .any(|c| c.username == selected && c.unacknowledged_count > 0);
         if unread
@@ -250,19 +503,12 @@ async fn load_conversations(
         }
         match crate::services::api::get::<Conversation>(&path).await {
             Ok(full) => {
-                if let Some(item) = value.iter_mut().find(|c| c.username == selected) {
+                if let Some(item) = list.iter_mut().find(|c| c.username == selected) {
                     *item = full;
                 }
             }
             Err(e) => problem = Some(e.to_string()),
         }
     }
-    Ok((selected, value, problem))
-}
-
-/// Identity of the newest message, used to scroll only when the history grows.
-pub(crate) fn last_message_key(messages: &[PrivateMessage]) -> Option<(i64, i32)> {
-    messages
-        .last()
-        .map(|m| (m.timestamp.timestamp_millis(), m.id))
+    Ok((selected, list, problem))
 }

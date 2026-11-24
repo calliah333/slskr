@@ -1,67 +1,256 @@
+//! Downloads and uploads (`/downloads`, `/uploads`).
+//!
+//! Rendering stays cheap with thousands of transfers: the page polls the full list, but
+//! each transfer lives in its own signal (`Page::rows`) that is only written when that
+//! transfer changed, so a progress tick re-renders one row. The grouped and filtered
+//! layout (`Page::layout`) is a memo over a slim index (id, user, path, size, state) that
+//! changes only when a transfer is added, removed or changes state; the keyed `For`
+//! lists below it keep existing rows in place.
+
 mod groups;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use gloo_net::http::Method;
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use slskr_types::transfers::{
-    DownloadFile, EnqueueDownloads, EnqueuedDownloads, Transfer, TransferDirection,
-    TransferState as State,
+    DownloadFile, EnqueueDownloads, EnqueueDownloadsRequest, EnqueuedDownloads, Transfer,
+    TransferDirection, TransferState as State,
 };
 
 use crate::{
     components::app::AppContext,
+    config,
     services::{api, util},
+    ui::{Alert, Badge, Button, DropdownMenu, EmptyState, Icon, Loading, Modal, ModalAction},
 };
 
-/// One user's transfers, grouped by remote directory.
+/// Where a transfer is in its life, for counts and the state filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Category {
+    Active,
+    Queued,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl Category {
+    fn of(state: State) -> Self {
+        match state {
+            State::Requested | State::Initializing | State::InProgress => Self::Active,
+            State::QueuedLocally | State::QueuedRemotely => Self::Queued,
+            State::Succeeded => Self::Succeeded,
+            State::Cancelled => Self::Cancelled,
+            State::TimedOut | State::Errored | State::Rejected | State::Aborted => Self::Failed,
+        }
+    }
+}
+
+/// The state filter (segmented control).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filter {
+    All,
+    Active,
+    Queued,
+    Completed,
+    Failed,
+}
+
+impl Filter {
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Active,
+        Self::Queued,
+        Self::Completed,
+        Self::Failed,
+    ];
+
+    fn value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Queued => "queued",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Active => "Active",
+            Self::Queued => "Queued",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+        }
+    }
+
+    fn matches(self, category: Category) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => category == Category::Active,
+            Self::Queued => category == Category::Queued,
+            Self::Completed => category == Category::Succeeded,
+            Self::Failed => matches!(category, Category::Failed | Category::Cancelled),
+        }
+    }
+}
+
+/// The slim, rarely changing part of a transfer: what grouping, filtering, counts and
+/// bulk actions need. Progress fields stay out so a progress tick leaves it unchanged.
 #[derive(Clone, Debug, PartialEq)]
-struct UserResponse {
+pub(crate) struct Entry {
+    id: String,
     username: String,
-    directories: Vec<DirectoryResponse>,
+    filename: String,
+    root: Option<String>,
+    size: u64,
+    state: State,
+    removed: bool,
+    /// Lower-case `username\nfilename` for the text filter.
+    haystack: String,
+}
+
+impl Entry {
+    fn new(file: &Transfer) -> Self {
+        Self {
+            id: file.id.clone(),
+            username: file.username.clone(),
+            filename: file.filename.clone(),
+            root: file.root.clone(),
+            size: file.size,
+            state: file.state,
+            removed: file.removed,
+            haystack: format!("{}\n{}", file.username, file.filename).to_lowercase(),
+        }
+    }
+
+    fn category(&self) -> Category {
+        Category::of(self.state)
+    }
+
+    fn matches(&self, file: &Transfer) -> bool {
+        self.id == file.id
+            && self.username == file.username
+            && self.filename == file.filename
+            && self.root == file.root
+            && self.size == file.size
+            && self.state == file.state
+            && self.removed == file.removed
+    }
+}
+
+/// Transfer counts by category (removed transfers excluded).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    files: usize,
+    bytes: u64,
+    active: usize,
+    queued: usize,
+    succeeded: usize,
+    failed: usize,
+    cancelled: usize,
+}
+
+impl Counts {
+    fn add(&mut self, entry: &Entry) {
+        if entry.removed {
+            return;
+        }
+        self.files += 1;
+        self.bytes = self.bytes.saturating_add(entry.size);
+        match entry.category() {
+            Category::Active => self.active += 1,
+            Category::Queued => self.queued += 1,
+            Category::Succeeded => self.succeeded += 1,
+            Category::Failed => self.failed += 1,
+            Category::Cancelled => self.cancelled += 1,
+        }
+    }
+}
+
+/// One visible file of a directory group.
+#[derive(Clone, Debug, PartialEq)]
+struct FileRef {
+    id: String,
+    removed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct DirectoryResponse {
+struct DirLayout {
     directory: String,
-    files: Vec<Transfer>,
+    files: Vec<FileRef>,
 }
 
-/// Groups transfers by user, then by remote directory, in first-seen order.
-fn grouped(transfers: Vec<Transfer>) -> Vec<UserResponse> {
-    let mut users = Vec::<UserResponse>::new();
-    for file in transfers {
-        let directory = file
-            .filename
-            .rsplit_once(['\\', '/'])
-            .map_or("", |(directory, _)| directory)
-            .to_owned();
-        let user = match users.iter().position(|user| user.username == file.username) {
-            Some(index) => &mut users[index],
-            None => {
-                users.push(UserResponse {
-                    username: file.username.clone(),
-                    directories: Vec::new(),
-                });
-                users.last_mut().expect("added user")
-            }
-        };
-        match user
-            .directories
-            .iter_mut()
-            .find(|group| group.directory == directory)
+/// One user's visible transfers, grouped by remote directory.
+#[derive(Clone, Debug, PartialEq)]
+struct UserLayout {
+    username: String,
+    directories: Vec<DirLayout>,
+    counts: Counts,
+}
+
+fn directory_of(filename: &str) -> &str {
+    filename
+        .rsplit_once(['\\', '/'])
+        .map_or("", |(directory, _)| directory)
+}
+
+/// Groups the matching entries by user, then by remote directory, in first-seen order;
+/// files are sorted by name within a directory.
+fn build_layout(index: &[Entry], filter: Filter, query: &str) -> Vec<UserLayout> {
+    let query = query.trim().to_lowercase();
+    let mut users = Vec::<UserLayout>::new();
+    let mut user_positions = HashMap::<&str, usize>::new();
+    let mut dir_positions = HashMap::<(usize, &str), usize>::new();
+    let mut names = HashMap::<&str, &str>::new();
+    for entry in index {
+        if !filter.matches(entry.category())
+            || (!query.is_empty() && !entry.haystack.contains(&query))
         {
-            Some(group) => group.files.push(file),
-            None => user.directories.push(DirectoryResponse {
-                directory,
-                files: vec![file],
-            }),
+            continue;
+        }
+        let user = *user_positions
+            .entry(entry.username.as_str())
+            .or_insert_with(|| {
+                users.push(UserLayout {
+                    username: entry.username.clone(),
+                    directories: Vec::new(),
+                    counts: Counts::default(),
+                });
+                users.len() - 1
+            });
+        let directory = directory_of(&entry.filename);
+        let layout = &mut users[user];
+        layout.counts.add(entry);
+        let position = *dir_positions.entry((user, directory)).or_insert_with(|| {
+            layout.directories.push(DirLayout {
+                directory: directory.to_owned(),
+                files: Vec::new(),
+            });
+            layout.directories.len() - 1
+        });
+        names.insert(&entry.id, util::get_file_name(&entry.filename));
+        layout.directories[position].files.push(FileRef {
+            id: entry.id.clone(),
+            removed: entry.removed,
+        });
+    }
+    for user in &mut users {
+        for directory in &mut user.directories {
+            directory.files.sort_unstable_by(|a, b| {
+                names[a.id.as_str()]
+                    .cmp(names[b.id.as_str()])
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
     }
     users
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation {
     Retry,
     Cancel,
@@ -69,28 +258,77 @@ enum Operation {
 }
 
 impl Operation {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Retry => "Retry",
-            Self::Cancel => "Cancel",
-            Self::Remove => "Remove",
-        }
+    fn allows(self, direction: TransferDirection, entry: &Entry) -> bool {
+        self.permits(direction, entry.state, entry.removed)
     }
 
-    fn allows(self, file: &Transfer) -> bool {
-        if file.removed {
+    fn permits(self, direction: TransferDirection, state: State, removed: bool) -> bool {
+        if removed {
             return false;
         }
-        let completed = file.state.is_complete();
         match self {
-            Self::Retry => file.direction == TransferDirection::Download && file.state.is_failed(),
-            Self::Cancel => !completed,
-            Self::Remove => completed,
+            Self::Retry => direction == TransferDirection::Download && state.is_failed(),
+            Self::Cancel => !state.is_complete(),
+            Self::Remove => state.is_complete(),
         }
     }
 }
 
-type Change = Callback<(Operation, Vec<Transfer>)>;
+type Change = Callback<(Operation, Vec<Entry>)>;
+
+/// Everything the group, directory and row components share. `Copy`, so it is passed by
+/// value instead of a dozen props.
+#[derive(Clone, Copy)]
+struct Page {
+    direction: TransferDirection,
+    /// One signal per transfer, written only when that transfer changed.
+    rows: StoredValue<HashMap<String, ArcRwSignal<Transfer>>>,
+    index: RwSignal<Vec<Entry>>,
+    layout: Memo<Vec<UserLayout>>,
+    selected: RwSignal<HashSet<String>>,
+    working: RwSignal<Option<Operation>>,
+    connected: Signal<bool>,
+    change: Change,
+    /// The transfer shown in the details dialog.
+    details: RwSignal<Option<String>>,
+    /// Refreshed every 30 s for relative times ("2h ago").
+    now: RwSignal<DateTime<Utc>>,
+}
+
+impl Page {
+    /// Entries of the given ids (in index order).
+    fn entries(self, ids: &HashSet<String>) -> Vec<Entry> {
+        self.index.with_untracked(|index| {
+            index
+                .iter()
+                .filter(|entry| ids.contains(&entry.id))
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Entries of one user (or all users) that the operation applies to and that match
+    /// `keep`.
+    fn targets(
+        self,
+        operation: Operation,
+        username: Option<&str>,
+        keep: impl Fn(&Entry) -> bool,
+    ) -> Vec<Entry> {
+        self.index.with_untracked(|index| {
+            index
+                .iter()
+                .filter(|entry| username.is_none_or(|name| entry.username == name))
+                .filter(|entry| operation.allows(self.direction, entry) && keep(entry))
+                .cloned()
+                .collect()
+        })
+    }
+
+    fn base(self) -> String {
+        config::url_base().trim_end_matches('/').to_owned()
+    }
+}
 
 fn collection(direction: TransferDirection) -> String {
     format!("/transfers/{}", direction.collection())
@@ -108,41 +346,77 @@ fn transfer_url(direction: TransferDirection, id: &str) -> String {
 pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     let state = expect_context::<AppContext>().state;
     let connected = Signal::derive(move || state.with(|state| state.server.state.is_connected()));
-    let users = RwSignal::new(Vec::<UserResponse>::new());
+    let rows = StoredValue::new(HashMap::<String, ArcRwSignal<Transfer>>::new());
+    let index = RwSignal::new(Vec::<Entry>::new());
+    let speed = RwSignal::new(0.0_f64);
     let loading = RwSignal::new(true);
     let load_error = RwSignal::new(None::<String>);
     let action_error = RwSignal::new(None::<String>);
     let history = RwSignal::new(false);
     let working = RwSignal::new(None::<Operation>);
-    let label = direction.as_str();
+    let selected = RwSignal::new(HashSet::<String>::new());
+    let details = RwSignal::new(None::<String>);
+    let now = RwSignal::new(Utc::now());
+    let filter = RwSignal::new(Filter::All);
+    let query = RwSignal::new(String::new());
+    let confirm_cancel = RwSignal::new(false);
+    let is_download = direction == TransferDirection::Download;
+    let noun = if is_download { "download" } else { "upload" };
+
+    let layout = Memo::new(move |_| {
+        index.with(|index| query.with(|query| build_layout(index, filter.get(), query)))
+    });
+    let counts = Memo::new(move |_| {
+        index.with(|index| {
+            let mut counts = Counts::default();
+            for entry in index {
+                counts.add(entry);
+            }
+            counts
+        })
+    });
+
+    // Selection follows what is visible: rows hidden by a filter (or gone) drop out.
+    Effect::new(move |_| {
+        layout.with(|layout| {
+            let visible = layout
+                .iter()
+                .flat_map(|user| &user.directories)
+                .flat_map(|directory| &directory.files)
+                .filter(|file| !file.removed)
+                .map(|file| file.id.as_str())
+                .collect::<HashSet<_>>();
+            if selected
+                .with_untracked(|selected| selected.iter().any(|id| !visible.contains(id.as_str())))
+            {
+                selected.update(|selected| selected.retain(|id| visible.contains(id.as_str())));
+            }
+        });
+    });
 
     spawn_local_scoped_with_cancellation(async move {
         let active_url = collection(direction);
         let history_url = format!("{active_url}?include_removed=true");
+        let mut ticks = 0_u32;
         loop {
+            if document().hidden() {
+                util::sleep(1_000).await;
+                continue;
+            }
             let include_removed = history.get_untracked();
             let url = if include_removed {
                 &history_url
             } else {
                 &active_url
             };
-            let snapshot = api::get::<Vec<Transfer>>(url).await.map(grouped);
+            let snapshot = api::get::<Vec<Transfer>>(url).await;
             if history.get_untracked() == include_removed {
                 match snapshot {
-                    Ok(mut snapshot) => {
-                        for user in &mut snapshot {
-                            if !include_removed {
-                                for directory in &mut user.directories {
-                                    directory.files.retain(|file| !file.removed);
-                                }
-                            }
-                            user.directories
-                                .retain(|directory| !directory.files.is_empty());
+                    Ok(mut list) => {
+                        if !include_removed {
+                            list.retain(|file| !file.removed);
                         }
-                        snapshot.retain(|user| !user.directories.is_empty());
-                        if users.with_untracked(|previous| *previous != snapshot) {
-                            users.set(snapshot);
-                        }
+                        apply_snapshot(list, rows, index, speed);
                         if load_error.with_untracked(Option::is_some) {
                             load_error.set(None);
                         }
@@ -159,11 +433,20 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     loading.set(false);
                 }
             }
+            ticks = ticks.wrapping_add(1);
+            if ticks.is_multiple_of(30) {
+                now.set(Utc::now());
+            }
             util::sleep(1_000).await;
         }
     });
 
-    let change = Callback::new(move |(operation, files): (Operation, Vec<Transfer>)| {
+    // Actions run in the page's owner, not the clicked control's: a menu, the selection
+    // bar or a row can unmount while the requests are still running.
+    let owner = StoredValue::new(Owner::current().expect("the page has an owner"));
+    let in_page = move |f: Box<dyn FnOnce()>| owner.with_value(|owner| owner.with(f));
+
+    let change = Callback::new(move |(operation, files): (Operation, Vec<Entry>)| {
         if working.with_untracked(Option::is_some)
             || (operation == Operation::Retry && !connected.get_untracked())
         {
@@ -171,149 +454,406 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         }
         let files = files
             .into_iter()
-            .filter(|file| file.direction == direction && operation.allows(file))
+            .filter(|file| operation.allows(direction, file))
             .collect::<Vec<_>>();
         if files.is_empty() {
             return;
         }
         working.set(Some(operation));
         action_error.set(None);
-        spawn_local_scoped_with_cancellation(async move {
-            let errors = match operation {
-                Operation::Retry => retry(files).await,
-                Operation::Cancel | Operation::Remove => {
-                    change_transfers(direction, operation, files).await
+        in_page(Box::new(move || {
+            spawn_local_scoped_with_cancellation(async move {
+                let errors = match operation {
+                    Operation::Retry => retry(files).await,
+                    Operation::Cancel | Operation::Remove => {
+                        change_transfers(direction, operation, files).await
+                    }
+                };
+                if !errors.is_empty() {
+                    action_error.set(Some(errors.into_iter().collect::<Vec<_>>().join("; ")));
                 }
-            };
-            if !errors.is_empty() {
-                action_error.set(Some(errors.into_iter().collect::<Vec<_>>().join("; ")));
-            }
-            working.set(None);
-        });
+                working.set(None);
+            });
+        }));
     });
 
+    let page = Page {
+        direction,
+        rows,
+        index,
+        layout,
+        selected,
+        working,
+        connected,
+        change,
+        details,
+        now,
+    };
+
+    let clear_completed = move || {
+        if working.with_untracked(Option::is_some) {
+            return;
+        }
+        working.set(Some(Operation::Remove));
+        action_error.set(None);
+        in_page(Box::new(move || {
+            spawn_local_scoped_with_cancellation(async move {
+                let url = format!("{}/completed", collection(direction));
+                if let Err(error) = api::request_text(Method::DELETE, &url, None).await {
+                    action_error.set(Some(error.to_string()));
+                }
+                working.set(None);
+            });
+        }));
+    };
+
+    let busy = Signal::derive(move || working.with(Option::is_some));
+    let has_failed = Signal::derive(move || counts.with(|counts| counts.failed > 0));
+    let has_open = Signal::derive(move || counts.with(|c| c.active + c.queued > 0));
+    let has_completed =
+        Signal::derive(move || counts.with(|c| c.succeeded + c.failed + c.cancelled > 0));
+    let header_actions = move || {
+        view! {
+            {is_download.then(|| view! {
+                <Button icon="rotate-cw" text="Retry failed"
+                    disabled=Signal::derive(move || busy.get() || !connected.get() || !has_failed.get())
+                    loading=Signal::derive(move || working.get() == Some(Operation::Retry))
+                    on_click=Callback::new(move |_| change.run((Operation::Retry,
+                        page.targets(Operation::Retry, None, |entry| entry.category() == Category::Failed))))/>
+            })}
+            <Button variant="danger-outline" icon="circle-x" text="Cancel all"
+                disabled=Signal::derive(move || busy.get() || !has_open.get())
+                loading=Signal::derive(move || working.get() == Some(Operation::Cancel))
+                on_click=Callback::new(move |_| confirm_cancel.set(true))/>
+            <DropdownMenu label="Clear finished transfers" text=Signal::stored("Clear".to_owned()) icon="trash-2" align="end">
+                <button type="button" class="menu__item" role="menuitem"
+                    disabled=move || busy.get() || counts.with(|c| c.succeeded == 0)
+                    on:click=move |_| change.run((Operation::Remove,
+                        page.targets(Operation::Remove, None, |entry| entry.state == State::Succeeded)))>
+                    <Icon name="circle-check"/>"Clear succeeded"
+                </button>
+                <button type="button" class="menu__item" role="menuitem"
+                    disabled=move || busy.get() || counts.with(|c| c.failed + c.cancelled == 0)
+                    on:click=move |_| change.run((Operation::Remove,
+                        page.targets(Operation::Remove, None, |entry| entry.state.is_failed())))>
+                    <Icon name="circle-alert"/>"Clear failed and cancelled"
+                </button>
+                <div class="menu__separator"></div>
+                <button type="button" class="menu__item" role="menuitem"
+                    disabled=move || busy.get() || !has_completed.get()
+                    on:click=move |_| clear_completed()>
+                    <Icon name="trash-2"/>"Clear all completed"
+                </button>
+            </DropdownMenu>
+        }
+    };
+
+    let title = if is_download { "Downloads" } else { "Uploads" };
+    let description = if is_download {
+        "Files you are downloading from other users, grouped by user and folder."
+    } else {
+        "Files other users are downloading from your shares."
+    };
+    let filter_value = Signal::derive(move || filter.get().value().to_owned());
+    let empty = Signal::derive(move || index.with(Vec::is_empty));
+    let no_matches = Signal::derive(move || layout.with(Vec::is_empty));
+    let base = page.base();
+    let (empty_title, empty_description, empty_href, empty_icon, empty_action) = if is_download {
+        (
+            "No downloads yet",
+            "Find something on the Search page and download it; it shows up here.",
+            format!("{base}/searches"),
+            "search",
+            "Go to Search",
+        )
+    } else {
+        (
+            "No uploads yet",
+            "When other users download files from your shares, they show up here.",
+            format!("{base}/system/shares"),
+            "share-2",
+            "Manage shares",
+        )
+    };
+
     view! {
-        <div class="transfer-segment">
-            <div class="ui raised segment transfers-header-segment">
-                <div class="transfers-segment-icon"><i class=format!("big {label} icon") aria-hidden="true"></i></div>
-                <label><input type="checkbox" prop:checked=history on:change=move |event| {
-                    history.set(event_target_checked(&event));
-                    loading.set(true);
-                }/>" Show removed transfers"</label>
-                <div class="transfers-header-buttons" hidden=move || users.with(Vec::is_empty)>
-                    { (direction == TransferDirection::Download).then(|| view! {
-                        <BulkAction operation=Operation::Retry choices=&["Errored", "Cancelled", "All"] users working connected change/>
-                    }) }
-                    <BulkAction operation=Operation::Cancel choices=&["All", "Queued", "In Progress"] users working connected change/>
-                    <BulkAction operation=Operation::Remove choices=&["Succeeded", "Errored", "Cancelled", "Completed"] users working connected change/>
+        <div class="transfers stack" class:transfers--busy=busy>
+            <div class="page-header transfers-header">
+                <div class="stack stack--sm">
+                    <div>
+                        <h1 class="page-header__title">{title}</h1>
+                        <p class="page-header__description">{description}</p>
+                    </div>
+                    <div class="cluster transfers-summary" aria-live="polite">
+                        {move || counts.with(|c| summary_badges(*c, speed.get(), is_download))}
+                    </div>
+                </div>
+                <div class="page-header__actions">{header_actions}</div>
+            </div>
+
+            <div class="card card--compact transfers-toolbar">
+                <div class="toolbar">
+                    <div class="input-icon grow">
+                        <Icon name="search"/>
+                        <input class="input" type="search" aria-label=format!("Filter {noun}s")
+                            placeholder="Filter by user or file name"
+                            prop:value=query on:input=move |event| query.set(event_target_value(&event))/>
+                    </div>
+                    <div class="tabs transfers-filter" role="group" aria-label="Filter by state">
+                        {Filter::ALL.into_iter().map(|option| {
+                            let selected = Memo::new(move |_| filter.get() == option);
+                            let count = move || counts.with(|c| match option {
+                                Filter::All => c.files,
+                                Filter::Active => c.active,
+                                Filter::Queued => c.queued,
+                                Filter::Completed => c.succeeded,
+                                Filter::Failed => c.failed + c.cancelled,
+                            });
+                            view! {
+                                <button type="button" class="tabs__tab" class:is-active=selected
+                                    data-filter=option.value()
+                                    aria-pressed=move || selected.get().to_string()
+                                    on:click=move |_| filter.set(option)>
+                                    {option.label()}
+                                    <span class="transfers-tab-count tabular">{count}</span>
+                                </button>
+                            }
+                        }).collect_view()}
+                    </div>
+                    <label class="switch transfers-history">
+                        <input type="checkbox" role="switch" prop:checked=history on:change=move |event| {
+                            history.set(event_target_checked(&event));
+                            loading.set(true);
+                        }/>
+                        <span class="switch__track" aria-hidden="true"></span>
+                        <span class="switch__label">"Show removed"</span>
+                    </label>
                 </div>
             </div>
-            {move || load_error.get().map(|error| view! { <div class="ui negative message" role="alert">{error}</div> })}
-            {move || action_error.get().map(|error| view! { <div class="ui negative message" role="alert">{error}</div> })}
-            {move || {
-                if loading.get() {
-                    view! { <div class="ui raised segment"><div class="ui active centered inline loader" role="status" aria-label=format!("Loading {label}s")></div></div> }.into_any()
-                } else if users.with(Vec::is_empty) && load_error.with(Option::is_none) {
-                    view! { <div class="ui basic placeholder segment placeholder-segment"><div class="ui icon header">
-                        <i class=format!("{label} icon") aria-hidden="true"></i>{format!("No {label}s to display")}
-                    </div></div> }.into_any()
-                } else { ().into_any() }
+
+            {move || load_error.get().map(|error| view! {
+                <Alert variant="danger" title=format!("Could not load {noun}s")>{error}</Alert>
+            })}
+            {move || action_error.get().map(|error| view! {
+                <Alert variant="danger" title="Some actions failed"
+                    on_dismiss=Callback::new(move |()| action_error.set(None))>{error}</Alert>
+            })}
+
+            {move || if loading.get() {
+                view! { <div class="card"><Loading label=format!("Loading {noun}s") show_label=true/></div> }.into_any()
+            } else if empty.get() && load_error.with(Option::is_none) {
+                let href = empty_href.clone();
+                view! {
+                    <div class="card transfers-empty">
+                        <EmptyState icon=if is_download { "download" } else { "upload" }
+                            title=empty_title description=empty_description>
+                            <Button variant="primary" icon=empty_icon text=empty_action href=href/>
+                        </EmptyState>
+                    </div>
+                }.into_any()
+            } else if no_matches.get() && !empty.get() {
+                view! {
+                    <div class="card transfers-empty">
+                        <EmptyState icon="list-filter" title=format!("No {noun}s match")
+                            description="Try another filter or clear the search.">
+                            <Button text="Clear filters" icon="x" on_click=Callback::new(move |_| {
+                                query.set(String::new());
+                                filter.set(Filter::All);
+                            })/>
+                        </EmptyState>
+                    </div>
+                }.into_any()
+            } else {
+                ().into_any()
             }}
-            <div hidden=loading>
-                <For each=move || users.with(|users| users.iter().map(|user| user.username.clone()).collect::<Vec<_>>())
+
+            <div class="transfers-groups stack" hidden=loading data-filter=filter_value>
+                <For each=move || layout.with(|layout| layout.iter().map(|user| user.username.clone()).collect::<Vec<_>>())
                     key=String::clone children=move |username: String| view! {
-                        <groups::TransferGroup username users direction connected working change/>
+                        <groups::TransferGroup username page/>
                     }/>
             </div>
+
+            <SelectionBar page/>
+            <groups::DetailsDialog page/>
+            <Modal open=confirm_cancel size="sm"
+                on_close=Callback::new(move |()| confirm_cancel.set(false))
+                title=format!("Cancel all {noun}s?")
+                content=format!("Every queued and active {noun} stops. Finished transfers are not affected.")
+                actions=vec![
+                    ModalAction::new("Keep them"),
+                    ModalAction::new("Cancel all").negative().on_click(move || {
+                        change.run((Operation::Cancel, page.targets(Operation::Cancel, None, |_| true)));
+                    }),
+                ]/>
         </div>
     }
 }
 
-fn matches_option(state: State, option: &str) -> bool {
-    match option {
-        "Errored" => matches!(state, State::TimedOut | State::Errored | State::Rejected),
-        "Succeeded" => state == State::Succeeded,
-        "Cancelled" => state == State::Cancelled,
-        "Queued" => state.is_queued(),
-        "In Progress" => state == State::InProgress,
-        _ => true,
+/// Writes a fresh snapshot into the per-row signals and the index, touching only what
+/// changed.
+fn apply_snapshot(
+    list: Vec<Transfer>,
+    rows: StoredValue<HashMap<String, ArcRwSignal<Transfer>>>,
+    index: RwSignal<Vec<Entry>>,
+    speed: RwSignal<f64>,
+) {
+    let entries = index.with_untracked(|current| {
+        let changed = current.len() != list.len()
+            || current
+                .iter()
+                .zip(&list)
+                .any(|(entry, file)| !entry.matches(file));
+        changed.then(|| list.iter().map(Entry::new).collect::<Vec<_>>())
+    });
+    let total_speed = list
+        .iter()
+        .filter(|file| file.state == State::InProgress && !file.removed)
+        .map(|file| file.average_speed)
+        .sum::<f64>();
+    rows.update_value(|map| {
+        if entries.is_some() && !map.is_empty() {
+            let ids = list
+                .iter()
+                .map(|file| file.id.as_str())
+                .collect::<HashSet<_>>();
+            map.retain(|id, _| ids.contains(id.as_str()));
+        }
+        for file in list {
+            if let Some(signal) = map.get(&file.id) {
+                if signal.with_untracked(|old| *old != file) {
+                    signal.set(file);
+                }
+            } else {
+                map.insert(file.id.clone(), ArcRwSignal::new(file));
+            }
+        }
+    });
+    if let Some(entries) = entries {
+        index.set(entries);
+    }
+    if speed.get_untracked() != total_speed {
+        speed.set(total_speed);
     }
 }
 
+fn summary_badges(counts: Counts, speed: f64, is_download: bool) -> impl IntoView {
+    let plural = |n: usize| if n == 1 { "file" } else { "files" };
+    let total = format!(
+        "{} {} · {}",
+        counts.files,
+        plural(counts.files),
+        util::format_bytes(counts.bytes as f64)
+    );
+    let mut badges = Vec::new();
+    if counts.files > 0 {
+        badges.push(view! { <Badge variant="outline" text=total/> }.into_any());
+    }
+    let mut push = |count: usize, variant: &'static str, icon: &'static str, label: &str| {
+        if count > 0 {
+            badges.push(
+                view! { <Badge variant=variant icon=icon text=format!("{count} {label}")/> }
+                    .into_any(),
+            );
+        }
+    };
+    push(counts.active, "primary", "activity", "active");
+    push(counts.queued, "warning", "clock", "queued");
+    push(counts.succeeded, "success", "circle-check", "succeeded");
+    push(counts.failed, "danger", "circle-alert", "failed");
+    push(counts.cancelled, "neutral", "ban", "cancelled");
+    if speed > 0.0 {
+        let icon = if is_download {
+            "arrow-down"
+        } else {
+            "arrow-up"
+        };
+        badges.push(
+            view! { <Badge variant="primary" icon=icon text=util::format_speed(speed) title="Current speed"/> }
+                .into_any(),
+        );
+    }
+    badges.collect_view()
+}
+
+/// The floating bar with actions for the selected rows.
 #[component]
-fn BulkAction(
-    operation: Operation,
-    choices: &'static [&'static str],
-    users: RwSignal<Vec<UserResponse>>,
-    working: RwSignal<Option<Operation>>,
-    connected: Signal<bool>,
-    change: Change,
-) -> impl IntoView {
-    let choice = RwSignal::new(choices[0].to_owned());
-    let available = move || {
-        users.with(|users| {
-            choice.with(|choice| {
-                all_files(users)
-                    .any(|file| operation.allows(file) && matches_option(file.state, choice))
+fn SelectionBar(page: Page) -> impl IntoView {
+    let Page {
+        direction,
+        selected,
+        working,
+        connected,
+        change,
+        ..
+    } = page;
+    let info = Memo::new(move |_| {
+        selected.with(|selected| {
+            page.index.with(|index| {
+                let mut count = 0;
+                let (mut retry, mut cancel, mut remove) = (false, false, false);
+                for entry in index.iter().filter(|entry| selected.contains(&entry.id)) {
+                    count += 1;
+                    retry |= Operation::Retry.allows(direction, entry);
+                    cancel |= Operation::Cancel.allows(direction, entry);
+                    remove |= Operation::Remove.allows(direction, entry);
+                }
+                (count, retry, cancel, remove)
             })
         })
-    };
-    let run = move |_| {
-        let files = users.with_untracked(|users| {
-            choice.with_untracked(|choice| {
-                all_files(users)
-                    .filter(|file| operation.allows(file) && matches_option(file.state, choice))
-                    .cloned()
-                    .collect()
-            })
-        });
+    });
+    let run = move |operation| {
+        let files = selected.with_untracked(|selected| page.entries(selected));
         change.run((operation, files));
     };
-    let (class, icon) = match operation {
-        Operation::Retry => ("ui green button", "redo icon"),
-        Operation::Cancel => ("ui red button", "x icon"),
-        Operation::Remove => ("ui button", "trash alternate icon"),
-    };
-    let label = operation.name();
+    let busy = Signal::derive(move || working.with(Option::is_some));
     view! {
-        <span class="ui buttons">
-            <button type="button" class=class class:loading=move || working.get() == Some(operation)
-                disabled=move || working.with(Option::is_some) || (operation == Operation::Retry && !connected.get()) || !available()
-                on:click=run>
-                <i class=icon aria-hidden="true"></i>
-                {move || choice.with(|choice| if choice == "All" { format!("{label} All") } else { format!("{label} All {choice}") })}
-            </button>
-            <select class="ui compact dropdown" aria-label=format!("{label} transfers by state")
-                disabled=move || working.with(Option::is_some) prop:value=choice on:change=move |event| choice.set(event_target_value(&event))>
-                {choices.iter().map(|choice| view! { <option value=*choice>{*choice}</option> }).collect_view()}
-            </select>
-        </span>" "
+        <Show when=move || info.with(|(count, ..)| *count > 0)>
+            <div class="transfers-selection" role="region" aria-label="Selected transfers">
+                <span class="transfers-selection__count">
+                    {move || info.with(|(count, ..)| format!("{count} selected"))}
+                </span>
+                <div class="transfers-selection__actions">
+                    <Show when=move || info.with(|(_, retry, ..)| *retry)>
+                        <Button size="sm" icon="rotate-cw" text="Retry"
+                            disabled=Signal::derive(move || busy.get() || !connected.get())
+                            on_click=Callback::new(move |_| run(Operation::Retry))/>
+                    </Show>
+                    <Show when=move || info.with(|(_, _, cancel, _)| *cancel)>
+                        <Button size="sm" variant="danger-outline" icon="circle-x" text="Cancel"
+                            disabled=busy on_click=Callback::new(move |_| run(Operation::Cancel))/>
+                    </Show>
+                    <Show when=move || info.with(|(.., remove)| *remove)>
+                        <Button size="sm" icon="trash-2" text="Remove"
+                            disabled=busy on_click=Callback::new(move |_| run(Operation::Remove))/>
+                    </Show>
+                    <Button size="sm" variant="ghost" icon="x" label="Clear selection"
+                        on_click=Callback::new(move |_| selected.set(HashSet::new()))/>
+                </div>
+            </div>
+        </Show>
     }
 }
 
-fn all_files(users: &[UserResponse]) -> impl Iterator<Item = &Transfer> {
-    users
-        .iter()
-        .flat_map(|user| user.directories.iter())
-        .flat_map(|directory| &directory.files)
-}
-
-async fn retry(files: Vec<Transfer>) -> BTreeSet<String> {
-    let mut requests: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+async fn retry(files: Vec<Entry>) -> BTreeSet<String> {
+    let mut requests: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
     for file in files {
         requests
-            .entry(file.username)
+            .entry((file.username, file.root))
             .or_default()
             .insert(file.filename, file.size);
     }
     let mut errors = BTreeSet::new();
-    for (username, files) in requests {
-        let body = EnqueueDownloads {
-            username: username.clone(),
-            files: files
-                .into_iter()
-                .map(|(filename, size)| DownloadFile { filename, size })
-                .collect(),
+    for ((username, root), files) in requests {
+        let body = EnqueueDownloadsRequest {
+            downloads: EnqueueDownloads {
+                username: username.clone(),
+                files: files
+                    .into_iter()
+                    .map(|(filename, size)| DownloadFile { filename, size })
+                    .collect(),
+            },
+            root,
         };
         match api::post::<_, EnqueuedDownloads>("/transfers/downloads", &body).await {
             Ok(response) => {
@@ -336,7 +876,7 @@ async fn retry(files: Vec<Transfer>) -> BTreeSet<String> {
 async fn change_transfers(
     direction: TransferDirection,
     operation: Operation,
-    files: Vec<Transfer>,
+    files: Vec<Entry>,
 ) -> BTreeSet<String> {
     let mut errors = BTreeSet::new();
     for file in files {
@@ -351,4 +891,86 @@ async fn change_transfers(
         }
     }
     errors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, username: &str, filename: &str, state: State) -> Entry {
+        Entry {
+            root: None,
+            id: id.into(),
+            username: username.into(),
+            filename: filename.into(),
+            size: 10,
+            state,
+            removed: false,
+            haystack: format!("{username}\n{filename}").to_lowercase(),
+        }
+    }
+
+    type Row = (String, String, Vec<String>);
+
+    fn rows(layout: &[UserLayout]) -> Vec<Row> {
+        layout
+            .iter()
+            .flat_map(|user| {
+                user.directories.iter().map(|dir| {
+                    (
+                        user.username.clone(),
+                        dir.directory.clone(),
+                        dir.files.iter().map(|file| file.id.clone()).collect(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn row(user: &str, dir: &str, ids: &[&str]) -> Row {
+        (
+            user.into(),
+            dir.into(),
+            ids.iter().map(|id| (*id).to_owned()).collect(),
+        )
+    }
+
+    #[test]
+    fn layout_groups_by_user_and_directory_and_sorts_files() {
+        let index = [
+            entry("1", "bob", "@@a\\Dir\\b.mp3", State::Succeeded),
+            entry("2", "alice", "@@x\\y.flac", State::InProgress),
+            entry("3", "bob", "@@a\\Dir\\a.mp3", State::Errored),
+            entry("4", "bob", "@@a\\Other\\c.mp3", State::QueuedRemotely),
+        ];
+        let layout = build_layout(&index, Filter::All, "");
+        assert_eq!(
+            rows(&layout),
+            vec![
+                row("bob", "@@a\\Dir", &["3", "1"]),
+                row("bob", "@@a\\Other", &["4"]),
+                row("alice", "@@x", &["2"]),
+            ]
+        );
+        assert_eq!(layout[0].counts.files, 3);
+        assert_eq!(layout[0].counts.failed, 1);
+    }
+
+    #[test]
+    fn layout_applies_state_and_text_filters() {
+        let index = [
+            entry("1", "bob", "@@a\\Dir\\b.mp3", State::Succeeded),
+            entry("2", "alice", "@@x\\Song.flac", State::InProgress),
+            entry("3", "bob", "@@a\\Dir\\a.mp3", State::Cancelled),
+        ];
+        assert_eq!(
+            rows(&build_layout(&index, Filter::Failed, "")),
+            vec![row("bob", "@@a\\Dir", &["3"])]
+        );
+        assert_eq!(
+            rows(&build_layout(&index, Filter::All, " SONG ")),
+            vec![row("alice", "@@x", &["2"])]
+        );
+        assert!(build_layout(&index, Filter::Queued, "").is_empty());
+    }
 }

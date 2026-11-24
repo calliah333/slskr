@@ -1,17 +1,18 @@
-//! Settings → API keys: list, create (the key is shown once) and delete.
+//! Settings → API keys: list, create (the key is shown once, in the dialog) and delete.
 
-use super::fields::use_form;
-use crate::{
-    services::{api, util::encode_uri_component},
-    ui::{
-        Badge, Icon, Modal, ModalAction,
-        form::{Field, FieldGrid, FormMessage, ListEditor, Section, Select, TextInput},
-    },
-};
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use slskr_types::{
     config::ApiKeyRole,
     settings::{CreateApiKey, CreatedApiKey},
+};
+
+use super::{account::ConfigBadge, fields::use_form};
+use crate::{
+    services::{api, util::encode_uri_component},
+    ui::{
+        Badge, EmptyState, Icon, Modal, ModalAction,
+        form::{ChipInput, Field, FormMessage, Section, Select, TextInput},
+    },
 };
 
 fn role_badge(role: ApiKeyRole) -> &'static str {
@@ -24,9 +25,9 @@ fn role_badge(role: ApiKeyRole) -> &'static str {
 
 fn role_name(role: ApiKeyRole) -> &'static str {
     match role {
-        ApiKeyRole::ReadOnly => "readonly",
-        ApiKeyRole::ReadWrite => "readwrite",
-        ApiKeyRole::Admin => "admin",
+        ApiKeyRole::ReadOnly => "Read only",
+        ApiKeyRole::ReadWrite => "Read & write",
+        ApiKeyRole::Admin => "Admin",
     }
 }
 
@@ -41,6 +42,119 @@ fn parse_role(text: &str) -> ApiKeyRole {
 #[component]
 pub fn ApiKeys() -> impl IntoView {
     let form = use_form();
+    let open = RwSignal::new(false);
+    let deleting = RwSignal::new(None::<String>);
+    let delete_open = Signal::derive(move || deleting.with(Option::is_some));
+    let error = RwSignal::new(None::<String>);
+
+    let keys = move || {
+        form.settings
+            .with(|s| s.as_ref().map(|s| s.api_keys.clone()).unwrap_or_default())
+    };
+
+    let confirm_delete = move || {
+        let Some(target) = deleting.get_untracked() else {
+            return;
+        };
+        spawn_local_scoped_with_cancellation(async move {
+            let path = format!("/api-keys/{}", encode_uri_component(&target));
+            match api::request_text(gloo_net::http::Method::DELETE, &path, None).await {
+                Ok(_) => form.reload().await,
+                Err(failure) => error.set(Some(failure.message)),
+            }
+            deleting.set(None);
+        });
+    };
+
+    let new_key = move |_| {
+        error.set(None);
+        open.set(true);
+    };
+
+    view! {
+        <Section id="settings-api-keys" title="API keys"
+            description="Let scripts use the API with the X-API-Key header. Changes apply at once."
+            actions=ViewFn::from(move || view! {
+                <button type="button" class="btn btn--sm api-key-new" on:click=new_key>
+                    <Icon name="plus"/>"Create key"
+                </button>
+            })>
+            {move || error.get().map(|message| view! { <FormMessage kind="danger"><p>{message}</p></FormMessage> })}
+            {move || {
+                let keys = keys();
+                if keys.is_empty() {
+                    return view! {
+                        <EmptyState icon="key" title="No API keys yet"
+                            description="Create a key for each script or tool that talks to slskr."/>
+                    }.into_any();
+                }
+                view! {
+                    <div class="table-wrap settings-table">
+                        <table class="table api-keys">
+                            <thead>
+                                <tr>
+                                    <th scope="col">"Name"</th>
+                                    <th scope="col">"Role"</th>
+                                    <th scope="col">"Allowed networks"</th>
+                                    <th scope="col" class="actions"><span class="sr-only">"Actions"</span></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {keys.into_iter().map(|key| {
+                                    let target = key.name.clone();
+                                    let networks = if key.allow.is_empty() {
+                                        view! { <span class="muted">"Any address"</span> }.into_any()
+                                    } else {
+                                        key.allow.iter().map(|cidr| view! {
+                                            <code class="settings-cidr">{cidr.clone()}</code>
+                                        }).collect_view().into_any()
+                                    };
+                                    view! {
+                                        <tr class="api-key-row">
+                                            <td class="font-medium">
+                                                <span class="row"><Icon name="key" class="muted"/>{key.name.clone()}</span>
+                                            </td>
+                                            <td><Badge variant=role_badge(key.role) text=role_name(key.role)/></td>
+                                            <td><span class="cluster">{networks}</span></td>
+                                            <td class="actions">
+                                                {if key.pinned {
+                                                    view! { <ConfigBadge title="Set in slskr.toml; remove it there"/> }.into_any()
+                                                } else {
+                                                    view! {
+                                                        <button type="button" class="btn btn--action is-danger api-key-delete"
+                                                            aria-label=format!("Delete API key {}", key.name)
+                                                            title="Delete"
+                                                            on:click=move |_| deleting.set(Some(target.clone()))>
+                                                            <Icon name="trash-2"/>
+                                                        </button>
+                                                    }.into_any()
+                                                }}
+                                            </td>
+                                        </tr>
+                                    }
+                                }).collect_view()}
+                            </tbody>
+                        </table>
+                    </div>
+                }.into_any()
+            }}
+            <CreateKeyDialog open/>
+            <Modal open=delete_open size="sm"
+                on_close=Callback::new(move |()| deleting.set(None))
+                title="Delete API key?"
+                content="Scripts using this key stop working at once. This can not be undone."
+                actions=vec![
+                    ModalAction::new("Cancel"),
+                    ModalAction::new("Delete").negative().on_click(confirm_delete),
+                ]/>
+        </Section>
+    }
+}
+
+/// The Create key dialog; after creating, the same dialog shows the key once.
+#[component]
+fn CreateKeyDialog(open: RwSignal<bool>) -> impl IntoView {
+    let form = use_form();
     let name = RwSignal::new(String::new());
     let role = RwSignal::new("readonly".to_owned());
     let allow = RwSignal::new(Vec::<String>::new());
@@ -50,14 +164,15 @@ pub fn ApiKeys() -> impl IntoView {
     let creating = RwSignal::new(false);
     let created = RwSignal::new(None::<CreatedApiKey>);
     let copied = RwSignal::new(false);
-    let deleting = RwSignal::new(None::<String>);
-    let delete_open = Signal::derive(move || deleting.with(Option::is_some));
     let name_ref = NodeRef::<leptos::html::Input>::new();
     let key_ref = NodeRef::<leptos::html::Input>::new();
 
-    let keys = move || {
-        form.settings
-            .with(|s| s.as_ref().map(|s| s.api_keys.clone()).unwrap_or_default())
+    let close = move || {
+        open.set(false);
+        created.set(None);
+        name_error.set(None);
+        allow_error.set(None);
+        error.set(None);
     };
 
     let create = move || {
@@ -83,10 +198,11 @@ pub fn ApiKeys() -> impl IntoView {
                     created.set(Some(key));
                     copied.set(false);
                     name.set(String::new());
+                    role.set("readonly".to_owned());
                     allow.set(Vec::new());
                     form.reload().await;
                     request_animation_frame(move || {
-                        if let Some(input) = key_ref.get_untracked() {
+                        if let Some(input) = key_ref.try_get_untracked().flatten() {
                             let _ = input.focus();
                             input.select();
                         }
@@ -111,8 +227,7 @@ pub fn ApiKeys() -> impl IntoView {
         if let Some(input) = key_ref.get_untracked() {
             input.select();
         }
-        let clipboard = window().navigator().clipboard();
-        let promise = clipboard.write_text(&key);
+        let promise = window().navigator().clipboard().write_text(&key);
         // Without clipboard access the key stays selected for Ctrl+C.
         leptos::task::spawn_local(async move {
             let ok = wasm_bindgen_futures::JsFuture::from(promise).await.is_ok();
@@ -120,35 +235,39 @@ pub fn ApiKeys() -> impl IntoView {
         });
     };
 
-    let confirm_delete = move || {
-        let Some(target) = deleting.get_untracked() else {
-            return;
-        };
-        spawn_local_scoped_with_cancellation(async move {
-            let path = format!("/api-keys/{}", encode_uri_component(&target));
-            match api::request_text(gloo_net::http::Method::DELETE, &path, None).await {
-                Ok(_) => {
-                    if created.with_untracked(|c| c.as_ref().is_some_and(|c| c.name == target)) {
-                        created.set(None);
-                    }
-                    form.reload().await;
-                }
-                Err(failure) => error.set(Some(failure.message)),
-            }
-            deleting.set(None);
-        });
-    };
-
     view! {
-        <Section id="settings-api-keys" title="API keys"
-            description="Keys let scripts use the API with the X-API-Key header. Changes here apply at once.">
-            {move || error.get().map(|message| view! { <FormMessage kind="danger"><p>{message}</p></FormMessage> })}
-            {move || created.get().map(|key| view! {
-                <div class="alert alert--warning api-key-created" role="alert">
-                    <Icon name="key"/>
-                    <div class="alert__body stack stack--sm">
-                        <div class="alert__title">{format!("API key {} created", key.name)}</div>
-                        <p>"Copy it now: it is shown only this once and can not be recovered."</p>
+        <Modal open=open on_close=Callback::new(move |()| close())
+            title="Create API key" class="api-key-dialog"
+            description="Keys are shown once. Give each script its own key."
+            footer=ViewFn::from(move || view! {
+                <Show when=move || created.with(Option::is_none)
+                    fallback=move || view! {
+                        <button type="button" class="btn btn--primary api-key-done" on:click=move |_| close()>
+                            <Icon name="check"/>"Done"
+                        </button>
+                    }>
+                    <button type="button" class="btn" on:click=move |_| close()>"Cancel"</button>
+                    <button type="submit" form="api-key-form" class="btn btn--primary api-key-create-button"
+                        disabled=creating aria-busy=move || creating.get().then_some("true")>
+                        {move || if creating.get() {
+                            view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
+                        } else {
+                            view! { <Icon name="key"/> }.into_any()
+                        }}
+                        "Create key"
+                    </button>
+                </Show>
+            })>
+            {move || match created.get() {
+                Some(key) => view! {
+                    <div class="stack api-key-created">
+                        <div class="alert alert--warning" role="alert">
+                            <Icon name="triangle-alert"/>
+                            <div class="alert__body">
+                                <div class="alert__title">{format!("Copy the key for {} now", key.name)}</div>
+                                <p>"It is shown only this once and can not be recovered. Store it in your script's configuration."</p>
+                            </div>
+                        </div>
                         <div class="input-group">
                             <input node_ref=key_ref type="text" readonly aria-label="New API key"
                                 class="input input--mono api-key-value" prop:value=key.key.clone()/>
@@ -157,96 +276,35 @@ pub fn ApiKeys() -> impl IntoView {
                                 {move || if copied.get() { "Copied" } else { "Copy" }}
                             </button>
                         </div>
-                        <div>
-                            <button type="button" class="btn btn--sm api-key-done"
-                                on:click=move |_| created.set(None)>
-                                "I have saved it"
-                            </button>
-                        </div>
+                        <p class="help">"Send it in the X-API-Key header."</p>
                     </div>
-                </div>
-            })}
-            <div class="table-wrap">
-            <table class="table table--compact api-keys">
-                <thead>
-                    <tr><th scope="col">"Name"</th><th scope="col">"Role"</th><th scope="col">"Allowed networks"</th><th scope="col" class="actions"><span class="visually-hidden">"Actions"</span></th></tr>
-                </thead>
-                <tbody>
-                    {move || {
-                        let keys = keys();
-                        if keys.is_empty() {
-                            return view! { <tr class="empty-row"><td colspan="4">"No API keys yet."</td></tr> }.into_any();
-                        }
-                        keys.into_iter().map(|key| {
-                            let target = key.name.clone();
-                            view! {
-                                <tr class="api-key-row">
-                                    <td class="font-medium">{key.name.clone()}</td>
-                                    <td><Badge variant=role_badge(key.role) text=role_name(key.role)/></td>
-                                    <td class="mono text-xs">{if key.allow.is_empty() { "any".to_owned() } else { key.allow.join(", ") }}</td>
-                                    <td class="actions">
-                                        {if key.pinned {
-                                            view! { <Badge variant="outline" icon="lock" title="Set in slskr.toml; remove it there" text="slskr.toml"/> }.into_any()
-                                        } else {
-                                            view! {
-                                                <button type="button" class="btn btn--action is-danger api-key-delete"
-                                                    aria-label=format!("Delete API key {}", key.name)
-                                                    title="Delete"
-                                                    on:click=move |_| deleting.set(Some(target.clone()))>
-                                                    <Icon name="trash-2"/>
-                                                </button>
-                                            }.into_any()
-                                        }}
-                                    </td>
-                                </tr>
-                            }
-                        }).collect_view().into_any()
-                    }}
-                </tbody>
-            </table>
-            </div>
-            <form class="api-key-create form-subsection" on:submit=move |event| { event.prevent_default(); create(); }>
-                <h3 class="form-subsection-title">"Create a key"</h3>
-                <FieldGrid>
-                    <Field id="api-key-name" label="Name" error=name_error>
-                        <TextInput value=name node_ref=name_ref on_input=move |t: String| name.set(t)
-                            placeholder="e.g. soularr"/>
-                    </Field>
-                    <Field id="api-key-role" label="Role"
-                        help="readonly reads; readwrite also searches, downloads and chats; admin also reads logs.">
-                        <Select value=role on_change=move |r: String| role.set(r)
-                            options=vec![
-                                ("readonly".into(), "Read only".into()),
-                                ("readwrite".into(), "Read and write".into()),
-                                ("admin".into(), "Administrator".into()),
-                            ]/>
-                    </Field>
-                </FieldGrid>
-                <Field id="api-key-allow" label="Allowed networks" error=allow_error
-                    help="CIDR ranges allowed to use the key; empty allows every address.">
-                    <ListEditor items=allow on_change=Callback::new(move |items: Vec<String>| allow.set(items))
-                        placeholder="e.g. 192.168.0.0/16"/>
-                </Field>
-                <div>
-                    <button type="submit" class="btn btn--primary api-key-create-button" disabled=creating
-                        aria-busy=move || creating.get().then_some("true")>
-                        {move || if creating.get() {
-                            view! { <span class="spinner" aria-hidden="true"></span> }.into_any()
-                        } else {
-                            view! { <Icon name="plus"/> }.into_any()
-                        }}
-                        "Create key"
-                    </button>
-                </div>
-            </form>
-            <Modal open=delete_open size="sm"
-                on_close=Callback::new(move |()| deleting.set(None))
-                title="Delete API key"
-                content="Scripts using this key will stop working. Delete it?"
-                actions=vec![
-                    ModalAction::new("Cancel"),
-                    ModalAction::new("Delete").negative().on_click(confirm_delete),
-                ]/>
-        </Section>
+                }.into_any(),
+                None => view! {
+                    <form id="api-key-form" class="stack api-key-create" novalidate
+                        on:submit=move |event| { event.prevent_default(); create(); }>
+                        {move || error.get().map(|message| view! { <FormMessage kind="danger"><p>{message}</p></FormMessage> })}
+                        <Field id="api-key-name" label="Name" error=name_error
+                            help="To recognise the key, e.g. the script using it.">
+                            <TextInput value=name node_ref=name_ref on_input=move |t: String| name.set(t)
+                                placeholder="e.g. soularr"/>
+                        </Field>
+                        <Field id="api-key-role" label="Role"
+                            help="Read only reads; read & write also searches, downloads and chats; admin also reads logs.">
+                            <Select value=role on_change=move |r: String| role.set(r)
+                                options=vec![
+                                    ("readonly".into(), "Read only".into()),
+                                    ("readwrite".into(), "Read & write".into()),
+                                    ("admin".into(), "Admin".into()),
+                                ]/>
+                        </Field>
+                        <Field id="api-key-allow" label="Allowed networks" error=allow_error
+                            help="CIDR ranges that may use the key; none allows every address.">
+                            <ChipInput items=allow mono=true placeholder="e.g. 192.168.0.0/16, then Enter"
+                                on_change=Callback::new(move |items: Vec<String>| allow.set(items))/>
+                        </Field>
+                    </form>
+                }.into_any(),
+            }}
+        </Modal>
     }
 }

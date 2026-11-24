@@ -2,13 +2,6 @@
 
 use std::cell::OnceCell;
 
-/// Storage key holding the active chat conversation.
-pub const ACTIVE_CHAT_KEY: &str = "slskd-active-chat";
-/// Storage key holding the active room.
-pub const ACTIVE_ROOM_KEY: &str = "slskd-active-room";
-/// Storage key holding the active user info tab.
-pub const ACTIVE_USER_INFO_KEY: &str = "slskd-active-user";
-
 thread_local! {
     static URL_BASE: OnceCell<String> = const { OnceCell::new() };
 }

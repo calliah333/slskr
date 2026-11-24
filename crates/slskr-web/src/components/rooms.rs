@@ -1,18 +1,51 @@
-use crate::{config, services::util};
-use leptos::{html, prelude::*};
+//! Chat rooms (`/rooms`), IRC style: the buffer list, the open room with its topic bar
+//! (ticker), line log and input line, and the nick list.
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use chrono::{DateTime, Utc};
+use leptos::prelude::*;
 use leptos_router::{
     NavigateOptions,
     components::A,
     hooks::{use_navigate, use_url},
 };
-use slskr_types::rooms::{RoomMessage, RoomUser, Ticker};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use slskr_types::{
+    conversations::Conversation,
+    rooms::{RoomInfo, RoomMessage, RoomUser, Ticker},
+    users::UserPresence,
 };
 use wasm_bindgen_futures::spawn_local;
 
+use crate::{
+    components::chat::{
+        buffer::{
+            self, BufferView, Command, Entry, Events, HELP, InputLine, OFFLINE_REASON, PollProblem,
+            Tone, announce_connection, merge, nick_color, parse_command, push_event,
+            set_if_changed, use_logged_in, use_own_nick,
+        },
+        presence_dot,
+        sidebar::{BufferList, NewMessage, QueryRow, RoomRow},
+    },
+    config,
+    services::util,
+    ui::{Button, EmptyState, Icon, Loading, StatusDot},
+};
+
 mod join;
+
+pub(crate) use join::RoomJoin;
+
+/// Other rooms and the conversation list are checked every this many polls.
+const BACKGROUND_EVERY: u32 = 5;
+/// More joins and parts than this between two polls are not listed (e.g. after a reconnect).
+const MAX_PRESENCE_LINES: usize = 8;
 
 fn stored_room() -> String {
     web_sys::window()
@@ -21,10 +54,43 @@ fn stored_room() -> String {
         .unwrap_or_default()
 }
 
-fn set_if_changed<T: PartialEq + Send + Sync + 'static>(signal: RwSignal<T>, value: T) {
-    if signal.try_with_untracked(|current| *current != value) == Some(true) {
-        let _ = signal.try_set(value);
+fn is_wide() -> bool {
+    web_sys::window()
+        .and_then(|w| w.match_media("(min-width: 1100px)").ok().flatten())
+        .is_some_and(|m| m.matches())
+}
+
+fn presence_rank(presence: UserPresence) -> u8 {
+    match presence {
+        UserPresence::Online => 0,
+        UserPresence::Away => 1,
+        UserPresence::Offline => 2,
     }
+}
+
+/// Message keys for the log: timestamp, author and text, numbered when repeated.
+fn room_entries(messages: &[RoomMessage]) -> Vec<Entry> {
+    let mut seen = HashMap::<String, u32>::new();
+    messages
+        .iter()
+        .map(|m| {
+            let base = format!(
+                "{}:{}:{}",
+                m.timestamp.timestamp_millis(),
+                m.username,
+                m.message
+            );
+            let n = seen.entry(base.clone()).or_default();
+            *n += 1;
+            Entry::message(
+                format!("{base}#{n}"),
+                m.timestamp,
+                m.username.clone(),
+                m.is_self,
+                m.message.clone(),
+            )
+        })
+        .collect()
 }
 
 #[component]
@@ -35,29 +101,54 @@ pub fn Rooms() -> impl IntoView {
         web_sys::UrlSearchParams::new_with_str(url.search())
             .ok()?
             .get("room")
+            .filter(|room| !room.is_empty())
     });
+    // Phones show the buffer list first unless a room was linked.
+    let show_buffer = RwSignal::new(room.is_some());
     let active = RwSignal::new(room.unwrap_or_else(stored_room));
-    let navigate = use_navigate();
+    let navigate = StoredValue::new_local(use_navigate());
     let messages = RwSignal::new(Vec::<RoomMessage>::new());
     let users = RwSignal::new(Vec::<RoomUser>::new());
+    // The room `users` belongs to; joins and parts are listed only within one room.
+    let users_room = RwSignal::new(None::<String>);
+    let loaded = RwSignal::new(false);
+    let room_loaded = RwSignal::new(false);
     let draft = RwSignal::new(String::new());
     let ticker = RwSignal::new(String::new());
+    let ticker_draft = RwSignal::new(String::new());
+    let editing_ticker = RwSignal::new(false);
     // The room whose ticker was last loaded; the ticker is fetched only on room change so
     // polling never overwrites what the user is typing.
     let ticker_room = RwSignal::new(None::<String>);
-    // Errors from user actions persist until the next action; polling errors are
-    // tracked separately and cleared once polling succeeds again.
-    let error = RwSignal::new(None::<String>);
+    // Polling errors clear themselves; action errors become lines in the buffer.
     let poll_error = RwSignal::new(None::<String>);
+    let events: Events = RwSignal::new(Vec::new());
+    // Unread counts of the other rooms, and when each room was last read.
+    let unread = RwSignal::new(HashMap::<String, u32>::new());
+    let last_seen = StoredValue::new(HashMap::<String, DateTime<Utc>>::new());
+    let ticks = StoredValue::new(0u32);
+    let room_list = RwSignal::new(Vec::<RoomInfo>::new());
+    let conversations = RwSignal::new(Vec::<Conversation>::new());
+    let queries_loaded = RwSignal::new(false);
+    let join_open = RwSignal::new(false);
+    let new_open = RwSignal::new(false);
+    let members_open = RwSignal::new(is_wide());
+    let member_filter = RwSignal::new(String::new());
+    let logged_in = use_logged_in();
+    let own_nick = use_own_nick();
     let generation = RwSignal::new(0u64);
     let in_flight = RwSignal::new(false);
     let alive = Arc::new(AtomicBool::new(true));
     let poll_alive = Arc::clone(&alive);
+    announce_connection(events, logged_in);
 
     let refresh = move || {
         let ticket = generation.get_untracked().wrapping_add(1);
         generation.set(ticket);
         in_flight.set(true);
+        let tick = ticks.get_value();
+        ticks.set_value(tick.wrapping_add(1));
+        let background = tick.is_multiple_of(BACKGROUND_EVERY);
         // A newer refresh supersedes this one; its results are dropped.
         let current = move || generation.try_get_untracked() == Some(ticket);
         // Only the latest refresh owns the in-flight flag.
@@ -88,7 +179,8 @@ pub fn Rooms() -> impl IntoView {
                 }
                 first
             };
-            set_if_changed(joined, rooms);
+            set_if_changed(joined, rooms.clone());
+            set_if_changed(loaded, true);
             let mut problem = None;
             if selected.is_empty() {
                 set_if_changed(messages, Vec::new());
@@ -107,7 +199,16 @@ pub fn Rooms() -> impl IntoView {
                     return;
                 }
                 match value {
-                    Ok(value) => set_if_changed(messages, value),
+                    Ok(value) => {
+                        if let Some(at) = value.last().map(|m| m.timestamp) {
+                            let _ = last_seen
+                                .try_update_value(|seen| seen.insert(selected.clone(), at));
+                        }
+                        if unread.try_with_untracked(|u| u.contains_key(&selected)) == Some(true) {
+                            unread.try_update(|u| u.remove(&selected));
+                        }
+                        set_if_changed(messages, value);
+                    }
                     Err(e) => problem = Some(e.to_string()),
                 }
                 let value = crate::services::api::get::<Vec<RoomUser>>(&format!(
@@ -119,9 +220,17 @@ pub fn Rooms() -> impl IntoView {
                     return;
                 }
                 match value {
-                    Ok(value) => set_if_changed(users, value),
+                    Ok(value) => {
+                        if users_room.try_get_untracked().flatten().as_deref() == Some(&selected) {
+                            announce_presence(events, &selected, users, &value);
+                        } else {
+                            let _ = users_room.try_set(Some(selected.clone()));
+                        }
+                        set_if_changed(users, value);
+                    }
                     Err(e) => problem = Some(e.to_string()),
                 }
+                set_if_changed(room_loaded, true);
                 if ticker_room.try_with_untracked(|room| room.as_deref() != Some(&selected))
                     == Some(true)
                 {
@@ -135,8 +244,48 @@ pub fn Rooms() -> impl IntoView {
                         return;
                     }
                     let _ = ticker.try_set(value.unwrap_or_default());
-                    let _ = ticker_room.try_set(Some(selected));
+                    let _ = ticker_room.try_set(Some(selected.clone()));
                 }
+            }
+            // The other rooms' unread counts and the conversation list, less often.
+            if background {
+                let mut counts = HashMap::new();
+                for room in rooms.iter().filter(|room| **room != selected) {
+                    let value = crate::services::api::get::<Vec<RoomMessage>>(&format!(
+                        "/rooms/joined/{}/messages",
+                        util::encode_uri_component(room)
+                    ))
+                    .await;
+                    if !current() {
+                        return;
+                    }
+                    let Ok(value) = value else { continue };
+                    let newest = value.last().map(|m| m.timestamp);
+                    let seen = last_seen
+                        .try_update_value(|seen| {
+                            *seen
+                                .entry(room.clone())
+                                .or_insert_with(|| newest.unwrap_or(DateTime::<Utc>::MIN_UTC))
+                        })
+                        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                    let count = value
+                        .iter()
+                        .filter(|m| !m.is_self && m.timestamp > seen)
+                        .count();
+                    if count > 0 {
+                        counts.insert(room.clone(), u32::try_from(count).unwrap_or(u32::MAX));
+                    }
+                }
+                set_if_changed(unread, counts);
+                let list = crate::services::api::get::<Vec<Conversation>>("/conversations").await;
+                if !current() {
+                    return;
+                }
+                if let Ok(mut list) = list {
+                    list.retain(|c| c.username != "..");
+                    set_if_changed(conversations, list);
+                }
+                set_if_changed(queries_loaded, true);
             }
             set_if_changed(poll_error, problem);
             finish();
@@ -155,44 +304,80 @@ pub fn Rooms() -> impl IntoView {
     });
     on_cleanup(move || alive.store(false, Ordering::Relaxed));
 
+    // The server's room list gives member counts and privacy of the other joined rooms.
+    Effect::new(move |_| {
+        if logged_in.get() {
+            spawn_local(async move {
+                if let Ok(value) = crate::services::api::get::<Vec<RoomInfo>>("/rooms").await {
+                    set_if_changed(room_list, value);
+                }
+            });
+        }
+    });
+
+    let go = move |path: String| {
+        navigate.with_value(|navigate| navigate(&path, NavigateOptions::default()));
+    };
     let select_room = Callback::new(move |name: String| {
         if active.get_untracked() != name {
             messages.set(Vec::new());
             users.set(Vec::new());
+            users_room.set(None);
             ticker.set(String::new());
+            draft.set(String::new());
+            editing_ticker.set(false);
+            member_filter.set(String::new());
+            room_loaded.set(false);
         }
+        show_buffer.set(true);
         active.set(name.clone());
-        error.set(None);
         let encoded = util::encode_uri_component(&name);
         if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
             let _ = storage.set_item("slskr.activeRoom", &name);
         }
-        navigate(
-            &format!("/rooms?room={encoded}"),
-            NavigateOptions {
-                replace: true,
-                scroll: false,
-                ..Default::default()
-            },
-        );
+        navigate.with_value(|navigate| {
+            navigate(
+                &format!("/rooms?room={encoded}"),
+                NavigateOptions {
+                    replace: true,
+                    scroll: false,
+                    ..Default::default()
+                },
+            )
+        });
         refresh();
+        buffer::focus_later("room-message-input");
     });
-    let send = move |_| {
-        let room = active.get_untracked();
-        let text = draft.get_untracked();
-        if room.is_empty() || text.trim().is_empty() {
+    let error_line = move |room: String, text: String| {
+        push_event(events, Some(room), Tone::Error, true, text);
+    };
+    let say = move |room: String, text: String| {
+        if room.is_empty() {
+            error_line(room, "Join a room first (/join room)".to_owned());
+            draft.set(text);
             return;
         }
-        draft.set(String::new());
-        error.set(None);
+        if !logged_in.get_untracked() {
+            error_line(room, format!("Not sent: {OFFLINE_REASON}"));
+            draft.set(text);
+            return;
+        }
         spawn_local(async move {
             let path = format!(
                 "/rooms/joined/{}/messages",
-                crate::services::util::encode_uri_component(&room)
+                util::encode_uri_component(&room)
             );
-            let body = slskr_types::conversations::SendMessage { message: text };
+            let body = slskr_types::conversations::SendMessage {
+                message: text.clone(),
+            };
             if let Err(e) = crate::services::api::post_text(&path, &body).await {
-                let _ = error.try_set(Some(e.to_string()));
+                error_line(room.clone(), format!("Not sent: {e}"));
+                // Give the text back unless something new was typed meanwhile.
+                if draft.try_with_untracked(String::is_empty) == Some(true)
+                    && active.try_get_untracked().as_deref() == Some(&room)
+                {
+                    let _ = draft.try_set(text);
+                }
             }
             // Refresh only while the component (and its signals) is still alive.
             if generation.try_get_untracked().is_some() {
@@ -200,107 +385,382 @@ pub fn Rooms() -> impl IntoView {
             }
         });
     };
-    let set_ticker = move |_| {
+    let start_ticker_edit = move || {
+        ticker_draft.set(ticker.get_untracked());
+        editing_ticker.set(true);
+        buffer::focus_later("room-ticker-input");
+    };
+    let save_ticker = move || {
         let room = active.get_untracked();
-        let text = ticker.get_untracked();
+        let text = ticker_draft.get_untracked().trim().to_owned();
         if room.is_empty() {
             return;
         }
-        error.set(None);
         spawn_local(async move {
-            let path = format!(
-                "/rooms/joined/{}/ticker",
-                crate::services::util::encode_uri_component(&room)
-            );
-            let body = Ticker { ticker: text };
-            if let Err(e) = crate::services::api::put::<_, ()>(&path, &body).await {
-                let _ = error.try_set(Some(e.to_string()));
+            let path = format!("/rooms/joined/{}/ticker", util::encode_uri_component(&room));
+            let body = Ticker {
+                ticker: text.clone(),
+            };
+            match crate::services::api::put::<_, ()>(&path, &body).await {
+                Ok(()) => {
+                    let line = if text.is_empty() {
+                        "You cleared your ticker".to_owned()
+                    } else {
+                        format!("Your ticker is now: {text}")
+                    };
+                    push_event(events, Some(room.clone()), Tone::Info, true, line);
+                    if active.try_get_untracked().as_deref() == Some(&room) {
+                        let _ = ticker.try_set(text);
+                        let _ = editing_ticker.try_set(false);
+                    }
+                }
+                Err(e) => error_line(room, format!("Could not set the ticker: {e}")),
             }
         });
     };
-
-    let leave_room = move |_| {
+    let leave_room = move || {
         let name = active.get_untracked();
         if name.is_empty() {
             return;
         }
-        error.set(None);
         spawn_local(async move {
-            let path = format!(
-                "/rooms/joined/{}",
-                crate::services::util::encode_uri_component(&name)
-            );
+            let path = format!("/rooms/joined/{}", util::encode_uri_component(&name));
             match crate::services::api::request_text(gloo_net::http::Method::DELETE, &path, None)
                 .await
             {
                 Ok(_) => {
+                    unread.try_update(|u| u.remove(&name));
+                    let _ = show_buffer.try_set(false);
                     if active.try_set(String::new()).is_none() {
                         refresh();
                     }
                 }
-                Err(e) => {
-                    let _ = error.try_set(Some(e.to_string()));
-                }
+                Err(e) => error_line(name, format!("Could not leave: {e}")),
             }
         });
     };
-    let anchor = NodeRef::<html::Div>::new();
-    // Scroll to the newest message when the history grows or the room changes
-    // (upstream Rooms.jsx scrolls the list's last child into view).
-    let scrolled_to = StoredValue::new(None::<Option<RoomMessage>>);
-    Effect::new(move |_| {
-        let last = messages.with(|m| m.last().cloned());
-        if let Some(anchor) = anchor.get()
-            && scrolled_to.with_value(|s| s.as_ref() != Some(&last))
-        {
-            scrolled_to.set_value(Some(last));
-            anchor.scroll_into_view();
+    let submit = Callback::new(move |text: String| {
+        let here = active.get_untracked();
+        match parse_command(&text) {
+            Command::Say(text) => say(here, text),
+            Command::Join(room) => {
+                if joined.with_untracked(|j| j.contains(&room)) {
+                    select_room.run(room);
+                    return;
+                }
+                spawn_local(async move {
+                    match buffer::join_room(&room).await {
+                        Ok(()) => {
+                            select_room.run(room.clone());
+                            push_event(
+                                events,
+                                Some(room.clone()),
+                                Tone::Info,
+                                true,
+                                format!("You joined #{room}"),
+                            );
+                        }
+                        Err(e) => error_line(here, format!("Could not join #{room}: {e}")),
+                    }
+                });
+            }
+            Command::Part => {
+                if here.is_empty() {
+                    error_line(here, "You are not in a room".to_owned());
+                } else {
+                    leave_room();
+                }
+            }
+            Command::Query(nick) => go(format!(
+                "/chat?username={}",
+                util::encode_uri_component(&nick)
+            )),
+            Command::Msg(nick, text) => spawn_local(async move {
+                match buffer::send_private(&nick, &text).await {
+                    Ok(()) => push_event(
+                        events,
+                        Some(here),
+                        Tone::Info,
+                        true,
+                        format!("-> {nick}: {text}"),
+                    ),
+                    Err(e) => error_line(here, format!("Not sent to {nick}: {e}")),
+                }
+            }),
+            Command::Help => {
+                for line in HELP {
+                    push_event(events, Some(here.clone()), Tone::Info, true, line);
+                }
+            }
+            Command::Invalid(problem) => error_line(here, problem),
         }
     });
-    let shown_error = move || error.get().or_else(|| poll_error.get());
+
+    let entries = Signal::derive(move || {
+        let here = active.get();
+        merge(messages.with(|m| room_entries(m)), events, &here)
+    });
+    let members = Memo::new(move |_| {
+        let needle = member_filter.get().trim().to_lowercase();
+        let mut list: Vec<RoomUser> = users.with(|users| {
+            users
+                .iter()
+                .filter(|u| needle.is_empty() || u.username.to_lowercase().contains(&needle))
+                .cloned()
+                .collect()
+        });
+        list.sort_by(|a, b| {
+            presence_rank(a.status)
+                .cmp(&presence_rank(b.status))
+                .then_with(|| a.username.to_lowercase().cmp(&b.username.to_lowercase()))
+        });
+        list
+    });
+    let member_count = Memo::new(move |_| users.with(Vec::len));
+    let online_count = Memo::new(move |_| {
+        users.with(|u| {
+            u.iter()
+                .filter(|u| u.status == UserPresence::Online)
+                .count()
+        })
+    });
+    let info =
+        move |name: &str| room_list.with(|list| list.iter().find(|r| r.name == name).cloned());
+    let active_private = Memo::new(move |_| active.with(|a| info(a).is_some_and(|r| r.is_private)));
+    let offline_reason =
+        Signal::derive(move || (!logged_in.get()).then(|| OFFLINE_REASON.to_owned()));
+    let rooms = Memo::new(move |_| {
+        let current = active.get();
+        let mut rows: Vec<RoomRow> = joined.with(|joined| {
+            joined
+                .iter()
+                .map(|name| {
+                    let known = info(name);
+                    let users = if *name == current && room_loaded.get() {
+                        Some(member_count.get())
+                    } else {
+                        known.as_ref().map(|r| r.user_count as usize)
+                    };
+                    RoomRow {
+                        name: name.clone(),
+                        users,
+                        unread: unread.with(|u| u.get(name).copied().unwrap_or_default()),
+                        private: known.is_some_and(|r| r.is_private),
+                    }
+                })
+                .collect()
+        });
+        rows.sort_by_key(|r| r.name.to_lowercase());
+        rows
+    });
+    let queries = Memo::new(move |_| {
+        let mut rows: Vec<QueryRow> = conversations.with(|list| {
+            list.iter()
+                .map(|c| QueryRow {
+                    nick: c.username.clone(),
+                    unread: c.unacknowledged_count,
+                })
+                .collect()
+        });
+        rows.sort_by_key(|r| r.nick.to_lowercase());
+        rows
+    });
+    let base = StoredValue::new(config::url_base().trim_end_matches('/').to_owned());
+    let has_room = Memo::new(move |_| !active.with(String::is_empty));
+
     view! {
-        <section class="rooms">
-            <nav class="room-menu">
-                <For each=move || joined.get() key=|name| name.clone() children=move |name| {
-                    let item_name = name.clone();
-                    let room_name = name.clone();
-                    view! { <button class:menu-active=move || active.get() == item_name class="menu-item" on:click=move |_| select_room.run(room_name.clone())>{name}</button> }
-                }/>
-                <join::RoomJoin on_join=select_room/>
-            </nav>
-            <Show when=move || shown_error().is_some()>
-                <p class="error">{move || shown_error().unwrap_or_default()}</p>
-            </Show>
-            <Show when=move || !active.get().is_empty() fallback=|| view! { <p class="placeholder-segment">"Join a room to start chatting."</p> }>
-                <div class="room-active-card">
-                    <button type="button" on:click=leave_room>"Leave room"</button>
-                    <div class="room-history">
-                        <For each=move || messages.get() key=|message| format!("{}:{}:{}", message.timestamp, message.username, message.message) children=move |message| {
-                            let own = message.is_self;
-                            view! { <div class:room-message-self=own class="room-message">
-                                <time class="room-message-time">{message.timestamp.format("%Y-%m-%d %H:%M:%S").to_string()}</time>
-                                <span class="room-message-name">{message.username} ": "</span><span>{message.message}</span>
-                            </div> }
-                        }/>
-                        <div id="room-history-scroll-anchor" node_ref=anchor></div>
+        <div class="messenger rooms" class:has-members=move || members_open.get() && has_room.get()
+            data-view=move || if show_buffer.get() { "buffer" } else { "list" }>
+            <BufferList title="Rooms" rooms=rooms queries=queries
+                active_room=Signal::derive(move || Some(active.get()).filter(|a| !a.is_empty()))
+                active_query=Signal::derive(|| None::<String>)
+                rooms_loaded=loaded queries_loaded=queries_loaded
+                on_room=select_room
+                on_query=Callback::new(move |nick: String| go(format!("/chat?username={}", util::encode_uri_component(&nick))))
+                on_join=Callback::new(move |()| join_open.set(true))
+                on_new=Callback::new(move |()| new_open.set(true))/>
+
+            <section class="messenger__main room-active-card" aria-label="Room">
+                <header class="topic">
+                    <Button variant="ghost" size="sm" icon="arrow-left" label="Back to buffers"
+                        class="messenger__back" on_click=Callback::new(move |_| show_buffer.set(false))/>
+                    <Show when=move || has_room.get() fallback=|| view! {
+                        <h2 class="topic__name">"Rooms"</h2>
+                        <span class="topic__text truncate">"Public chat rooms \u{b7} type /join room"</span>
+                    }>
+                        <h2 class="topic__name">
+                            <span class="topic__sigil" aria-hidden="true">
+                                {move || if active_private.get() { view! { <Icon name="lock" size="xs"/> }.into_any() } else { "#".into_any() }}
+                            </span>
+                            <span class="truncate">{move || active.get()}</span>
+                            <span class="sr-only">{move || if active_private.get() { " (private)" } else { "" }}</span>
+                        </h2>
+                        <Show when=move || editing_ticker.get() fallback=move || view! {
+                            <span class="topic__text room-ticker">
+                                <span class="truncate" title=move || ticker.get()>
+                                    {move || {
+                                        let t = ticker.get();
+                                        if t.is_empty() { "No ticker set".to_owned() } else { t }
+                                    }}
+                                </span>
+                                <button type="button" class="btn btn--ghost btn--xs btn--icon room-ticker__edit"
+                                    aria-label="Edit your ticker" title="Edit your ticker"
+                                    on:click=move |_| start_ticker_edit()>
+                                    <Icon name="pencil" size="xs"/>
+                                </button>
+                            </span>
+                        }>
+                            <form class="topic__text room-ticker__form" on:submit=move |ev| { ev.prevent_default(); save_ticker(); }
+                                on:keydown=move |ev: leptos::ev::KeyboardEvent| if ev.key() == "Escape" { editing_ticker.set(false); }>
+                                <input id="room-ticker-input" class="input input--sm input--mono" maxlength="1024"
+                                    aria-label="Your ticker for this room" placeholder="Your ticker for this room"
+                                    prop:value=move || ticker_draft.get()
+                                    on:input=move |ev| ticker_draft.set(event_target_value(&ev))/>
+                                <Button size="xs" icon="check" label="Save ticker" button_type="submit"/>
+                                <Button variant="ghost" size="xs" icon="x" label="Cancel"
+                                    on_click=Callback::new(move |_| editing_ticker.set(false))/>
+                            </form>
+                        </Show>
+                        <div class="topic__actions">
+                            <button type="button" class="btn btn--ghost btn--sm room-members-toggle"
+                                aria-pressed=move || members_open.get().to_string()
+                                aria-controls="room-members" title="Nick list"
+                                on:click=move |_| members_open.update(|o| *o = !*o)>
+                                <Icon name="users"/>
+                                <span class="tabular">{move || member_count.get()}</span>
+                                <span class="sr-only">" members"</span>
+                            </button>
+                            <Button variant="ghost" size="sm" icon="log-out" label="Leave room"
+                                class="room-leave-button" on_click=Callback::new(move |_| leave_room())/>
+                        </div>
+                    </Show>
+                </header>
+                <PollProblem poll_error=poll_error/>
+                <div class="messenger__body">
+                    <div class="messenger__column">
+                        <BufferView entries=entries scope=active own_nick=own_nick
+                            label=Signal::derive(move || format!("Messages in {}", active.get()))
+                            empty=ViewFn::from(move || {
+                                if !has_room.get() {
+                                    view! {
+                                        <div class="buffer__empty">
+                                            <EmptyState icon="messages-square" title="Join a room to start chatting"
+                                                description="Rooms are public group chats on the Soulseek network. Type /join room below or pick one from the list.">
+                                                <Button variant="primary" size="sm" icon="plus" text="Join room"
+                                                    on_click=Callback::new(move |_| join_open.set(true))/>
+                                            </EmptyState>
+                                        </div>
+                                    }.into_any()
+                                } else if room_loaded.get() {
+                                    view! {
+                                        <div class="buffer__empty">
+                                            <p class="buffer__hint">{format!("* Now talking in #{}. Messages sent while you are here show up below.", active.get_untracked())}</p>
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    view! { <div class="buffer__empty"><Loading label="Loading messages"/></div> }.into_any()
+                                }
+                            })/>
+                        <InputLine draft=draft on_submit=submit offline_reason=offline_reason nick=own_nick
+                            input_id="room-message-input"
+                            placeholder=Signal::derive(move || {
+                                let room = active.get();
+                                if room.is_empty() { "Type /join room to start".to_owned() } else { format!("Message #{room}") }
+                            })/>
                     </div>
-                    <form class="room-input" on:submit=move |ev| { ev.prevent_default(); send(()); }>
-                        <input id="room-message-input" prop:value=move || draft.get() on:input=move |ev| draft.set(event_target_value(&ev)) placeholder="Message room"/>
-                        <button class="room-message-button" type="submit">"Send"</button>
-                    </form>
-                    <form on:submit=move |ev| { ev.prevent_default(); set_ticker(()); }>
-                        <input prop:value=move || ticker.get() on:input=move |ev| ticker.set(event_target_value(&ev)) placeholder="Room ticker"/>
-                        <button type="submit">"Set ticker"</button>
-                    </form>
+                    <Show when=move || members_open.get() && has_room.get()>
+                        <div class="nicklist-backdrop" on:click=move |_| members_open.set(false)></div>
+                        <aside class="nicklist room-users" id="room-members" aria-label="Nick list">
+                            <div class="nicklist__head">
+                                <span class="nicklist__title">
+                                    {move || format!("{} users \u{b7} {} online", member_count.get(), online_count.get())}
+                                </span>
+                                <Button variant="ghost" size="xs" icon="x" label="Hide nick list"
+                                    on_click=Callback::new(move |_| members_open.set(false))/>
+                            </div>
+                            <div class="nicklist__search">
+                                <input class="input input--sm input--mono" type="search" placeholder="Filter nicks"
+                                    aria-label="Filter nicks"
+                                    prop:value=move || member_filter.get()
+                                    on:input=move |ev| member_filter.set(event_target_value(&ev))/>
+                            </div>
+                            <ul class="nicklist__list" role="list">
+                                <For each=move || members.get() key=|user| (user.username.clone(), user.status, user.is_self)
+                                    children=move |user| {
+                                        let (dot, text) = presence_dot(user.status);
+                                        let href = format!("{}/users?username={}",
+                                            base.get_value(), util::encode_uri_component(&user.username));
+                                        let detail = format!("{} \u{b7} {} files \u{b7} {}", text,
+                                            user.file_count, util::format_speed(f64::from(user.average_speed)));
+                                        let class = format!("nick-row__name truncate {}", nick_color(&user.username));
+                                        view! {
+                                            <li class="nick-row" class:nick-row--self=user.is_self>
+                                                <StatusDot status=dot label=text.to_owned()/>
+                                                <A href=href attr:class=class attr:title=detail>{user.username.clone()}</A>
+                                            </li>
+                                        }
+                                    }/>
+                            </ul>
+                            <Show when=move || members.with(Vec::is_empty)>
+                                <p class="nicklist__empty">
+                                    {move || if member_count.get() == 0 { "No users loaded." } else { "No nick matches." }}
+                                </p>
+                            </Show>
+                        </aside>
+                    </Show>
                 </div>
-                <aside class="room-users"><h3>"Users"</h3>
-                    <For each=move || users.get() key=|user| user.username.clone() children=move |user| {
-                        let username = user.username;
-                        let href = format!("{}/users?username={}", config::url_base().trim_end_matches('/'), util::encode_uri_component(&username));
-                        view! { <A href=href>{username}</A> }
-                    }/>
-                </aside>
-            </Show>
-        </section>
+            </section>
+        </div>
+        <RoomJoin open=join_open rooms=room_list joined=Signal::from(joined) on_join=select_room/>
+        <NewMessage open=new_open
+            on_start=Callback::new(move |nick: String| go(format!("/chat?username={}", util::encode_uri_component(&nick))))/>
+    }
+}
+
+/// Lists who joined or left since the previous poll of the same room.
+fn announce_presence(
+    events: Events,
+    room: &str,
+    previous: RwSignal<Vec<RoomUser>>,
+    now: &[RoomUser],
+) {
+    let Some((joined, left)) = previous.try_with_untracked(|before| {
+        let before: HashSet<&str> = before.iter().map(|u| u.username.as_str()).collect();
+        let after: HashSet<&str> = now.iter().map(|u| u.username.as_str()).collect();
+        let mut joined: Vec<String> = after.difference(&before).map(|s| (*s).to_owned()).collect();
+        let mut left: Vec<String> = before.difference(&after).map(|s| (*s).to_owned()).collect();
+        joined.sort();
+        left.sort();
+        (joined, left)
+    }) else {
+        return;
+    };
+    if joined.len() + left.len() > MAX_PRESENCE_LINES {
+        push_event(
+            events,
+            Some(room.to_owned()),
+            Tone::Info,
+            false,
+            format!("{} joined, {} left", joined.len(), left.len()),
+        );
+        return;
+    }
+    for nick in joined {
+        push_event(
+            events,
+            Some(room.to_owned()),
+            Tone::Info,
+            false,
+            format!("{nick} has joined #{room}"),
+        );
+    }
+    for nick in left {
+        push_event(
+            events,
+            Some(room.to_owned()),
+            Tone::Info,
+            false,
+            format!("{nick} has left #{room}"),
+        );
     }
 }

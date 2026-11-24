@@ -6,11 +6,10 @@ segmented and underline tabs, outline buttons with one solid blue primary action
 coloured pill badges, quiet tables and lucide line icons. Light and dark themes share every
 rule; only the token values change.
 
-Everything lives in two places:
-
 - `crates/slskr-web/assets/static/css/app.css`: tokens, base styles, a few layout
-  utilities, the component classes below, the app shell, page sections and (temporarily)
-  the legacy Semantic UI fallbacks.
+  utilities, the component classes below, and the app shell.
+- `crates/slskr-web/assets/static/css/pages/`: page-specific styles, loaded through
+  the Trunk stylesheet links in `crates/slskr-web/index.html`.
 - `crates/slskr-web/src/ui/`: Leptos components that emit that markup (`Button`, `Card`,
   `Badge`, `Alert`, `Modal`, `Icon`, …) and the form components in `ui/form.rs`.
 
@@ -20,9 +19,8 @@ Everything lives in two places:
    (`hsl(var(--primary))`) in `app.css`. Charts may use `currentColor` and the status
    classes (`text-success`, …) or read tokens with `getComputedStyle` if they must.
 2. **No `style=` for layout** except computed values (a progress width, a chart size).
-3. **No new global CSS in page files.** Page-specific rules go at the end of `app.css` in a
-   `/* ---------- page: name ---------- */` section, prefixed with the page's root class
-   (`.transfers …`). Prefer composing the existing classes first.
+3. **Keep reusable styles in `app.css`.** Scope page rules to a page or its components.
+   Prefer composing the existing classes first.
 4. Use the Rust components where they exist; write the documented HTML where a component
    would add nothing (tables, `input`, `select`).
 5. Icon-only buttons need `aria-label` (the `Button` `label` prop sets it and `title`).
@@ -398,19 +396,44 @@ All take an extra `class` where it makes sense. Optional props can be left out.
 
 ### Form components (`crate::ui::form`)
 
-For labelled settings and setup fields. `Field` provides the control's `id`,
-`aria-describedby`, invalid and locked state as context, so the control inside needs none.
+The settings and setup fields use `assets/static/css/pages/settings.css`.
+`Field` provides the control's `id`, `aria-describedby`, invalid and locked state as context,
+so the control inside needs none.
+
+Two layouts. **Stacked** (setup wizard, dialogs): label, control, help, error. **Row**
+(`row=true`, settings): label and help on the left, a right-sized control on the right, rows
+separated by hairlines inside a `Section`. Use `wide=true` to put a full-width control
+(chips, a text area, the folder list) below its label. In rows:
+
+- Booleans are `Toggle` switches and enums `Select`s. Numbers are narrow `NumberInput`s with
+  a `unit` such as "KiB/s" or "files". Use a `zero_label` checkbox where 0 means unlimited.
+- Durations are a number and a unit (`DurationInput`), with "Never" where empty means never.
+- Lists of strings are `ChipInput`s (Enter adds, Backspace in the empty input removes).
+- A value set in `slskr.toml` or the environment is locked: the control is disabled and a
+  lock icon after the label carries the reason as tooltip and screen-reader text
+  (`Set in slskr.toml or SLSKR_WEB_LISTEN (web.listen)`).
+- Rarely changed rows go into `Advanced` ("Show advanced settings"), which opens by itself
+  when a row inside has an error.
+- Undo (`form-revert`) and Reset to default (`form-reset`) are small icon buttons after the
+  label.
 
 | Component | Purpose |
 | --- | --- |
-| `Section { id, title, description }` | a `card form-section` of fields |
-| `FieldGrid` | lays fields side by side (`form-grid`) |
-| `Field { id, label, help, error, locked_reason, tag, actions }` | `field form-field` (+ `field--error`, `field--locked`): label row (with a `badge--outline` tag and action buttons), control, help, lock note, error |
-| `TextInput`, `PasswordInput`, `NumberInput`, `DurationInput`, `TextArea`, `Select` | `input`/`textarea`/`select` bound to the field |
-| `Toggle { checked, on_change, states }` | a `switch` with "On"/"Off" text |
-| `ListEditor { items, on_change, placeholder, add_label, extra }` | one `input-group` row per item with a remove button, plus an add row |
-| `FormMessage { kind }` | an `Alert` with the `form-message` hook |
-| `SaveBar { dirty, saving, on_save, on_discard, problem }` | floating bar at the bottom while there are unsaved changes |
+| `Section { id, title, description, actions, footer }` | a `card form-section` whose content is `form-rows` |
+| `RowHeading { title, description }` | a small heading between rows |
+| `Field { id, label, help, error, locked_reason, tag, tag_title, actions, row, wide }` | `field form-field` (+ `form-row`, `form-row--wide`, `field--error`, `field--locked`): label head (lock icon `.form-locked`, `badge--outline` tag, actions), control, help, error |
+| `FieldGrid` | stacked fields side by side (`form-grid`) |
+| `TextInput { mono }`, `PasswordInput`, `TextArea`, `Select` | `input`/`textarea`/`select` bound to the field |
+| `NumberInput { unit, zero_label, fallback }` | narrow number with a unit addon (`input-affix`) and an optional "Unlimited" checkbox (`form-zero`) |
+| `DurationInput { optional }` | number and a unit select with choices from seconds to weeks plus "Never". The select uses `<id>-unit` |
+| `Toggle { checked, on_change, states }` | a `switch` with optional On/Off text via `states` |
+| `ChipInput { items, on_change, placeholder, mono }` | `chip-input` with removable `chip`s |
+| `Advanced { open, label }` | `details.form-advanced` disclosure of rows |
+| `FormMessage { kind, title }` | an `Alert` with the `form-message` hook |
+| `SaveBar { dirty, saving, on_save, on_discard, problem }` | floating bar at the bottom while there are unsaved changes: count, Discard, "Save changes" |
+
+`components/directory_picker.rs` adds `FolderList` (shared-folder rows with rename and
+remove, and an "Add folder" button) and `DirectoryPicker` (the folder dialog).
 
 ## App shell
 
@@ -423,13 +446,6 @@ System) that scrolls sideways on phones. There is no footer; live transfer speed
 queue counts are the stat tiles at the top of Overview.
 
 ## From Semantic UI
-
-The old Semantic UI stylesheet is gone. A small **LEGACY** section at the end of `app.css`
-keeps not-yet-restyled pages usable: `.ui.segment`, `.ui.button`, `.ui.table`, `.ui.label`,
-`.ui.message`, `.ui.input`, `.ui.menu`, `.ui.list`, `.ui.loader`, `.ui.progress`,
-`.ui.popup`, `.ui.grid`, `.ui.statistic`, and `<i class="… icon">` drawn as lucide masks.
-When you restyle a page, replace its Semantic markup and delete nothing else; the last
-page to go deletes the section (check with `grep -rn 'class="ui \|"ui ' crates/slskr-web/src`).
 
 | Semantic UI | Now |
 | --- | --- |

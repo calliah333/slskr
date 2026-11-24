@@ -407,7 +407,13 @@ fn AppShell(
                     <Route path=path!("/chat") view=Chat/>
                     <Route path=path!("/users") view=Users/>
                     <Route path=path!("/browse") view=Browse/>
-                    <Route path=path!("/settings") view=SettingsPage/>
+                    <Route path=path!("/settings/:category?") view=SettingsPage/>
+                    // Settings used to be a System tab; keep `?section=` links working.
+                    <Route path=path!("/system/settings") view=|| {
+                        let search = use_location().search.get_untracked();
+                        let query = if search.is_empty() || search.starts_with('?') { search } else { format!("?{search}") };
+                        view! { <Redirect path=format!("/settings{query}") options=NavigateOptions { replace: true, ..Default::default() }/> }
+                    }/>
                     <Route path=path!("/system/files/:root") view=System/>
                     <Route path=path!("/system/:tab?") view=System/>
                 </Routes>
