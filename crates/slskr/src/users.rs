@@ -295,7 +295,10 @@ impl UserService {
         Ok(value)
     }
 
-    async fn browse_peer(&self, username: &str) -> soulseek::Result<Arc<BrowseResponse>> {
+    pub(crate) async fn browse_peer(
+        &self,
+        username: &str,
+    ) -> soulseek::Result<Arc<BrowseResponse>> {
         let id = {
             let mut cache = self.cache.write().unwrap();
             if let Some(browse) = cache.browses.get(username) {

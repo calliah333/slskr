@@ -37,6 +37,46 @@ pub(super) fn relative(value: &str) -> bool {
         && !traverses(value)
 }
 
+/// A remote folder without trailing separators (`Music\Album\` is `Music\Album`).
+pub(super) fn trim_folder(folder: &str) -> &str {
+    folder.trim_end_matches(['/', '\\'])
+}
+
+/// The last component of a remote folder: the local folder a folder download is saved in.
+pub(super) fn folder_name(folder: &str) -> &str {
+    trim_folder(folder)
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+}
+
+/// `path` relative to the remote folder `root`, or `None` when it is not below `root`.
+/// Remote names are compared exactly; either separator ends the root.
+pub(super) fn relative_to<'a>(root: &str, path: &'a str) -> Option<&'a str> {
+    let root = trim_folder(root);
+    if root.is_empty() {
+        return None;
+    }
+    path.strip_prefix(root)?
+        .strip_prefix(['/', '\\'])
+        .filter(|rest| !rest.is_empty())
+}
+
+/// Whether the remote folder `name` is `root` or below it.
+pub(super) fn within(root: &str, name: &str) -> bool {
+    trim_folder(name) == trim_folder(root) || relative_to(root, name).is_some()
+}
+
+/// The download subdirectory of a folder download: the sanitized last component of
+/// `root`, then each sanitized folder component of `filename` below `root`.
+fn folder_layout(root: &str, filename: &str) -> PathBuf {
+    let mut path = PathBuf::from(sanitize(folder_name(root)));
+    if let Some(relative) = relative_to(root, filename) {
+        path.extend(sanitized_path(remote_directory(relative)).iter());
+    }
+    path
+}
+
 fn sanitize(value: &str) -> String {
     let mut result: String = value
         .chars()
@@ -89,6 +129,9 @@ pub(super) fn derive(
 ) -> PathBuf {
     if let Some(explicit) = batch.and_then(|b| b.destination.as_deref()) {
         return sanitized_path(explicit);
+    }
+    if let Some(root) = t.root.as_deref() {
+        return folder_layout(root, &t.filename);
     }
     let pattern = options.downloads.subdirectory.trim();
     if pattern.is_empty() {
@@ -604,6 +647,138 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
 
     use super::*;
+    use crate::transfers::new_transfer;
+    use slskr_types::transfers::TransferDirection;
+
+    fn rooted(filename: &str, root: &str) -> Transfer {
+        let mut t = new_transfer(
+            TransferDirection::Download,
+            "peer",
+            filename.into(),
+            1,
+            None,
+        );
+        t.root = Some(root.into());
+        t
+    }
+
+    #[test]
+    fn folder_layout_keeps_nested_structure() {
+        let mut cfg = Config::default();
+        cfg.downloads.subdirectory = "${SOURCE_USERNAME}".into();
+        let root = r"@@music\Artist\Album";
+        for (filename, expected) in [
+            (r"@@music\Artist\Album\01.flac", "Album"),
+            (r"@@music\Artist\Album\CD1\01.flac", "Album/CD1"),
+            (r"@@music\Artist\Album\CD2\Bonus\01.flac", "Album/CD2/Bonus"),
+            (r"@@music\Artist\Album\Artwork\\front.jpg", "Album/Artwork"),
+            ("@@music\\Artist\\Album/Scans/back.jpg", "Album/Scans"),
+        ] {
+            assert_eq!(
+                derive(&cfg, &rooted(filename, root), None, None),
+                PathBuf::from(expected),
+                "{filename}"
+            );
+        }
+        // A trailing separator on the root changes nothing.
+        assert_eq!(
+            derive(&cfg, &rooted(r"a\Album\CD1\x", r"a\Album\"), None, None),
+            PathBuf::from("Album/CD1")
+        );
+        // Without a root, the configured pattern still applies.
+        let mut plain = rooted(r"a\Album\CD1\x", "");
+        plain.root = None;
+        assert_eq!(derive(&cfg, &plain, None, None), PathBuf::from("peer"));
+        // A batch's explicit destination wins.
+        let batch = Batch {
+            id: "b".into(),
+            search_id: None,
+            username: "peer".into(),
+            created_at: Utc::now(),
+            destination: Some("Explicit".into()),
+            external_id: None,
+            transfers: Vec::new(),
+        };
+        assert_eq!(
+            derive(&cfg, &rooted(r"a\Album\x", r"a\Album"), Some(&batch), None),
+            PathBuf::from("Explicit")
+        );
+    }
+
+    #[test]
+    fn folder_layout_sanitizes_peer_components() {
+        let cfg = Config::default();
+        for (filename, root) in [
+            (r"r\Album\..\..\etc\passwd", r"r\Album"),
+            (r"r\Album\.\x", r"r\Album"),
+            (r"r\Album\C:\Windows\x", r"r\Album"),
+            ("r\\Album\\/abs\\x", r"r\Album"),
+            (r"C:\Album\sub\x", r"C:\Album"),
+            ("/home/u/Album/sub/x", "/home/u/Album"),
+            (r"r\..\x", r"r\.."),
+            (r"\\server\share\x", r"\\server\share"),
+            (r"r\a<b>c|d\x", r"r\a<b>c|d"),
+        ] {
+            let path = derive(&cfg, &rooted(filename, root), None, None);
+            assert!(
+                path.components()
+                    .all(|c| matches!(c, Component::Normal(name) if name != "." && name != "..")),
+                "{filename}: {}",
+                path.display()
+            );
+            assert!(path.components().count() >= 1, "{filename}");
+        }
+        assert_eq!(
+            derive(&cfg, &rooted(r"r\Album\..\..\x", r"r\Album"), None, None),
+            PathBuf::from("Album/_/_")
+        );
+        assert_eq!(
+            derive(&cfg, &rooted(r"r\Album\C:\x", r"r\Album"), None, None),
+            PathBuf::from("Album/C_")
+        );
+        assert_eq!(
+            derive(&cfg, &rooted(r"r\..\x", r"r\.."), None, None),
+            PathBuf::from("_")
+        );
+        // A stored root the file is not under keeps only the root's folder.
+        assert_eq!(
+            derive(&cfg, &rooted(r"other\sub\x", r"r\Album"), None, None),
+            PathBuf::from("Album")
+        );
+    }
+
+    #[test]
+    fn folder_installs_confined_under_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("downloads");
+        let cfg = Config::default();
+        let t = rooted(r"r\Album\..\..\CD1\song.flac", r"r\Album");
+        let subdirectory = derive(&cfg, &t, None, None);
+        let part = Partial::new(tmp.path().join("incomplete"), "peer", &t.filename, 3);
+        part.open(0).unwrap().write_all(b"abc").unwrap();
+        let installed = part
+            .finish(&downloads, &subdirectory, 3, false, None)
+            .unwrap();
+        assert!(installed.starts_with(downloads.canonicalize().unwrap()));
+        assert!(installed.ends_with("Album/_/_/CD1/song.flac"));
+    }
+
+    #[test]
+    fn root_matching() {
+        assert_eq!(relative_to(r"a\b", r"a\b\c\d"), Some(r"c\d"));
+        assert_eq!(relative_to(r"a\b\", r"a\b\c"), Some("c"));
+        assert_eq!(relative_to(r"a\b", "a\\b/c"), Some("c"));
+        assert_eq!(relative_to(r"a\b", r"a\bc\d"), None);
+        assert_eq!(relative_to(r"a\b", r"a\b"), None);
+        assert_eq!(relative_to(r"a\b", r"a\b\"), None);
+        assert_eq!(relative_to(r"A\B", r"a\b\c"), None);
+        assert_eq!(relative_to("", r"a\b"), None);
+        assert!(within(r"a\b", r"a\b\"));
+        assert!(within(r"a\b", r"a\b\c"));
+        assert!(!within(r"a\b", r"a\bc"));
+        assert_eq!(folder_name(r"@@music\Artist\Album\"), "Album");
+        assert_eq!(folder_name("Album"), "Album");
+    }
 
     #[test]
     fn resume_identity_includes_exact_filename_and_size() {

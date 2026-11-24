@@ -308,7 +308,8 @@ CREATE TABLE transfers (
   state INTEGER NOT NULL, state_description TEXT, requested_at TEXT NOT NULL, enqueued_at TEXT,
   started_at TEXT, ended_at TEXT, bytes_transferred INTEGER NOT NULL DEFAULT 0,
   average_speed REAL NOT NULL DEFAULT 0, exception TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-  next_attempt_at TEXT, removed INTEGER NOT NULL DEFAULT 0
+  next_attempt_at TEXT, removed INTEGER NOT NULL DEFAULT 0, place_in_queue INTEGER,
+  root TEXT -- migration 2: the remote folder of a folder download
 );
 CREATE INDEX ix_transfers_username ON transfers(username);
 CREATE INDEX ix_transfers_state ON transfers(state);
@@ -317,6 +318,31 @@ CREATE INDEX ix_transfers_state ON transfers(state);
 `transfers::store::{state_from_bits, state_to_bits}` convert them to and from the API's
 `TransferState` enum, and `state_description` holds the enum name for humans.
 `exception` holds the failure as `Kind: message`; the API calls it `error`.
+
+### Folder downloads and the download layout
+A download's local folder is computed from its stored record each time it is attempted
+(`transfers::destination::derive`), so retries and restarts install to the same place. The
+first of these rules that applies picks the folder below `downloads.directory`: a
+batch's `destination`; the transfer's `root`; or the `downloads.subdirectory` pattern.
+A `root` is the remote folder a folder download was enqueued under
+(`POST /api/transfers/downloads/folder`, or `POST /api/transfers/downloads` with `root`).
+The file goes to `<last component of root>/<folders of the filename below root>/<name>`.
+For example, root `@@music\Artist\Album` and `@@music\Artist\Album\CD1\01.flac` give
+`Album/CD1/01.flac`. Each component comes from the peer, so it is split on both `\` and
+`/`, empty components are dropped, and each is sanitized. `.` and `..` become `_`, and
+`:`, `<`, `>`, `|` and the other reserved characters become `_`, which turns a drive
+prefix such as `C:` into `C_`. Requests already refuse names with `.`/`..` components.
+Installation still confines the result to `downloads.directory`, refusing symlinked
+folders, and keeps the no-clobber rename unless `on_conflict = "overwrite"`.
+
+The folder endpoint asks the peer for the folder (FolderContentsRequest, with the client's
+`message_timeout`). A response may list several folders, but slskd, Nicotine+ and slskr
+answer with the requested folder only. So when `recursive` is set and the response lists
+nothing below `path`, the daemon browses the user (`UserService::browse_peer`, which
+reuses a browse finished in the last few seconds) and takes the folders below `path`
+from it, locked ones included. The files are planned by `transfers::folder::plan`, which
+drops duplicates and reports unsafe peer names as `failed`. They are then enqueued
+through the normal path, which handles duplicate detection, retries, slots and events.
 
 `search.db` keeps each `Search` and `SearchResponse` as its API JSON, and `events.db`
 each event's type and data; their migrations converted records written in the older

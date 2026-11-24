@@ -2,6 +2,7 @@
 
 mod api;
 mod destination;
+mod folder;
 mod queue;
 mod store;
 
@@ -448,6 +449,7 @@ impl TransferService {
         &self,
         username: String,
         files: Vec<DownloadFile>,
+        root: Option<String>,
         context: DownloadContext,
     ) -> anyhow::Result<EnqueuedDownloads> {
         self.ready().await?;
@@ -455,7 +457,10 @@ impl TransferService {
         tokio::spawn(async move {
             let context = Arc::new(context);
             let cancel = service.0.core.shutdown.child_token();
-            let mut response = EnqueuedDownloads::default();
+            let mut response = EnqueuedDownloads {
+                files: files.len(),
+                ..EnqueuedDownloads::default()
+            };
             {
                 let mut runtime = service.runtime();
                 for file in files {
@@ -466,13 +471,14 @@ impl TransferService {
                         });
                         continue;
                     }
-                    let transfer = new_transfer(
+                    let mut transfer = new_transfer(
                         TransferDirection::Download,
                         &username,
                         file.filename,
                         file.size,
                         context.batch.as_ref().map(|b| b.id.clone()),
                     );
+                    transfer.root.clone_from(&root);
                     runtime.insert(transfer.clone(), cancel.child_token(), None, false);
                     response.enqueued.push(transfer);
                 }
@@ -1188,6 +1194,7 @@ fn new_transfer(
         username: username.into(),
         direction,
         filename,
+        root: None,
         size,
         state: TransferState::QueuedLocally,
         requested_at: Utc::now(),

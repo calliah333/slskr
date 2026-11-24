@@ -139,6 +139,10 @@ pub struct Transfer {
     pub direction: TransferDirection,
     /// The peer's (remote) filename.
     pub filename: String,
+    /// Folder downloads: the remote folder the file was enqueued under. The file is
+    /// saved as `<downloads>/<last component of root>/<path relative to root>`.
+    #[serde(default)]
+    pub root: Option<String>,
     pub size: u64,
     pub state: TransferState,
     pub requested_at: DateTime<Utc>,
@@ -213,13 +217,41 @@ pub struct EnqueueDownloads {
     pub files: Vec<DownloadFile>,
 }
 
-/// `POST /api/transfers/downloads` response.
+/// `POST /api/transfers/downloads` body as the daemon reads it: the fields of
+/// [`EnqueueDownloads`] (flattened, so the JSON is `{username, files, root?}`) plus an
+/// optional `root`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EnqueueDownloadsRequest {
+    #[serde(flatten)]
+    pub downloads: EnqueueDownloads,
+    /// A remote folder that every file is under. Each file is then saved as
+    /// `<downloads>/<last component of root>/<path relative to root>`, keeping the
+    /// folder's structure; without it, `downloads.subdirectory` applies.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+/// `POST /api/transfers/downloads/folder` body: every file in a peer's folder.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EnqueueFolder {
+    pub username: String,
+    /// The remote folder, as in browse or search results (`@@share\Artist\Album`).
+    pub path: String,
+    /// Also download every folder below `path`.
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+/// `POST /api/transfers/downloads` and `POST /api/transfers/downloads/folder` response.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct EnqueuedDownloads {
     #[serde(default)]
     pub enqueued: Vec<Transfer>,
     #[serde(default)]
     pub failed: Vec<EnqueueFailure>,
+    /// The number of files asked for: `enqueued` plus `failed`.
+    #[serde(default)]
+    pub files: usize,
 }
 
 /// A file that could not be enqueued.
@@ -330,5 +362,24 @@ mod tests {
             serde_json::from_str::<CreateBatch>(r#"{"username":"bob","files":[{"filename":"x"}]}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn enqueue_request_shapes() {
+        let plain: EnqueueDownloadsRequest =
+            serde_json::from_str(r#"{"username":"bob","files":[{"filename":"a\\b","size":1}]}"#)
+                .unwrap();
+        assert_eq!(plain.root, None);
+        assert_eq!(plain.downloads.files[0].filename, r"a\b");
+        let rooted: EnqueueDownloadsRequest =
+            serde_json::from_str(r#"{"username":"bob","files":[],"root":"a"}"#).unwrap();
+        assert_eq!(rooted.root.as_deref(), Some("a"));
+        assert_eq!(rooted.downloads.username, "bob");
+        let folder: EnqueueFolder =
+            serde_json::from_str(r#"{"username":"bob","path":"a\\b"}"#).unwrap();
+        assert!(!folder.recursive);
+        assert_eq!(folder.path, r"a\b");
+        let value = serde_json::to_value(EnqueuedDownloads::default()).unwrap();
+        assert_eq!(value["files"], 0);
     }
 }

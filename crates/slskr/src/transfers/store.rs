@@ -7,7 +7,8 @@ use slskr_types::{
 
 use crate::db::Database;
 
-pub(super) const MIGRATIONS: &[&str] = &[r#"
+pub(super) const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE transfer_batches (
     id TEXT PRIMARY KEY, search_id TEXT, username TEXT NOT NULL,
     created_at TEXT NOT NULL, destination TEXT, external_id TEXT
@@ -24,7 +25,10 @@ CREATE INDEX ix_transfers_username ON transfers(username);
 CREATE INDEX ix_transfers_state ON transfers(state);
 CREATE INDEX ix_transfers_batch_id ON transfers(batch_id);
 CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
-"#];
+"#,
+    // Folder downloads: the remote folder the file is saved relative to.
+    "ALTER TABLE transfers ADD COLUMN root TEXT;",
+];
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
 // Initializing 4, InProgress 8, Completed 16, Succeeded 32, Cancelled 64, TimedOut 128,
@@ -76,7 +80,7 @@ pub(crate) fn state_to_bits(state: TransferState) -> u32 {
     }
 }
 
-const FIELDS: &str = "id, batch_id, username, direction, filename, size, state, requested_at, enqueued_at,\n    started_at, ended_at, bytes_transferred, average_speed, place_in_queue, exception, attempts, next_attempt_at, removed";
+const FIELDS: &str = "id, batch_id, username, direction, filename, size, state, requested_at, enqueued_at,\n    started_at, ended_at, bytes_transferred, average_speed, place_in_queue, exception, attempts, next_attempt_at, removed, root";
 
 pub(super) fn direction_name(direction: TransferDirection) -> &'static str {
     match direction {
@@ -127,6 +131,7 @@ fn transfer(row: &Row<'_>) -> rusqlite::Result<Transfer> {
         attempts: row.get(15)?,
         next_attempt_at: date(row, 16)?,
         removed: row.get(17)?,
+        root: row.get(18)?,
         bytes_remaining: 0,
         elapsed_ms: None,
         percent_complete: 0.0,
@@ -175,12 +180,12 @@ pub(super) async fn insert(db: &Database, transfers: Vec<Transfer>) -> anyhow::R
             let mut supersede = tx.prepare("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND username = ?2
                 AND filename = ?3 AND removed = 0 AND (state & 16) != 0")?;
             let mut insert = tx.prepare("INSERT INTO transfers (id, batch_id, username, direction, filename, size,
-                state, state_description, requested_at, enqueued_at, removed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")?;
+                state, state_description, requested_at, enqueued_at, removed, root) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)")?;
             for t in transfers {
                 let direction = direction_name(t.direction);
                 supersede.execute(params![direction, t.username, t.filename])?;
                 insert.execute(params![t.id, t.batch_id, t.username, direction, t.filename, t.size,
-                    state_to_bits(t.state), t.state.as_str(), timestamp(t.requested_at), t.enqueued_at.map(timestamp), t.removed])?;
+                    state_to_bits(t.state), t.state.as_str(), timestamp(t.requested_at), t.enqueued_at.map(timestamp), t.removed, t.root])?;
             }
         }
         tx.commit()
@@ -479,6 +484,59 @@ mod tests {
         let transfers = batch.transfers;
         assert_eq!(transfers[0].id, t.id);
         assert!(transfers[0].removed);
+    }
+
+    #[tokio::test]
+    async fn folder_root_survives_restart_and_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transfers.db");
+        // A database written before folder downloads gains the column empty.
+        let db = Database::open(&path, &MIGRATIONS[..1]).unwrap();
+        db.call(|db| {
+            db.execute(
+                "INSERT INTO transfers (id, username, direction, filename, size, state, requested_at)
+                    VALUES ('old', 'peer', 'Download', 'a\\b', 1, 2050, '2026-01-01T00:00:00Z')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        drop(db);
+
+        let db = Database::open(&path, MIGRATIONS).unwrap();
+        let mut t = new_transfer(
+            TransferDirection::Download,
+            "peer",
+            r"@@music\Album\CD1\01.flac".into(),
+            5,
+            None,
+        );
+        t.root = Some(r"@@music\Album".into());
+        insert(&db, vec![t.clone()]).await.unwrap();
+        t.attempts = 1;
+        t.state = TransferState::InProgress;
+        save(&db, vec![Snapshot::new(&t, 0)]).await.unwrap();
+        drop(db);
+
+        let db = Database::open(&path, MIGRATIONS).unwrap();
+        let (_, pending) = initialize(&db).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, "old");
+        assert_eq!(pending[0].root, None);
+        let recovered = &pending[1];
+        assert_eq!(recovered.root, t.root);
+        let cfg = slskr_types::config::Config::default();
+        let layout = super::super::destination::derive(&cfg, &t, None, None);
+        assert_eq!(layout, Path::new("Album/CD1"));
+        assert_eq!(
+            super::super::destination::derive(&cfg, recovered, None, None),
+            layout
+        );
+        let found = find(&db, TransferDirection::Download, t.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.root, t.root);
     }
 
     #[test]

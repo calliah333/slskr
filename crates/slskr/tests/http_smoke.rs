@@ -578,6 +578,57 @@ async fn daemon_http_smoke() {
         .await
         .unwrap();
     assert_eq!(unknown_transfer.status(), reqwest::StatusCode::NOT_FOUND);
+    // Folder downloads: validation first, then 409 while not logged in.
+    for (path, body, status) in [
+        (
+            "transfers/downloads",
+            serde_json::json!({"username": "peer", "root": "@@m\\Album",
+                "files": [{"filename": "@@m\\Other\\a.flac", "size": 1}]}),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "transfers/downloads",
+            serde_json::json!({"username": "peer", "root": "@@m\\..",
+                "files": [{"filename": "@@m\\..\\a.flac", "size": 1}]}),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "transfers/downloads",
+            serde_json::json!({"username": "peer", "root": "@@m\\Album",
+                "files": [{"filename": "@@m\\Album\\CD1\\a.flac", "size": 1}]}),
+            reqwest::StatusCode::CONFLICT,
+        ),
+        (
+            "transfers/downloads/folder",
+            serde_json::json!({"username": "", "path": "@@m\\Album"}),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "transfers/downloads/folder",
+            serde_json::json!({"username": "peer", "path": ""}),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "transfers/downloads/folder",
+            serde_json::json!({"username": "peer", "path": "@@m\\Album\\..\\..", "recursive": true}),
+            reqwest::StatusCode::BAD_REQUEST,
+        ),
+        (
+            "transfers/downloads/folder",
+            serde_json::json!({"username": "peer", "path": "@@m\\Album", "recursive": true}),
+            reqwest::StatusCode::CONFLICT,
+        ),
+    ] {
+        let response = client
+            .post(format!("{api}/{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{path} {body}");
+        let error: Value = response.json().await.unwrap();
+        assert!(error["error"].is_string(), "{path} {body}");
+    }
     let downloads: Value = client
         .get(format!("{api}/transfers/downloads"))
         .send()

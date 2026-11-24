@@ -146,7 +146,8 @@ purpose, so keep administrator access to trusted people.
 | POST | `/api/searches/{id}/cancel` | readwrite | | 204; the final state arrives as an event |
 | GET | `/api/searches/{id}/responses` | readonly | | `[SearchResponse]`, in arrival order |
 | GET | `/api/transfers/downloads` | readonly | `?username&include_removed=false` | `[Transfer]` |
-| POST | `/api/transfers/downloads` | readwrite | `EnqueueDownloads` `{username, files: [{filename, size}]}` | 201/207/200 `EnqueuedDownloads` |
+| POST | `/api/transfers/downloads` | readwrite | `EnqueueDownloadsRequest` `{username, files: [{filename, size}], root?}`; with `root`, each file is saved as `<downloads>/<last component of root>/<path below root>`, and a file not below `root` is a 400 | 201/207/200 `EnqueuedDownloads` `{enqueued, failed, files}` |
+| POST | `/api/transfers/downloads/folder` | readwrite | `EnqueueFolder` `{username, path, recursive=false}` | 201/207/200 `EnqueuedDownloads`: every file in the peer's folder `path` (and, if `recursive`, in every folder below it), saved as `<downloads>/<last component of path>/<path below it>`; 404 if the folder is missing or has no files, 409 if not logged in, 504 if the peer does not answer |
 | DELETE | `/api/transfers/downloads/completed` | readwrite | | 204; removes every completed download from the list |
 | GET | `/api/transfers/downloads/{id}` | readonly | | `Transfer` |
 | DELETE | `/api/transfers/downloads/{id}` | readwrite | | 204; cancels if active and removes from the list |
