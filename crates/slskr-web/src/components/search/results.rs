@@ -61,7 +61,7 @@ impl File {
     }
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct Filter {
     include: Vec<String>,
     exclude: Vec<String>,
@@ -170,6 +170,54 @@ fn folder_name(directory: &str) -> String {
         .to_owned()
 }
 
+/// By username: the response the cards were grouped from, and the cards.
+type Grouped = HashMap<String, (Arc<SearchResponse>, Arc<[Arc<Folder>]>)>;
+
+/// The folder cards of each response, for one filter and `hide_locked`.
+#[derive(Default)]
+struct FolderCache {
+    filter: Filter,
+    hide_locked: bool,
+    entries: Grouped,
+}
+
+impl FolderCache {
+    /// Starts a pass: returns the entries still valid for `filter` and `hide_locked`. Those
+    /// not used again by [`Self::folders`] in this pass are dropped.
+    fn begin(&mut self, filter: &Filter, hide_locked: bool) -> Grouped {
+        let previous = std::mem::take(&mut self.entries);
+        if self.filter == *filter && self.hide_locked == hide_locked {
+            previous
+        } else {
+            self.filter = filter.clone();
+            self.hide_locked = hide_locked;
+            HashMap::new()
+        }
+    }
+
+    /// The cards of `response`, reused when this exact response was grouped before.
+    fn folders(
+        &mut self,
+        previous: &mut Grouped,
+        response: &Arc<SearchResponse>,
+        filter: &Filter,
+        hide_locked: bool,
+    ) -> Arc<[Arc<Folder>]> {
+        let cards = match previous.remove(&response.username) {
+            Some((grouped, cards)) if Arc::ptr_eq(&grouped, response) => cards,
+            _ => folders(response, filter, hide_locked)
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
+        };
+        self.entries.insert(
+            response.username.clone(),
+            (Arc::clone(response), Arc::clone(&cards)),
+        );
+        cards
+    }
+}
+
 /// The folders of one response that have files left after filtering.
 fn folders(response: &SearchResponse, filter: &Filter, hide_locked: bool) -> Vec<Folder> {
     let count = response.files.len()
@@ -254,7 +302,7 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 pub(super) fn SearchResults(
     id: StoredValue<String>,
     live: RwSignal<LiveResponses>,
-    saved: RwSignal<Vec<SearchResponse>>,
+    saved: RwSignal<Vec<Arc<SearchResponse>>>,
     connected: Signal<bool>,
     done: Memo<bool>,
     ready: Signal<bool>,
@@ -267,6 +315,9 @@ pub(super) fn SearchResults(
     let sort_by_queue = RwSignal::new(false);
     let hidden = RwSignal::new(BTreeSet::<String>::new());
     let limit = RwSignal::new(PAGE_SIZE);
+    // Folder cards per response, kept while the response, the filter and `hide_locked` stay
+    // the same: a live batch then only groups the responses it added or replaced.
+    let grouped = StoredValue::new(FolderCache::default());
     // (responses, users with results left, folder cards)
     let results = Memo::new(move |_| {
         let hide_locked = hide_locked.get();
@@ -277,7 +328,7 @@ pub(super) fn SearchResults(
             live.with(|live| {
                 hidden.with(|hidden| {
                     filter.with(|filter| {
-                        let mut responses: BTreeMap<&str, &SearchResponse> = saved
+                        let mut responses: BTreeMap<&str, &Arc<SearchResponse>> = saved
                             .iter()
                             .map(|row| (row.username.as_str(), row))
                             .collect();
@@ -293,16 +344,19 @@ pub(super) fn SearchResults(
                         let count = responses.len();
                         let mut users = 0;
                         let mut cards = Vec::new();
-                        for row in responses.into_values().filter(|row| {
-                            !hidden.contains(&row.username)
-                                && (!free_only || row.has_free_upload_slot)
-                        }) {
-                            let found = folders(row, filter, hide_locked);
-                            if !found.is_empty() {
-                                users += 1;
+                        grouped.update_value(|cache| {
+                            let mut previous = cache.begin(filter, hide_locked);
+                            for row in responses.into_values().filter(|row| {
+                                !hidden.contains(&row.username)
+                                    && (!free_only || row.has_free_upload_slot)
+                            }) {
+                                let found = cache.folders(&mut previous, row, filter, hide_locked);
+                                if !found.is_empty() {
+                                    users += 1;
+                                }
+                                cards.extend(found.iter().cloned());
                             }
-                            cards.extend(found.into_iter().map(Arc::new));
-                        }
+                        });
                         if by_queue {
                             cards.sort_by(|a, b| {
                                 (a.queue, &a.username, &a.directory).cmp(&(
@@ -962,5 +1016,57 @@ fn FolderCard(
             </footer>
             <ContextMenu state=menu/>
         </article>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(username: &str, files: &[&str]) -> Arc<SearchResponse> {
+        Arc::new(SearchResponse {
+            username: username.into(),
+            files: files
+                .iter()
+                .map(|name| users::File {
+                    filename: (*name).into(),
+                    extension: "flac".into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn folder_cache_regroups_only_changed_responses() {
+        let mut cache = FolderCache::default();
+        let filter = Filter::default();
+        let alice = response("alice", &[r"music\a\1.flac", r"music\b\2.flac"]);
+        let bob = response("bob", &[r"music\c\3.flac"]);
+        let pass = |cache: &mut FolderCache, rows: &[&Arc<SearchResponse>], filter: &Filter| {
+            let mut previous = cache.begin(filter, true);
+            rows.iter()
+                .map(|row| cache.folders(&mut previous, row, filter, true))
+                .collect::<Vec<_>>()
+        };
+
+        let first = pass(&mut cache, &[&alice, &bob], &filter);
+        assert_eq!(first[0].len(), 2);
+        // Same responses: the same cards, not regrouped.
+        let second = pass(&mut cache, &[&alice, &bob], &filter);
+        assert!(Arc::ptr_eq(&first[0], &second[0]) && Arc::ptr_eq(&first[1], &second[1]));
+
+        // A replaced response is regrouped; the other is kept.
+        let bob = response("bob", &[r"music\c\3.flac", r"music\d\4.flac"]);
+        let third = pass(&mut cache, &[&alice, &bob], &filter);
+        assert!(Arc::ptr_eq(&first[0], &third[0]));
+        assert_eq!(third[1].len(), 2);
+
+        // A different filter regroups everything, and drops users no longer listed.
+        let filter = Filter::parse("\\b\\");
+        let fourth = pass(&mut cache, &[&alice], &filter);
+        assert!(!Arc::ptr_eq(&first[0], &fourth[0]));
+        assert_eq!(cache.entries.len(), 1);
     }
 }

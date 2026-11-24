@@ -1,6 +1,9 @@
 mod results;
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
 use leptos_router::{
@@ -57,7 +60,9 @@ impl Catalog {
 #[derive(Default)]
 struct LiveResponses {
     id: String,
-    responses: BTreeMap<String, SearchResponse>,
+    /// Shared, so the results view can tell a replaced response from one it already
+    /// grouped into folders.
+    responses: BTreeMap<String, Arc<SearchResponse>>,
 }
 
 fn endpoint(id: &str) -> String {
@@ -116,8 +121,8 @@ pub fn Searches() -> impl IntoView {
                     live.responses.clear();
                 }
                 for response in responses {
-                    let response = response.clone();
-                    live.responses.insert(response.username.clone(), response);
+                    live.responses
+                        .insert(response.username.clone(), Arc::new(response.clone()));
                 }
             });
         }
@@ -490,7 +495,7 @@ fn SearchDetail(
     });
     let known_completion = Memo::new(move |_| search.with(|search| search.as_ref().map(complete)));
     let done = Memo::new(move |_| known_completion.get() == Some(true));
-    let saved = RwSignal::new(Vec::<SearchResponse>::new());
+    let saved = RwSignal::new(Vec::<Arc<SearchResponse>>::new());
     let fetching = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
     let path = id.with_value(|id| format!("{}/responses", endpoint(id)));
@@ -510,7 +515,7 @@ fn SearchDetail(
             }
             match result {
                 Ok(rows) => {
-                    saved.set(rows);
+                    saved.set(rows.into_iter().map(Arc::new).collect());
                     error.set(None);
                 }
                 Err(error_value) => error.set(Some(error_value.to_string())),
