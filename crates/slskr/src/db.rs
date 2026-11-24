@@ -6,9 +6,18 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use rusqlite::Connection;
+
+/// How long a statement waits for a lock held by another connection before failing.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Page cache per connection, in KiB (a negative `cache_size`).
+const CACHE_KIB: i64 = 8 * 1024;
+/// Size the WAL file is truncated to after a checkpoint, so one large write does not leave
+/// a large file behind. Checkpoints themselves use SQLite's default (every 1000 pages).
+const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Database {
@@ -22,8 +31,12 @@ struct Inner {
 
 impl Database {
     /// Open a SQLite database and apply migrations in order.
+    ///
+    /// File databases use write-ahead logging with `synchronous = NORMAL`: every commit is
+    /// atomic and consistent, but the last commits before a power loss may roll back.
     pub fn open(path: &Path, migrations: &[&str]) -> anyhow::Result<Self> {
-        let connection = if path == Path::new(":memory:") {
+        let in_memory = path == Path::new(":memory:");
+        let connection = if in_memory {
             Connection::open_in_memory()?
         } else {
             if let Some(parent) = path
@@ -35,6 +48,22 @@ impl Database {
             Connection::open(path)?
         };
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
+        connection.pragma_update(None, "cache_size", -CACHE_KIB)?;
+        if !in_memory {
+            // Outside any transaction: the journal mode cannot change inside one.
+            let mode: String =
+                connection
+                    .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+            anyhow::ensure!(
+                mode.eq_ignore_ascii_case("wal"),
+                "could not enable write-ahead logging for {} (journal mode {mode})",
+                path.display()
+            );
+            connection.pragma_update(None, "synchronous", "NORMAL")?;
+            connection.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
+        }
         let current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         anyhow::ensure!(
             current >= 0 && current as usize <= migrations.len(),

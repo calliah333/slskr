@@ -128,35 +128,40 @@ fn fingerprint(salt: &[u8], username: &str, password: &str) -> Vec<u8> {
 fn apply(connection: &mut rusqlite::Connection, write: &Write) -> rusqlite::Result<()> {
     match write {
         Write::Insert(hash, record) => {
-            connection.execute(
-                "INSERT OR REPLACE INTO sessions
+            connection
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO sessions
                  (token_hash, username, role, created_at, expires_at, last_seen_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+                )?
+                .execute(params![
                     &hash[..],
                     record.username,
                     record.role.as_str(),
                     timestamp(record.created_at),
                     timestamp(record.expires_at),
                     timestamp(record.last_seen_at),
-                ],
-            )?;
+                ])?;
         }
         Write::Touch {
             hash,
             expires_at,
             last_seen_at,
         } => {
-            connection.execute(
-                "UPDATE sessions SET expires_at = ?2, last_seen_at = ?3 WHERE token_hash = ?1",
-                params![&hash[..], timestamp(*expires_at), timestamp(*last_seen_at)],
-            )?;
+            connection
+                .prepare_cached(
+                    "UPDATE sessions SET expires_at = ?2, last_seen_at = ?3 WHERE token_hash = ?1",
+                )?
+                .execute(params![
+                    &hash[..],
+                    timestamp(*expires_at),
+                    timestamp(*last_seen_at)
+                ])?;
         }
         Write::Delete(hash) => {
-            connection.execute(
-                "DELETE FROM sessions WHERE token_hash = ?1",
-                params![&hash[..]],
-            )?;
+            connection
+                .prepare_cached("DELETE FROM sessions WHERE token_hash = ?1")?
+                .execute(params![&hash[..]])?;
         }
         Write::Reset(fingerprint) => {
             let transaction = connection.transaction()?;

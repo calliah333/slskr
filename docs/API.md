@@ -129,7 +129,7 @@ purpose, so keep administrator access to trusted people.
 | POST | `/api/api-keys` | admin session | `CreateApiKey` `{name, role?, allow?}` | 201 `CreatedApiKey`, the only time the key is shown |
 | DELETE | `/api/api-keys/{name}` | admin session | | 204 |
 | GET | `/api/events` | readonly | WebSocket upgrade | live events, see below |
-| GET | `/api/events/history` | readonly | `?offset=0&limit=100` | `[Event]`, newest first; `X-Total-Count` header |
+| GET | `/api/events/history` | readonly | `?offset=0&limit=100` | `[Event]`, newest first; `X-Total-Count` header. The history keeps the newest 10000 events of the last 30 days |
 | GET | `/api/logs` | admin | | `[LogRecord]`, the recent records kept in memory |
 | GET | `/api/logs/files` | admin | | `[LogFile]` |
 | GET | `/api/logs/files/{name}` | admin | | the log file, `text/plain` |
