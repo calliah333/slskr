@@ -55,7 +55,9 @@ use crate::{
 use queue::{Bandwidth, UploadHistory, UploadQueue};
 use store::Snapshot;
 
-pub(crate) use store::state_from_bits;
+#[cfg(test)]
+pub(crate) use store::MIGRATIONS as TRANSFER_MIGRATIONS;
+pub(crate) use store::{date as stored_date, state_from_bits, timestamp as stored_time};
 
 #[derive(Clone)]
 pub struct TransferService(Arc<Inner>);

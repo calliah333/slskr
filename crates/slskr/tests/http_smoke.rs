@@ -670,13 +670,14 @@ async fn daemon_http_smoke() {
         let error: Value = response.json().await.unwrap();
         assert!(error["error"].is_string(), "{path} {body}");
     }
-    // Seed history before taking the first snapshot, with Soulseek disconnected.
+    // Seed history before taking the first snapshot, with Soulseek disconnected. Times are
+    // stored as nanoseconds since the epoch (2025-01-01T00:00:00Z and a minute later).
     const TRANSFER_ID: &str = "11111111-1111-1111-1111-111111111111";
     rusqlite::Connection::open(data_dir.path().join("db/transfers.db"))
         .unwrap()
         .execute(
             "INSERT INTO transfers (id, username, direction, filename, size, state, requested_at, ended_at)
-             VALUES (?1, 'peer', 'Download', 'album/track.flac', 1, 48, '2025-01-01T00:00:00Z', '2025-01-01T00:01:00Z')",
+             VALUES (?1, 'peer', 'Download', 'album/track.flac', 1, 48, 1735689600000000000, 1735689660000000000)",
             [TRANSFER_ID],
         )
         .unwrap();

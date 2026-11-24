@@ -121,7 +121,9 @@ Each `Database` is one connection behind a mutex, so calls run one at a time. Fi
 databases use WAL, so a `reader()` connection runs long reads (transfer reports) without
 holding up the writer.
 Migrations: ordered SQL strings; applied ones tracked via `PRAGMA user_version`.
-Timestamps stored as TEXT RFC 3339 UTC; flags as INTEGER; GUIDs as TEXT.
+Timestamps are stored as TEXT RFC 3339 UTC, except transfer times (`transfers.*_at`),
+which are INTEGER nanoseconds since the Unix epoch so reports can subtract and bucket
+them without parsing; flags as INTEGER; GUIDs as TEXT.
 
 ### Errors (`http.rs`)
 `enum ApiError { BadRequest(String), Unauthorized, Forbidden(String), NotFound(String), Conflict(String), Internal(anyhow::Error), Status(StatusCode, String) }`

@@ -5,9 +5,10 @@ pub(crate) use cache::cache_response;
 
 use crate::http::{ApiError, ApiResult, Json, Path, Query, Routes};
 use crate::{app::AppState, auth::Authenticated, db::Database};
+// Transfer times are stored as nanoseconds since the epoch (see the transfer store).
+use crate::transfers::{stored_date as datetime, stored_time as timestamp};
 use axum::extract::State;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::Row;
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use slskr_types::telemetry::{
     LeaderboardSortBy, SortOrder, TransferDirectorySummary, TransferErrorDetail,
@@ -59,25 +60,6 @@ const fn utc(seconds: i64, nanos: u32) -> DateTime<Utc> {
         Some(time) => time,
         None => panic!("invalid report timestamp"),
     }
-}
-
-fn timestamp(time: DateTime<Utc>) -> String {
-    // SQLite compares the TEXT bounds with the transfer store's fixed-width UTC timestamps.
-    time.to_rfc3339_opts(SecondsFormat::Nanos, true)
-}
-
-fn datetime(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
-    row.get::<_, Option<String>>(index)?
-        .map(|value| {
-            value.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    index,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })
-        })
-        .transpose()
 }
 
 fn summary_state(bits: u32) -> TransferState {
@@ -142,8 +124,8 @@ impl ReportsService {
         self.database.call(move |db| {
             let mut stmt = db.prepare_cached(concat!(
                 "SELECT direction, state, SUM(size), COUNT(*), COUNT(DISTINCT username), AVG(average_speed),
-                    AVG(strftime('%s', started_at)-strftime('%s', enqueued_at)),
-                    AVG(strftime('%s', ended_at)-strftime('%s', started_at))
+                    AVG(started_at - enqueued_at) / 1e9,
+                    AVG(ended_at - started_at) / 1e9
                  FROM transfers WHERE ended_at BETWEEN ?1 AND ?2
                     AND state IN (", completed_states!(), ") AND (?3 IS NULL OR direction = ?3)
                     AND (?4 IS NULL OR username = ?4) GROUP BY direction, state"
@@ -184,34 +166,48 @@ impl ReportsService {
         let direction = direction.map(str::to_owned);
         let username = username.map(str::to_owned);
         let mut histogram = empty_histogram(start, end, seconds);
-        self.database.call(move |db| {
-            let mut stmt = db.prepare_cached(concat!(
-                "SELECT (CAST(strftime('%s', ended_at) AS INTEGER) / ?1) * ?1, direction, state,
+        self.database
+            .call(move |db| {
+                let mut stmt = db.prepare_cached(concat!(
+                    "SELECT (ended_at / 1000000000 / ?1) * ?1, direction, state,
                     SUM(size), COUNT(*), COUNT(DISTINCT username),
-                    CAST(SUM(size) AS REAL) / NULLIF(SUM(strftime('%s', ended_at)-strftime('%s', started_at)), 0),
-                    AVG(strftime('%s', started_at)-strftime('%s', enqueued_at)),
-                    AVG(strftime('%s', ended_at)-strftime('%s', started_at))
+                    CAST(SUM(size) AS REAL) / (NULLIF(SUM(ended_at - started_at), 0) / 1e9),
+                    AVG(started_at - enqueued_at) / 1e9,
+                    AVG(ended_at - started_at) / 1e9
                  FROM transfers WHERE ended_at BETWEEN ?2 AND ?3
-                    AND state IN (", completed_states!(), ") AND (?4 IS NULL OR direction = ?4)
+                    AND state IN (",
+                    completed_states!(),
+                    ") AND (?4 IS NULL OR direction = ?4)
                     AND (?5 IS NULL OR username = ?5) GROUP BY 1, 2, 3"
-            ))?;
-            let mut rows = stmt.query(rusqlite::params![seconds, start_text, end_text, direction, username])?;
-            while let Some(row) = rows.next()? {
-                let Some(summary) = DateTime::from_timestamp(row.get(0)?, 0)
-                    .and_then(|at| histogram.get_mut(&at))
-                else {
-                    continue;
-                };
-                summary.entry(api_direction(&row.get::<_, String>(1)?)).or_default().insert(summary_state(row.get(2)?), TransferSummary {
-                    total_bytes: row.get(3)?, count: row.get(4)?, distinct_users: row.get(5)?,
-                    average_speed: row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
-                    average_wait_ms: ms(row.get(7)?),
-                    average_duration_ms: ms(row.get(8)?),
-                    ..Default::default()
-                });
-            }
-            Ok(histogram)
-        }).await
+                ))?;
+                let mut rows = stmt.query(rusqlite::params![
+                    seconds, start_text, end_text, direction, username
+                ])?;
+                while let Some(row) = rows.next()? {
+                    let Some(summary) = DateTime::from_timestamp(row.get(0)?, 0)
+                        .and_then(|at| histogram.get_mut(&at))
+                    else {
+                        continue;
+                    };
+                    summary
+                        .entry(api_direction(&row.get::<_, String>(1)?))
+                        .or_default()
+                        .insert(
+                            summary_state(row.get(2)?),
+                            TransferSummary {
+                                total_bytes: row.get(3)?,
+                                count: row.get(4)?,
+                                distinct_users: row.get(5)?,
+                                average_speed: row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
+                                average_wait_ms: ms(row.get(7)?),
+                                average_duration_ms: ms(row.get(8)?),
+                                ..Default::default()
+                            },
+                        );
+                }
+                Ok(histogram)
+            })
+            .await
     }
 
     /// Fast chart totals from completed hours, with the raw rows at the two edges.
@@ -236,36 +232,50 @@ impl ReportsService {
             timestamp(utc(full_start.max(full_end), 0)),
             timestamp(end),
         );
-        self.database.call(move |db| {
-            let mut histogram = empty_histogram(start, end, seconds);
-            let mut stmt = db.prepare_cached(concat!(
-                "SELECT hour / ?1 * ?1, direction, state, SUM(bytes), SUM(files) FROM (
+        self.database
+            .call(move |db| {
+                let mut histogram = empty_histogram(start, end, seconds);
+                let mut stmt = db.prepare_cached(concat!(
+                    "SELECT hour / ?1 * ?1, direction, state, SUM(bytes), SUM(files) FROM (
                     SELECT hour, direction, state, bytes, files FROM transfer_chart_hours
                     WHERE hour >= ?2 AND hour < ?3
                     UNION ALL
-                    SELECT unixepoch(substr(ended_at, 1, 19)) / 3600 * 3600, direction, state, size, 1
+                    SELECT ended_at / 3600000000000 * 3600, direction, state, size, 1
                     FROM transfers WHERE ended_at BETWEEN ?4 AND ?5
-                      AND state IN (", completed_states!(), ")
+                      AND state IN (",
+                    completed_states!(),
+                    ")
                     UNION ALL
-                    SELECT unixepoch(substr(ended_at, 1, 19)) / 3600 * 3600, direction, state, size, 1
-                    FROM transfers WHERE ended_at BETWEEN ?6 AND ?7 AND state IN (", completed_states!(), ")
+                    SELECT ended_at / 3600000000000 * 3600, direction, state, size, 1
+                    FROM transfers WHERE ended_at BETWEEN ?6 AND ?7 AND state IN (",
+                    completed_states!(),
+                    ")
                 ) GROUP BY 1, 2, 3"
-            ))?;
-            let mut rows = stmt.query(rusqlite::params![seconds, full_start, full_end, bounds.0, bounds.1, bounds.2, bounds.3])?;
-            while let Some(row) = rows.next()? {
-                let Some(summary) = DateTime::from_timestamp(row.get(0)?, 0)
-                    .and_then(|at| histogram.get_mut(&at))
-                else {
-                    continue;
-                };
-                summary.entry(api_direction(&row.get::<_, String>(1)?)).or_default().insert(summary_state(row.get(2)?), TransferSummary {
-                    total_bytes: row.get(3)?,
-                    count: row.get(4)?,
-                    ..Default::default()
-                });
-            }
-            Ok(histogram)
-        }).await
+                ))?;
+                let mut rows = stmt.query(rusqlite::params![
+                    seconds, full_start, full_end, bounds.0, bounds.1, bounds.2, bounds.3
+                ])?;
+                while let Some(row) = rows.next()? {
+                    let Some(summary) = DateTime::from_timestamp(row.get(0)?, 0)
+                        .and_then(|at| histogram.get_mut(&at))
+                    else {
+                        continue;
+                    };
+                    summary
+                        .entry(api_direction(&row.get::<_, String>(1)?))
+                        .or_default()
+                        .insert(
+                            summary_state(row.get(2)?),
+                            TransferSummary {
+                                total_bytes: row.get(3)?,
+                                count: row.get(4)?,
+                                ..Default::default()
+                            },
+                        );
+                }
+                Ok(histogram)
+            })
+            .await
     }
 
     pub async fn leaderboard(
@@ -293,8 +303,8 @@ impl ReportsService {
         self.database.call(move |db| {
             let sql = format!(
                 "SELECT username, SUM(size) AS total_bytes, COUNT(*) AS count, AVG(average_speed) AS average_speed,
-                    AVG(strftime('%s', started_at)-strftime('%s', enqueued_at)),
-                    AVG(strftime('%s', ended_at)-strftime('%s', started_at))
+                    AVG(started_at - enqueued_at) / 1e9,
+                    AVG(ended_at - started_at) / 1e9
                  FROM transfers WHERE direction = ?1 AND state = 48 AND ended_at BETWEEN ?2 AND ?3
                  GROUP BY username ORDER BY {field} {ordering}, username DESC LIMIT ?4 OFFSET ?5"
             );
@@ -756,6 +766,7 @@ mod tests {
         assert!(histogram_bucket_count(GENESIS, end, 120) > MAX_HISTOGRAM_BUCKETS);
         assert!(
             fixture()
+                .0
                 .histogram(GENESIS, end, 120, None, None)
                 .await
                 .is_err()
@@ -769,14 +780,20 @@ mod tests {
         assert!(histogram_bucket_count(MIN_TIME, MAX_TIME, seconds) <= MAX_HISTOGRAM_BUCKETS);
     }
 
-    fn fixture() -> ReportsService {
-        let database = Database::open(std::path::Path::new(":memory:"), &[r#"
-            CREATE TABLE transfers (
-                id TEXT, username TEXT, direction TEXT, filename TEXT, size INTEGER, state INTEGER,
-                requested_at TEXT, enqueued_at TEXT, started_at TEXT, ended_at TEXT,
-                bytes_transferred INTEGER, average_speed REAL, exception TEXT
-            );
-            INSERT INTO transfers VALUES
+    /// Report data written by the text-timestamp schema, then converted by the
+    /// integer-times migration, so every report test also covers that migration.
+    fn fixture() -> (ReportsService, tempfile::TempDir) {
+        use crate::transfers::TRANSFER_MIGRATIONS as MIGRATIONS;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transfers.db");
+        let integer_times = MIGRATIONS
+            .iter()
+            .position(|sql| *sql == include_str!("../transfers/migrations/integer_times.sql"))
+            .unwrap();
+        drop(Database::open(&path, &MIGRATIONS[..integer_times]).unwrap());
+        rusqlite::Connection::open(&path).unwrap().execute_batch(r#"
+            INSERT INTO transfers (id, username, direction, filename, size, state, requested_at,
+                enqueued_at, started_at, ended_at, bytes_transferred, average_speed, exception) VALUES
                 ('d1','alice','Download','one.flac',120,48,
                  '2025-12-31T23:59:57.000000000Z','2025-12-31T23:59:57.000000000Z',
                  '2025-12-31T23:59:58.000000000Z','2026-01-01T00:00:00.000000000Z',120,12,NULL),
@@ -792,13 +809,19 @@ mod tests {
                  '2026-01-01T00:00:00.000000000Z',NULL,NULL,'2026-01-01T00:01:00.000000000Z',40,4,NULL),
                 ('u2','bob','Upload','music\album\two.flac',70,48,
                  '2026-01-01T00:00:00.000000000Z',NULL,NULL,'2026-01-01T00:01:01.000000000Z',70,7,NULL);
-        "#, include_str!("../transfers/migrations/chart.sql")]).unwrap();
-        ReportsService::new(database)
+        "#).unwrap();
+        let database = Database::open(&path, MIGRATIONS).unwrap();
+        (ReportsService::new(database), directory)
+    }
+
+    /// The stored form of an RFC 3339 time.
+    fn stored(time: &str) -> i64 {
+        timestamp(time.parse().unwrap())
     }
 
     #[tokio::test]
     async fn chart_keeps_exact_edges_and_tracks_transfer_changes() {
-        let reports = fixture();
+        let (reports, _directory) = fixture();
         let start = START - Duration::minutes(5);
         let end = START + Duration::hours(2) + Duration::minutes(2);
         let chart = |histogram: &TransferHistogram, hour, direction, state| {
@@ -826,13 +849,20 @@ mod tests {
             (3, 1620)
         );
 
-        reports.database.call(|db| db.execute_batch(
+        let changes = format!(
             "DELETE FROM transfers WHERE id = 'd2';
              UPDATE transfers SET direction = 'Upload', size = 50 WHERE id = 'd1';
-             UPDATE transfers SET state = 48, ended_at = '2026-01-01T02:01:00.000000000Z' WHERE id = 'd3';
-             INSERT INTO transfers (id, username, direction, size, state, ended_at)
-             VALUES ('d5', 'alice', 'Download', 7, 48, '2026-01-01T01:59:59.999999999Z');"
-        )).await.unwrap();
+             UPDATE transfers SET state = 48, ended_at = {} WHERE id = 'd3';
+             INSERT INTO transfers (id, username, direction, filename, size, state, requested_at, ended_at)
+             VALUES ('d5', 'alice', 'Download', 'five.flac', 7, 48, 0, {});",
+            stored("2026-01-01T02:01:00.000000000Z"),
+            stored("2026-01-01T01:59:59.999999999Z"),
+        );
+        reports
+            .database
+            .call(move |db| db.execute_batch(&changes))
+            .await
+            .unwrap();
         let updated = reports.chart(start, end, 3600).await.unwrap();
         assert_eq!(
             chart(
@@ -874,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn summary_and_histogram_match_direction_state_and_window() {
-        let reports = fixture();
+        let (reports, _directory) = fixture();
         let summary = reports
             .summary(START, END, Some("Download"), None)
             .await
@@ -902,16 +932,17 @@ mod tests {
             .unwrap();
         assert_eq!(histogram.len(), 2);
         let final_bucket = &histogram[&(START + Duration::minutes(2))];
+        // d2 alone: 600 bytes over the exact 2.25 s (whole seconds once made it 2 s).
         assert_eq!(
             final_bucket[&TransferDirection::Download][&TransferState::Succeeded].average_speed,
-            300.0
+            600.0 / 2.25
         );
         assert!(final_bucket[&TransferDirection::Upload].is_empty());
     }
 
     #[tokio::test]
     async fn dashboard_lists_and_user_details_use_transfer_history() {
-        let reports = fixture();
+        let (reports, _directory) = fixture();
         let top = reports
             .leaderboard(
                 "Download",

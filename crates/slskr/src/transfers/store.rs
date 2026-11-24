@@ -7,7 +7,7 @@ use slskr_types::{
 
 use crate::db::Database;
 
-pub(super) const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
 CREATE TABLE transfer_batches (
     id TEXT PRIMARY KEY, search_id TEXT, username TEXT NOT NULL,
@@ -39,6 +39,7 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
     // No query filters on `state` alone (they use the partial and report indexes), but
     // every state change had to update it.
     "DROP INDEX ix_transfers_state;",
+    include_str!("migrations/integer_times.sql"),
 ];
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
@@ -135,11 +136,30 @@ pub(super) fn direction_name(direction: TransferDirection) -> &'static str {
     }
 }
 
-fn timestamp(time: DateTime<Utc>) -> String {
+/// A transfer time as stored: nanoseconds since the Unix epoch, saturated outside the
+/// range `i64` covers (years 1677 to 2262).
+pub(crate) fn timestamp(time: DateTime<Utc>) -> i64 {
+    time.timestamp_nanos_opt()
+        .unwrap_or(if time.timestamp() < 0 {
+            i64::MIN
+        } else {
+            i64::MAX
+        })
+}
+
+/// A stored transfer time.
+pub(crate) fn date(row: &Row<'_>, i: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    Ok(row
+        .get::<_, Option<i64>>(i)?
+        .map(DateTime::from_timestamp_nanos))
+}
+
+/// Batch times stay RFC 3339 text; nothing compares them.
+fn rfc3339(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
-fn date(row: &Row<'_>, i: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
+fn text_date(row: &Row<'_>, i: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
     row.get::<_, Option<String>>(i)?
         .map(|text| {
             text.parse().map_err(|error| {
@@ -383,7 +403,7 @@ pub(super) async fn remove(
 pub(super) async fn create_batch(db: &Database, batch: Batch) -> anyhow::Result<bool> {
     db.call(move |db| {
         Ok(db.execute("INSERT INTO transfer_batches (id, search_id, username, created_at, destination, external_id)\n            VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
-            params![batch.id, batch.search_id, batch.username, timestamp(batch.created_at), batch.destination, batch.external_id])? != 0)
+            params![batch.id, batch.search_id, batch.username, rfc3339(batch.created_at), batch.destination, batch.external_id])? != 0)
     }).await
 }
 
@@ -408,7 +428,7 @@ pub(super) async fn batch_info(db: &Database, id: String) -> anyhow::Result<Opti
 fn batch_metadata(db: &Connection, id: &str) -> rusqlite::Result<Option<Batch>> {
     db.query_row("SELECT id, search_id, username, created_at, destination, external_id FROM transfer_batches WHERE id = ?1", [id], |row| Ok(Batch {
         id: row.get(0)?, search_id: row.get(1)?, username: row.get(2)?,
-        created_at: date(row, 3)?.ok_or(rusqlite::Error::InvalidQuery)?, transfers: Vec::new(),
+        created_at: text_date(row, 3)?.ok_or(rusqlite::Error::InvalidQuery)?, transfers: Vec::new(),
         destination: row.get(4)?, external_id: row.get(5)?,
     })).optional()
 }
@@ -482,6 +502,110 @@ mod tests {
 
     use super::*;
     use crate::transfers::new_transfer;
+
+    #[tokio::test]
+    async fn text_times_become_nanoseconds_keeping_rows_order_and_chart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transfers.db");
+        let integer_times = MIGRATIONS
+            .iter()
+            .position(|sql| *sql == include_str!("migrations/integer_times.sql"))
+            .unwrap();
+        drop(Database::open(&path, &MIGRATIONS[..integer_times]).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO transfers (rowid, id, username, direction, filename, size, state,
+                     requested_at, enqueued_at, started_at, ended_at, next_attempt_at) VALUES
+                 (7, 'b', 'peer', 'Download', 'b', 5, 48, '2026-01-01T00:00:00Z',
+                  '2026-01-01T00:00:01.5Z', '2026-01-01T01:00:02.000000001+01:00',
+                  '2026-01-01T00:59:59.999999999Z', NULL),
+                 (3, 'a', 'peer', 'Download', 'a', 9, 2050, '2026-01-01T00:00:00.123Z',
+                  NULL, NULL, NULL, '2026-01-02T00:00:00.000000000Z');",
+            )
+            .unwrap();
+        let chart = |connection: &Connection| {
+            connection
+                .query_row(
+                    "SELECT group_concat(hour || ':' || bytes || ':' || files) FROM transfer_chart_hours",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        let before = chart(&connection);
+        drop(connection);
+
+        let db = Database::open(&path, MIGRATIONS).unwrap();
+        let at = |text: &str| timestamp(text.parse().unwrap());
+        // rowid, id, then requested, enqueued, started, ended and next attempt.
+        type Row = (
+            i64,
+            String,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows: Vec<Row> = db
+            .call(|db| {
+                db.prepare("SELECT rowid, id, requested_at, enqueued_at, started_at, ended_at, next_attempt_at FROM transfers ORDER BY rowid")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))?
+                    .collect()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    3,
+                    "a".into(),
+                    at("2026-01-01T00:00:00.123Z"),
+                    None,
+                    None,
+                    None,
+                    Some(at("2026-01-02T00:00:00Z"))
+                ),
+                (
+                    7,
+                    "b".into(),
+                    at("2026-01-01T00:00:00Z"),
+                    Some(at("2026-01-01T00:00:01.5Z")),
+                    Some(at("2026-01-01T00:00:02.000000001Z")),
+                    Some(at("2026-01-01T00:59:59.999999999Z")),
+                    None,
+                ),
+            ]
+        );
+        let after = db.call(move |db| Ok(chart(db))).await.unwrap();
+        assert_eq!(after, before, "chart hours are kept");
+
+        // The recreated triggers keep the chart in step with later changes.
+        let found = find(&db, TransferDirection::Download, "b".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.ended_at,
+            Some("2026-01-01T00:59:59.999999999Z".parse().unwrap())
+        );
+        db.call(|db| db.execute("DELETE FROM transfers WHERE id = 'b'", []))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.call(
+                |db| db.query_row("SELECT count(*) FROM transfer_chart_hours", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn preserves_delayed_retries_and_recovers_interrupted_jobs() {
