@@ -1,15 +1,125 @@
 //! Message framing: [`MessageBuilder`], [`MessageReader`] and [`ProtocolError`].
 
-use std::io::{Read, Write};
+use std::cell::RefCell;
+use std::io;
 use std::net::Ipv4Addr;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use flate2::Compression;
-use flate2::bufread::ZlibDecoder;
-use flate2::write::ZlibEncoder;
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
 /// Maximum inflated peer payload size, independent of the compressed frame size.
 const MAX_INFLATED_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+/// Upper bound of the up-front inflate buffer; larger payloads grow as they inflate,
+/// so a small hostile frame cannot reserve much memory before producing output.
+const MAX_INFLATE_PREALLOCATION: usize = 1024 * 1024;
+
+// zlib states are large (the deflate state is a few hundred KiB) and costly to set
+// up relative to typical small search responses, so each thread reuses one of each.
+thread_local! {
+    static DEFLATE: RefCell<Option<Compress>> = const { RefCell::new(None) };
+    static INFLATE: RefCell<Option<Decompress>> = const { RefCell::new(None) };
+}
+
+/// Zlib-compresses `input` (default level, zlib header), reusing this thread's state.
+fn deflate(input: &[u8]) -> Vec<u8> {
+    fn run(state: &mut Compress, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len() / 2 + 64);
+        loop {
+            // Ample space guarantees progress on every call.
+            if out.capacity() - out.len() < 1024 {
+                out.reserve(out.capacity().max(1024));
+            }
+            let consumed = state.total_in() as usize;
+            // Compressing into memory cannot fail.
+            match state
+                .compress_vec(&input[consumed..], &mut out, FlushCompress::Finish)
+                .expect("in-memory zlib compression")
+            {
+                Status::StreamEnd => return out,
+                Status::Ok | Status::BufError => {}
+            }
+        }
+    }
+    DEFLATE.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut slot) => {
+            let state = slot.get_or_insert_with(|| Compress::new(Compression::default(), true));
+            // Also clears anything left by an earlier call that unwound mid-stream.
+            state.reset();
+            run(state, input)
+        }
+        Err(_) => run(&mut Compress::new(Compression::default(), true), input),
+    })
+}
+
+/// Inflates a zlib stream of at most `limit` bytes, reusing this thread's state.
+/// Data after the end of the stream is ignored.
+fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>, ProtocolError> {
+    fn run(state: &mut Decompress, input: &[u8], limit: usize) -> Result<Vec<u8>, ProtocolError> {
+        let corrupt =
+            |error| ProtocolError::Decompress(io::Error::new(io::ErrorKind::InvalidInput, error));
+        let too_large =
+            || ProtocolError::Invalid(format!("inflated payload exceeds {limit} bytes"));
+        let hint = input
+            .len()
+            .saturating_mul(4)
+            .clamp(64, MAX_INFLATE_PREALLOCATION)
+            .min(limit);
+        let mut out = Vec::with_capacity(hint);
+        loop {
+            if out.len() >= limit {
+                if out.len() > limit {
+                    return Err(too_large());
+                }
+                // Probe past the cap without growing the output buffer.
+                let consumed = state.total_in() as usize;
+                let before = state.total_out();
+                let status = state
+                    .decompress(&input[consumed..], &mut [0], FlushDecompress::None)
+                    .map_err(corrupt)?;
+                return match status {
+                    _ if state.total_out() != before => Err(too_large()),
+                    Status::StreamEnd => Ok(out),
+                    Status::Ok | Status::BufError => Err(incomplete()),
+                };
+            }
+            if out.len() == out.capacity() {
+                out.reserve_exact(out.capacity().max(4096).min(limit - out.len()));
+            }
+            let consumed = state.total_in() as usize;
+            let before = (state.total_in(), state.total_out());
+            match state
+                .decompress_vec(&input[consumed..], &mut out, FlushDecompress::None)
+                .map_err(corrupt)?
+            {
+                Status::StreamEnd if out.len() > limit => return Err(too_large()),
+                Status::StreamEnd => return Ok(out),
+                // Without progress despite free output space, the input ended early.
+                Status::Ok | Status::BufError
+                    if (state.total_in(), state.total_out()) == before
+                        && out.len() < out.capacity() =>
+                {
+                    return Err(incomplete());
+                }
+                Status::Ok | Status::BufError => {}
+            }
+        }
+    }
+    INFLATE.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut slot) => {
+            let state = slot.get_or_insert_with(|| Decompress::new(true));
+            state.reset(true);
+            run(state, input, limit)
+        }
+        Err(_) => run(&mut Decompress::new(true), input, limit),
+    })
+}
+
+fn incomplete() -> ProtocolError {
+    ProtocolError::Decompress(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "incomplete deflate stream",
+    ))
+}
 
 /// Errors produced while encoding or decoding protocol messages.
 #[derive(Debug, thiserror::Error)]
@@ -104,15 +214,7 @@ impl MessageBuilder {
 
     /// Zlib-compresses the payload written so far (everything after the code).
     pub fn compress(&mut self) -> &mut Self {
-        let mut encoder = ZlibEncoder::new(
-            Vec::with_capacity(self.payload.len() / 2 + 16),
-            Compression::default(),
-        );
-        // Writing into a Vec cannot fail.
-        encoder
-            .write_all(&self.payload)
-            .expect("in-memory zlib compression");
-        let compressed = encoder.finish().expect("in-memory zlib compression");
+        let compressed = deflate(&self.payload);
         self.payload.clear();
         self.payload.extend_from_slice(&compressed);
         self
@@ -225,21 +327,7 @@ impl MessageReader {
     }
 
     fn decompress_with_limit(&mut self, limit: usize) -> Result<(), ProtocolError> {
-        let mut decoder = ZlibDecoder::new(&self.buf[..]);
-        let mut out = Vec::new();
-        (&mut decoder)
-            .take(limit as u64)
-            .read_to_end(&mut out)
-            .map_err(ProtocolError::Decompress)?;
-
-        // Probe past the cap without growing the output buffer.
-        if out.len() == limit && decoder.read(&mut [0]).map_err(ProtocolError::Decompress)? != 0 {
-            return Err(ProtocolError::Invalid(format!(
-                "inflated payload exceeds {limit} bytes"
-            )));
-        }
-
-        self.buf = Bytes::from(out);
+        self.buf = Bytes::from(inflate(&self.buf, limit)?);
         Ok(())
     }
 }
@@ -367,6 +455,84 @@ mod tests {
     fn decompress_garbage_fails() {
         let mut r = MessageReader::new(Bytes::from_static(&[1, 2, 3, 4, 5]));
         assert!(matches!(r.decompress(), Err(ProtocolError::Decompress(_))));
+    }
+
+    /// Deterministic, poorly compressible bytes, so inflating grows the buffer repeatedly.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678_u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn reference_deflate(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn reused_zlib_state_matches_a_fresh_encoder_and_decoder() {
+        use std::io::Read;
+        let large = noise(3 * MAX_INFLATE_PREALLOCATION + 17);
+        for data in [&b""[..], b"x", &[7; 70_000], &large] {
+            // Repeat on this thread's reused state.
+            for _ in 0..2 {
+                let compressed = deflate(data);
+                assert_eq!(compressed, reference_deflate(data));
+                let mut inflated = Vec::new();
+                flate2::read::ZlibDecoder::new(&compressed[..])
+                    .read_to_end(&mut inflated)
+                    .unwrap();
+                assert_eq!(inflated, data);
+                assert_eq!(
+                    inflate(&compressed, MAX_INFLATED_PAYLOAD_LEN).unwrap(),
+                    data
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decompress_rejects_truncated_streams_and_ignores_trailing_data() {
+        let data = noise(10_000);
+        let compressed = reference_deflate(&data);
+        for cut in [0, 1, compressed.len() / 2, compressed.len() - 1] {
+            assert!(
+                matches!(
+                    inflate(&compressed[..cut], MAX_INFLATED_PAYLOAD_LEN),
+                    Err(ProtocolError::Decompress(_))
+                ),
+                "cut at {cut}"
+            );
+        }
+        let mut trailing = compressed.clone();
+        trailing.extend_from_slice(b"trailing");
+        assert_eq!(inflate(&trailing, MAX_INFLATED_PAYLOAD_LEN).unwrap(), data);
+        // A failure leaves the reused state usable.
+        assert_eq!(inflate(&compressed, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn inflate_limit_applies_beyond_the_preallocation() {
+        let data = noise(2 * MAX_INFLATE_PREALLOCATION + 5);
+        let compressed = reference_deflate(&data);
+        assert_eq!(inflate(&compressed, data.len()).unwrap(), data);
+        assert!(matches!(
+            inflate(&compressed, data.len() - 1),
+            Err(ProtocolError::Invalid(_))
+        ));
+        assert!(matches!(
+            inflate(&compressed, MAX_INFLATE_PREALLOCATION),
+            Err(ProtocolError::Invalid(_))
+        ));
     }
 
     #[test]

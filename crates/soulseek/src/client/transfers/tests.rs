@@ -538,3 +538,65 @@ async fn download_slot_is_held_from_before_the_request() {
     })
     .await;
 }
+
+#[test]
+fn registry_user_index_tracks_inserts_and_removals() {
+    fn pending(username: &str, filename: &str) -> Pending {
+        Pending {
+            direction: Direction::Download,
+            username: username.into(),
+            filename: filename.into(),
+            session: CancellationToken::new(),
+            response: None,
+            offer: None,
+            failure: None,
+            remote_token: None,
+            incoming: None,
+        }
+    }
+    let files = |registry: &Registry, username: &str| {
+        let mut files: Vec<_> = registry
+            .user(username)
+            .map(|entry| entry.filename.clone())
+            .collect();
+        files.sort();
+        files
+    };
+
+    let mut registry = Registry::default();
+    registry.insert(1, pending("alice", "a1"));
+    registry.insert(2, pending("bob", "b1"));
+    registry.insert(3, pending("alice", "a2"));
+    assert_eq!(files(&registry, "alice"), ["a1", "a2"]);
+    assert_eq!(files(&registry, "bob"), ["b1"]);
+    assert!(files(&registry, "Alice").is_empty());
+
+    // Replacing a token moves it to the new owner.
+    registry.insert(3, pending("bob", "b2"));
+    assert_eq!(files(&registry, "alice"), ["a1"]);
+    assert_eq!(files(&registry, "bob"), ["b1", "b2"]);
+
+    assert!(
+        registry
+            .find_user_mut("bob", |entry| entry.filename == "b2")
+            .is_some()
+    );
+    registry.find_map_user("bob", |entry| {
+        entry.remote_token = Some(9);
+        None::<()>
+    });
+    assert!(
+        registry
+            .user("bob")
+            .all(|entry| entry.remote_token == Some(9))
+    );
+
+    registry.remove(1);
+    registry.remove(1);
+    assert!(files(&registry, "alice").is_empty());
+    assert!(!registry.by_user.contains_key("alice"));
+    registry.remove(2);
+    registry.remove(3);
+    assert!(registry.by_user.is_empty());
+    assert!(registry.active.is_empty());
+}

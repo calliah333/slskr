@@ -908,7 +908,7 @@ mod tests {
     use tokio::net::TcpStream;
 
     use super::*;
-    use crate::model::ClientState;
+    use crate::model::{ClientState, File};
     use crate::net::test_support::{FakeServer, read_frame, write_frame};
     use crate::protocol::peer::{FolderContentsResponse, PeerIncoming};
     use crate::resolvers::Resolvers;
@@ -998,6 +998,56 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), exchange)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_decodes_a_large_response_off_the_async_workers() {
+        let client = logged_in_client();
+        let mut peer = install_peer(&client).await;
+        // Distinct names keep the compressed frame above the blocking-decode threshold.
+        let response = BrowseResponse {
+            directories: (0..20_000u64)
+                .map(|n| Directory {
+                    name: format!("shared\\{:x}", n.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                    files: vec![File {
+                        code: 1,
+                        filename: format!("{:x}.flac", n.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)),
+                        size: n * 7919,
+                        extension: "flac".into(),
+                        attributes: vec![],
+                    }],
+                })
+                .collect(),
+            ..BrowseResponse::default()
+        };
+        let body = response.to_bytes().slice(4..);
+        assert!(body.len() as u64 > peer_handler::BLOCKING_DECODE_LEN);
+        let exchange = async {
+            let request = async {
+                read_frame(&mut peer).await;
+                write_frame(&mut peer, &body).await;
+            };
+            let browse = client.browse("peer", BrowseOptions::default(), CancellationToken::new());
+            let (actual, ()) = tokio::join!(browse, request);
+            assert_eq!(actual.unwrap(), response);
+        };
+        tokio::time::timeout(Duration::from_secs(10), exchange)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_requests_are_answered_with_the_resolved_shares() {
+        let client = logged_in_client();
+        let mut peer = install_peer(&client).await;
+        write_frame(&mut peer, &BrowseRequest.to_bytes()[4..]).await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut peer))
+            .await
+            .unwrap();
+        let PeerIncoming::BrowseResponse(response) = PeerIncoming::decode(reply).unwrap() else {
+            panic!("expected a browse response");
+        };
+        assert_eq!(response, BrowseResponse::default());
     }
 
     fn large_browse_body() -> Bytes {

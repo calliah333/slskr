@@ -2420,7 +2420,8 @@ mod tests {
 
     #[test]
     fn integer_messages() {
-        let cases: [(ServerCode, fn(u32) -> ServerIncoming); 8] = [
+        type Decoded = fn(u32) -> ServerIncoming;
+        let cases: [(ServerCode, Decoded); 8] = [
             (ServerCode::ParentMinSpeed, ServerIncoming::ParentMinSpeed),
             (
                 ServerCode::ParentSpeedRatio,
