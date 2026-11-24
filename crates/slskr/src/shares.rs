@@ -6,7 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -29,6 +29,7 @@ use crate::{
 };
 
 mod audio;
+mod index;
 mod scan;
 use scan::ShareSpec;
 
@@ -56,6 +57,9 @@ struct Snapshot {
     options: ScanOptions,
     scanned_at: DateTime<Utc>,
     shares: BTreeMap<String, ShareContents>,
+    /// Built from `shares` on first use; never written to the share cache.
+    #[serde(skip)]
+    index: OnceLock<Option<index::SearchIndex>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -159,6 +163,55 @@ impl Snapshot {
             .and_then(|share| share.directories.get(parent))
             .map_or(&[], Vec::as_slice)
     }
+
+    /// The search index, building it on first use; `None` when the snapshot
+    /// is too large to index and searches scan it linearly.
+    fn search_index(&self) -> Option<&index::SearchIndex> {
+        self.index
+            .get_or_init(|| index::SearchIndex::build(&self.shares))
+            .as_ref()
+    }
+
+    /// Collects matches in search order: shares, directories, then files.
+    fn search(&self, collect: &mut SearchMatches) {
+        let Some(index) = self.search_index() else {
+            return self.search_linear(collect);
+        };
+        let Some(lists) = index.candidates(&collect.matcher) else {
+            return self.search_linear(collect);
+        };
+        let mut directory = (usize::MAX, &[][..]);
+        for id in index::intersect(&lists) {
+            let located = index.locate(id);
+            if located.directory != directory.0 {
+                directory = (located.directory, self.files(located.name));
+                collect.parent(located.name);
+            }
+            let file = &directory.1[located.file];
+            collect.file(&file.name, |filename| file.wire(filename));
+            if collect.is_full() {
+                break;
+            }
+        }
+    }
+
+    /// Tests every shared file; the reference for [`Snapshot::search`].
+    fn search_linear(&self, collect: &mut SearchMatches) {
+        for share in self.shares.values() {
+            for (parent, files) in &share.directories {
+                if files.is_empty() {
+                    continue;
+                }
+                collect.parent(parent);
+                for file in files {
+                    collect.file(&file.name, |filename| file.wire(filename));
+                    if collect.is_full() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl ShareFile {
@@ -196,6 +249,7 @@ impl ShareService {
                     .context("reading share cache"));
             match result {
                 Ok(snapshot) if snapshot.options.matches(&options) && snapshot_has_configured_roots(&snapshot) => {
+                    snapshot.search_index();
                     Some(Arc::new(snapshot))
                 }
                 Ok(_) => None,
@@ -373,6 +427,8 @@ impl ShareService {
                 writer.flush()?;
                 writer.get_ref().sync_all()?;
             }
+            // Index on this blocking thread, not in the first incoming search.
+            snapshot.search_index();
             Ok(snapshot)
         });
         let mut active = self.0.active.lock().unwrap();
@@ -486,8 +542,9 @@ impl ShareService {
         share.resolve(&remote, parent, name)
     }
 
-    /// Returns at most `limit` shared files matching `query`, stopping the scan
-    /// once the limit is reached so broad queries stay bounded.
+    /// Returns at most `limit` shared files matching `query`, in share order.
+    /// Candidates come from the snapshot's word index and collection stops
+    /// once the limit is reached, so broad queries stay bounded.
     pub fn search(
         &self,
         query: &soulseek::SearchQuery,
@@ -503,20 +560,7 @@ impl ShareService {
             return Ok(collect.matches);
         }
         if let Some(snapshot) = &self.snapshot() {
-            'local: for share in snapshot.shares.values() {
-                for (parent, files) in &share.directories {
-                    if files.is_empty() {
-                        continue;
-                    }
-                    collect.parent(parent);
-                    for file in files {
-                        collect.file(&file.name, |filename| file.wire(filename));
-                        if collect.is_full() {
-                            break 'local;
-                        }
-                    }
-                }
-            }
+            snapshot.search(&mut collect);
         }
         Ok(collect.matches)
     }
@@ -838,6 +882,333 @@ mod tests {
         assert!(shares.search(&txt, 0).unwrap().is_empty());
         fs::remove_file(root.join("first.txt")).unwrap();
         assert!(shares.resolve_file("music\\first.txt").is_err());
+    }
+
+    /// Words for synthetic shares: diacritics, digits, punctuation, words
+    /// that are suffixes of others, and a non-Latin script.
+    const WORDS: &[&str] = &[
+        "Pink",
+        "Floyd",
+        "pink",
+        "FLOYD",
+        "Beyoncé",
+        "beyonce",
+        "halo",
+        "Hello",
+        "jello",
+        "ello",
+        "AC-DC",
+        "ac",
+        "dc",
+        "Live",
+        "live_at",
+        "Dogs",
+        "dog",
+        "01",
+        "02",
+        "2001",
+        "the",
+        "The",
+        "Café",
+        "cafe",
+        "Ünder",
+        "under",
+        "Сон",
+        "сон",
+        "a",
+        "b",
+        "mp3",
+        "x.y",
+        "Mötley",
+        "Crüe",
+        "remaster",
+        "remastered",
+        "+",
+        "(",
+        ")",
+        "-",
+        "[",
+        "]",
+    ];
+
+    fn phrase(
+        rng: &mut impl rand::Rng,
+        words: std::ops::Range<usize>,
+        separators: &[&str],
+    ) -> String {
+        use rand::seq::IndexedRandom;
+        let mut text = String::new();
+        for i in 0..rng.random_range(words) {
+            if i > 0 {
+                text.push_str(separators.choose(rng).unwrap());
+            }
+            text.push_str(WORDS.choose(rng).unwrap());
+        }
+        text
+    }
+
+    /// Each file name also gets one of `rare` generated words (`w0`, `w1`, ...).
+    fn synthetic_snapshot(
+        seed: u64,
+        shares: usize,
+        dirs: usize,
+        files: usize,
+        rare: u32,
+    ) -> Snapshot {
+        use rand::{Rng, SeedableRng};
+        let rng = &mut rand::rngs::StdRng::seed_from_u64(seed);
+        let separators = [" ", " - ", "_", ".", ""];
+        let mut snapshot = Snapshot {
+            options: ScanOptions {
+                directories: Vec::new(),
+                filters: Vec::new(),
+            },
+            scanned_at: Utc::now(),
+            shares: BTreeMap::new(),
+            index: OnceLock::new(),
+        };
+        for s in 0..shares {
+            let alias = format!(
+                "share{s}{}",
+                phrase(rng, 1..2, &[""]).replace(['\\', '/'], "")
+            );
+            let mut directories = BTreeMap::new();
+            let mut file_count = 0u32;
+            directories.insert(alias.clone(), Vec::new());
+            for _ in 0..dirs {
+                let mut name = alias.clone();
+                for _ in 0..rng.random_range(1..4) {
+                    name.push('\\');
+                    name.push_str(&phrase(rng, 1..4, &separators));
+                }
+                let count = rng.random_range(0..=files);
+                let mut entries: Vec<ShareFile> = (0..count)
+                    .map(|_| ShareFile {
+                        name: format!(
+                            "{} w{}.mp3",
+                            phrase(rng, 1..5, &separators),
+                            rng.random_range(0..rare.max(1))
+                        ),
+                        modified: None,
+                        size: 1,
+                        extension: "mp3".into(),
+                        attributes: Vec::new(),
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                entries.dedup_by(|a, b| a.name == b.name);
+                file_count += count as u32;
+                directories.entry(name).or_insert(entries);
+            }
+            snapshot.shares.insert(
+                alias,
+                ShareContents {
+                    root: PathBuf::new(),
+                    configured_root: PathBuf::new(),
+                    directories,
+                    file_count,
+                },
+            );
+        }
+        snapshot
+    }
+
+    fn run_search(
+        snapshot: &Snapshot,
+        query: &soulseek::SearchQuery,
+        limit: usize,
+        linear: bool,
+    ) -> Vec<String> {
+        let mut collect = SearchMatches {
+            matcher: query.matcher(),
+            limit,
+            filename: String::new(),
+            matches: Vec::new(),
+        };
+        if !collect.is_full() && !collect.matcher.is_empty() {
+            if linear {
+                snapshot.search_linear(&mut collect);
+            } else {
+                snapshot.search(&mut collect);
+            }
+        }
+        collect
+            .matches
+            .into_iter()
+            .map(|file| file.filename)
+            .collect()
+    }
+
+    #[test]
+    fn indexed_search_matches_linear_scan() {
+        use rand::{Rng, SeedableRng, seq::IndexedRandom};
+        let snapshot = synthetic_snapshot(7, 3, 60, 12, 40);
+        assert!(snapshot.search_index().is_some());
+        let rng = &mut rand::rngs::StdRng::seed_from_u64(11);
+        let mut queries: Vec<String> = [
+            "",
+            " ",
+            "-",
+            "*",
+            "!",
+            "pink floyd",
+            "PINK",
+            "beyonce",
+            "BEYONCÉ",
+            "*ello",
+            "*LO",
+            "*o",
+            "*",
+            "ac/dc",
+            "ac-dc -live",
+            "the -the",
+            "mp3",
+            "mp3 -pink",
+            "-pink",
+            "сон",
+            "*он",
+            "café",
+            "a b",
+            "share0",
+            "share1pink",
+            "missingword",
+            "pink missingword",
+            "*zzz",
+            "remaster -remastered",
+            "x.y",
+            "Mötley Crüe",
+            "01 -0",
+            "*a *b",
+        ]
+        .iter()
+        .map(|q| (*q).to_owned())
+        .collect();
+        for _ in 0..400 {
+            let mut query = String::new();
+            for i in 0..rng.random_range(1..4) {
+                if i > 0 {
+                    query.push(' ');
+                }
+                match rng.random_range(0..10) {
+                    0 => query.push('-'),
+                    1 => query.push('*'),
+                    _ => {}
+                }
+                query.push_str(&phrase(rng, 1..3, &["-", "", "_", "."]));
+            }
+            queries.push(query);
+        }
+        let mut nonempty = 0;
+        for text in &queries {
+            let query = soulseek::SearchQuery::parse(text);
+            for limit in [0, 1, 3, 50, usize::MAX] {
+                let expected = run_search(&snapshot, &query, limit, true);
+                assert_eq!(
+                    run_search(&snapshot, &query, limit, false),
+                    expected,
+                    "{text:?} limit {limit}"
+                );
+                nonempty += usize::from(!expected.is_empty());
+            }
+        }
+        assert!(nonempty > queries.len(), "corpus should produce matches");
+        // An exclusion phrase made of several words still filters.
+        let exclusions = soulseek::SearchQuery::with_exclusions(
+            WORDS.choose(rng).unwrap(),
+            vec!["pink floyd".into(), "x.y".into()],
+        );
+        assert_eq!(
+            run_search(&snapshot, &exclusions, usize::MAX, false),
+            run_search(&snapshot, &exclusions, usize::MAX, true)
+        );
+    }
+
+    #[test]
+    fn index_handles_words_shared_by_directories_and_files() {
+        let mut snapshot = synthetic_snapshot(1, 1, 0, 0, 0);
+        let share = snapshot.shares.values_mut().next().unwrap();
+        let alias = share.directories.keys().next().unwrap().clone();
+        let file = |name: &str| ShareFile {
+            name: name.into(),
+            modified: None,
+            size: 1,
+            extension: String::new(),
+            attributes: Vec::new(),
+        };
+        share.directories.insert(
+            format!("{alias}\\Pink Pink"),
+            vec![file("floyd pink.mp3"), file("other.mp3"), file("pink.mp3")],
+        );
+        share
+            .directories
+            .insert(format!("{alias}\\z"), vec![file("pink.mp3")]);
+        let pink = soulseek::SearchQuery::parse("pink");
+        let found = run_search(&snapshot, &pink, usize::MAX, false);
+        assert_eq!(found, run_search(&snapshot, &pink, usize::MAX, true));
+        assert_eq!(found.len(), 4);
+    }
+
+    /// Times 1000 searches over ~100k files:
+    /// `cargo test --release -p slskr search_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn search_benchmark() {
+        use rand::{Rng, SeedableRng, seq::IndexedRandom};
+        use std::time::Instant;
+        let started = Instant::now();
+        let snapshot = synthetic_snapshot(3, 4, 2_500, 20, 50_000);
+        let files = snapshot_counts(&snapshot).1;
+        let generated = started.elapsed();
+        let started = Instant::now();
+        let index = snapshot.search_index().unwrap();
+        let built = started.elapsed();
+        println!(
+            "{files} files ({generated:?} to generate), index built in {built:?}: \
+             {} words, {} postings, ~{} KiB",
+            index.words(),
+            index.postings_len(),
+            index.heap_bytes() / 1024
+        );
+        let rng = &mut rand::rngs::StdRng::seed_from_u64(5);
+        // Common: one to three of the few corpus words, every tenth a `*`
+        // suffix. Rare: a corpus word plus a generated word, like an artist
+        // or title in a real library.
+        for mix in ["common", "rare"] {
+            let queries: Vec<_> = (0..1000)
+                .map(|i| {
+                    let mut text = (0..rng.random_range(1..4))
+                        .map(|_| (*WORDS.choose(rng).unwrap()).to_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if mix == "rare" {
+                        text.push_str(&format!(" w{}", rng.random_range(0..50_000)));
+                    } else if i % 10 == 0 {
+                        text.insert(0, '*');
+                    }
+                    if i % 7 == 0 {
+                        text.push_str(" -live");
+                    }
+                    soulseek::SearchQuery::parse(&text)
+                })
+                .collect();
+            let mut results = [0usize; 2];
+            let mut times = [Duration::ZERO; 2];
+            for (path, linear) in [(0, true), (1, false)] {
+                let started = Instant::now();
+                for query in &queries {
+                    results[path] += run_search(&snapshot, query, 100, linear).len();
+                }
+                times[path] = started.elapsed();
+            }
+            assert_eq!(results[0], results[1]);
+            println!(
+                "1000 {mix} searches (limit 100, {} results): linear {:?}, indexed {:?} ({:.0}x)",
+                results[1],
+                times[0],
+                times[1],
+                times[0].as_secs_f64() / times[1].as_secs_f64()
+            );
+        }
     }
 
     #[cfg(unix)]
