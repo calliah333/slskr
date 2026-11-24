@@ -86,7 +86,12 @@ pub struct AppInner {
     pub(crate) search_filters: RwLock<Vec<regex::Regex>>,
     pub(crate) excluded_search_phrases: RwLock<Vec<String>>,
     pub(crate) upload_speed: AtomicU32,
+    /// When our statistics were last re-read after reporting an upload speed.
+    statistics_refreshed: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
+
+/// How often our own statistics are re-read after reporting an upload speed.
+const STATISTICS_REFRESH: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ConnectionDirective {
@@ -122,6 +127,7 @@ impl AppInner {
             search_filters,
             excluded_search_phrases: RwLock::new(Vec::new()),
             upload_speed: AtomicU32::new(0),
+            statistics_refreshed: std::sync::Mutex::new(None),
         }
     }
 }
@@ -337,6 +343,14 @@ impl AppState {
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = phrases;
                 }
+                Ok(ClientEvent::TransferStateChanged { transfer, .. })
+                    if transfer.direction == soulseek::TransferDirection::Upload
+                        && transfer.state.contains(
+                            soulseek::TransferState::COMPLETED | soulseek::TransferState::SUCCEEDED,
+                        ) =>
+                {
+                    self.report_upload_speed(transfer.average_speed)
+                }
                 Ok(ClientEvent::UserStatisticsChanged(statistics))
                     if self.client.username().as_deref() == Some(statistics.username.as_str()) =>
                 {
@@ -446,6 +460,44 @@ impl AppState {
                 state.user.privileges.privileges_remaining = seconds;
             });
         }
+    }
+
+    /// Reports a finished upload's speed, as other clients do. The server averages
+    /// these into our statistics, whose average speed other clients see and our search
+    /// responses advertise; clients rank sources by it. Re-reads the statistics at most
+    /// every [`STATISTICS_REFRESH`] so the advertised speed follows.
+    fn report_upload_speed(&self, bytes_per_second: f64) {
+        if !bytes_per_second.is_finite() || bytes_per_second < 1.0 {
+            return;
+        }
+        let speed = bytes_per_second.ceil().min(f64::from(u32::MAX)) as u32;
+        let refresh = {
+            let now = tokio::time::Instant::now();
+            let mut last = self
+                .statistics_refreshed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = last.is_none_or(|at| now.duration_since(at) >= STATISTICS_REFRESH);
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        let app = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = app.client.send_upload_speed(speed).await {
+                tracing::debug!(%error, "could not report upload speed");
+                return;
+            }
+            let Some(username) = app.client.username().filter(|_| refresh) else {
+                return;
+            };
+            if let Ok(statistics) = app.client.get_user_statistics(&username).await
+                && app.client.username().as_deref() == Some(username.as_str())
+            {
+                app.update_statistics(statistics);
+            }
+        });
     }
 
     fn update_statistics(&self, statistics: soulseek::UserStatistics) {
