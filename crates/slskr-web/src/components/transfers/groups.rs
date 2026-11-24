@@ -103,6 +103,17 @@ fn folder_files(user: &UserLayout) -> HashMap<String, FolderFiles> {
     folders
 }
 
+/// The label of a folder row: its name at the top level, otherwise its path below the
+/// row it is nested under, so folders the tree collapses stay visible.
+fn folder_label(parent: &str, path: &str) -> String {
+    let relative = path
+        .strip_prefix(parent)
+        .and_then(|rest| rest.strip_prefix(['\\', '/']))
+        .filter(|_| !parent.is_empty())
+        .unwrap_or_else(|| util::get_file_name(path));
+    relative.split(['\\', '/']).collect::<Vec<_>>().join(" / ")
+}
+
 fn indent(depth: usize) -> String {
     format!("--transfer-indent: {}ch", depth.min(8) * 2)
 }
@@ -188,20 +199,20 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
                     .into_iter()
                     .flatten()
                     .rev()
-                    .map(|path| (path, 0))
+                    .map(|path| (path, 0, folder_label("", path)))
                     .collect::<Vec<_>>();
                 let mut visible = Vec::new();
-                while let Some((path, depth)) = pending.pop() {
+                while let Some((path, depth, label)) = pending.pop() {
                     if !path.is_empty() && !folded.contains(path) {
                         pending.extend(
                             tree.get(path)
                                 .into_iter()
                                 .flatten()
                                 .rev()
-                                .map(|child| (child, depth + 1)),
+                                .map(|child| (child, depth + 1, folder_label(path, child))),
                         );
                     }
-                    visible.push((path.clone(), depth));
+                    visible.push((path.clone(), depth, label));
                 }
                 visible
             })
@@ -292,8 +303,8 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
                         <th class="actions"><span class="sr-only">"Actions"</span></th>
                     </tr></thead>
                     <For each=move || visible.get()
-                        key=|(path, depth)| (path.clone(), *depth) children=move |(directory, depth)| view! {
-                            <TransferDirectory directory depth folded_folders folders page/>
+                        key=Clone::clone children=move |(directory, depth, label)| view! {
+                            <TransferDirectory directory depth label folded_folders folders page/>
                         }/>
                 </table>
             </div>
@@ -333,6 +344,7 @@ fn group_badges(user: &UserLayout) -> impl IntoView + use<> {
 fn TransferDirectory(
     directory: String,
     depth: usize,
+    label: String,
     folded_folders: RwSignal<HashSet<String>>,
     folders: Memo<HashMap<String, FolderFiles>>,
     page: Page,
@@ -342,7 +354,7 @@ fn TransferDirectory(
     } else {
         directory.clone()
     };
-    let short = util::get_file_name(&title).to_owned();
+    let short = if directory.is_empty() { title.clone() } else { label };
     let dir = StoredValue::new(directory);
     let ids = Memo::new(move |_| {
         dir.with_value(|dir| {
@@ -832,6 +844,9 @@ mod tests {
                 ])
             );
             assert_eq!(folder_files(&user)[&artist].count, 2);
+            assert_eq!(folder_label("", &user.directories[0].directory), "album1");
+            let nested = [&artist, "_temp", "album1"].join(separator);
+            assert_eq!(folder_label(&artist, &nested), "_temp / album1");
         }
     }
 }
