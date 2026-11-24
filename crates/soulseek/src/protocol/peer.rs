@@ -162,6 +162,16 @@ impl BrowseRequest {
 impl BrowseResponse {
     /// Encodes as a compressed SharesReply.
     pub fn to_bytes(&self) -> Bytes {
+        self.payload().compress().build()
+    }
+
+    /// Encodes as a SharesReply at the highest compression level: slower, a few
+    /// percent smaller. For a frame that is cached and sent to many peers.
+    pub fn to_bytes_best(&self) -> Bytes {
+        self.payload().compress_best().build()
+    }
+
+    fn payload(&self) -> MessageBuilder {
         let mut b = builder(PeerCode::BrowseResponse);
         b.u32(self.directories.len() as u32);
         for d in &self.directories {
@@ -171,7 +181,7 @@ impl BrowseResponse {
         for d in &self.locked_directories {
             write_directory(&mut b, d);
         }
-        b.compress().build()
+        b
     }
 
     pub fn decode(r: &mut MessageReader) -> Result<Self, ProtocolError> {
@@ -678,7 +688,11 @@ mod tests {
             directories: vec![dir("x"), dir("y")],
             locked_directories: vec![dir("z")],
         };
-        assert_eq!(decode(m.to_bytes()), PeerIncoming::BrowseResponse(m));
+        assert_eq!(
+            decode(m.to_bytes()),
+            PeerIncoming::BrowseResponse(m.clone())
+        );
+        assert_eq!(decode(m.to_bytes_best()), PeerIncoming::BrowseResponse(m));
     }
 
     #[test]

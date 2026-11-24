@@ -20,8 +20,8 @@ thread_local! {
     static INFLATE: RefCell<Option<Decompress>> = const { RefCell::new(None) };
 }
 
-/// Zlib-compresses `input` (default level, zlib header), reusing this thread's state.
-fn deflate(input: &[u8]) -> Vec<u8> {
+/// Zlib-compresses `input` (zlib header). The default level reuses this thread's state.
+fn deflate(input: &[u8], level: Compression) -> Vec<u8> {
     fn run(state: &mut Compress, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len() / 2 + 64);
         loop {
@@ -39,6 +39,9 @@ fn deflate(input: &[u8]) -> Vec<u8> {
                 Status::Ok | Status::BufError => {}
             }
         }
+    }
+    if level != Compression::default() {
+        return run(&mut Compress::new(level, true), input);
     }
     DEFLATE.with(|cell| match cell.try_borrow_mut() {
         Ok(mut slot) => {
@@ -214,7 +217,17 @@ impl MessageBuilder {
 
     /// Zlib-compresses the payload written so far (everything after the code).
     pub fn compress(&mut self) -> &mut Self {
-        let compressed = deflate(&self.payload);
+        self.compress_with(Compression::default())
+    }
+
+    /// Like [`MessageBuilder::compress`] at the highest zlib level: several times
+    /// slower for a few percent fewer bytes, for frames encoded once and sent often.
+    pub fn compress_best(&mut self) -> &mut Self {
+        self.compress_with(Compression::best())
+    }
+
+    fn compress_with(&mut self, level: Compression) -> &mut Self {
+        let compressed = deflate(&self.payload, level);
         self.payload.clear();
         self.payload.extend_from_slice(&compressed);
         self
@@ -485,7 +498,7 @@ mod tests {
         for data in [&b""[..], b"x", &[7; 70_000], &large] {
             // Repeat on this thread's reused state.
             for _ in 0..2 {
-                let compressed = deflate(data);
+                let compressed = deflate(data, Compression::default());
                 assert_eq!(compressed, reference_deflate(data));
                 let mut inflated = Vec::new();
                 flate2::read::ZlibDecoder::new(&compressed[..])

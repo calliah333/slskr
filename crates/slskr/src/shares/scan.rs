@@ -173,6 +173,7 @@ pub(super) fn scan_roots(
         scanned_at,
         shares,
         index: Default::default(),
+        browse: Default::default(),
     })
 }
 

@@ -60,6 +60,9 @@ struct Snapshot {
     /// Built from `shares` on first use; never written to the share cache.
     #[serde(skip)]
     index: OnceLock<Option<index::SearchIndex>>,
+    /// The SharesReply frame answering browse requests, encoded on first use.
+    #[serde(skip)]
+    browse: OnceLock<bytes::Bytes>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +195,25 @@ impl Snapshot {
             if collect.is_full() {
                 break;
             }
+        }
+    }
+
+    /// The SharesReply frame for browse requests: encoded once, at the highest
+    /// compression level, since every browse of this snapshot sends the same bytes.
+    fn browse_frame(&self) -> bytes::Bytes {
+        self.browse
+            .get_or_init(|| self.browse_response().to_bytes_best())
+            .clone()
+    }
+
+    fn browse_response(&self) -> soulseek::BrowseResponse {
+        soulseek::BrowseResponse {
+            directories: self
+                .shares
+                .values()
+                .flat_map(ShareContents::directories)
+                .collect(),
+            locked_directories: Vec::new(),
         }
     }
 
@@ -429,6 +451,8 @@ impl ShareService {
             }
             // Index on this blocking thread, not in the first incoming search.
             snapshot.search_index();
+            // Likewise encode the share list here, not in the first browse.
+            snapshot.browse_frame();
             Ok(snapshot)
         });
         let mut active = self.0.active.lock().unwrap();
@@ -503,21 +527,12 @@ impl ShareService {
         self.snapshot().as_deref().map_or((0, 0), snapshot_counts)
     }
 
-    pub fn browse(&self) -> Result<soulseek::BrowseResponse> {
-        let directories = self
-            .snapshot()
-            .iter()
-            .flat_map(|snapshot| {
-                snapshot
-                    .shares
-                    .values()
-                    .flat_map(ShareContents::directories)
-            })
-            .collect();
-        Ok(soulseek::BrowseResponse {
-            directories,
-            locked_directories: Vec::new(),
-        })
+    /// The encoded browse response; blocks while a new snapshot's frame is encoded.
+    pub fn browse_frame(&self) -> bytes::Bytes {
+        self.snapshot().map_or_else(
+            || soulseek::BrowseResponse::default().to_bytes(),
+            |snapshot| snapshot.browse_frame(),
+        )
     }
 
     pub fn list_directory(&self, directory_name: &str) -> Result<Vec<soulseek::Directory>> {
@@ -867,7 +882,18 @@ mod tests {
         let shares = ShareService::new(&core).unwrap();
         shares.scan(CancellationToken::new()).await.unwrap();
         assert_eq!(shares.shares()[0].alias.as_deref(), Some("music"));
-        assert_eq!(shares.browse().unwrap().directories.len(), 1);
+        let frame = shares.browse_frame();
+        assert_eq!(
+            frame.as_ptr(),
+            shares.browse_frame().as_ptr(),
+            "the scan encodes the frame once"
+        );
+        let soulseek::protocol::peer::PeerIncoming::BrowseResponse(browse) =
+            soulseek::protocol::peer::PeerIncoming::decode(frame.slice(4..)).unwrap()
+        else {
+            panic!("not a browse response");
+        };
+        assert_eq!(browse.directories.len(), 1);
         assert_eq!(shares.list_directory("music").unwrap()[0].files[0].size, 5);
         let found = shares
             .search(&soulseek::SearchQuery::parse("second"), usize::MAX)
@@ -966,6 +992,7 @@ mod tests {
             scanned_at: Utc::now(),
             shares: BTreeMap::new(),
             index: OnceLock::new(),
+            browse: OnceLock::new(),
         };
         for s in 0..shares {
             let alias = format!(
@@ -1150,6 +1177,27 @@ mod tests {
 
     /// Times 1000 searches over ~100k files:
     /// `cargo test --release -p slskr search_benchmark -- --ignored --nocapture`
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn browse_frame_benchmark() {
+        use std::time::Instant;
+        let snapshot = synthetic_snapshot(3, 4, 2_500, 20, 50_000);
+        let response = snapshot.browse_response();
+        let started = Instant::now();
+        let default = response.to_bytes();
+        let default_time = started.elapsed();
+        let started = Instant::now();
+        let best = response.to_bytes_best();
+        let best_time = started.elapsed();
+        println!(
+            "{} files: default {} bytes in {default_time:?}, best {} bytes in {best_time:?} ({:.1}% smaller)",
+            snapshot_counts(&snapshot).1,
+            default.len(),
+            best.len(),
+            100.0 * (1.0 - best.len() as f64 / default.len() as f64)
+        );
+    }
     #[test]
     #[ignore = "benchmark"]
     fn search_benchmark() {

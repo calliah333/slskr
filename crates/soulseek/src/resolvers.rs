@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 
+use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{BoxFuture, ready};
 
@@ -23,6 +24,26 @@ pub trait Resolvers: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<BrowseResponse>> {
         let _ = (username, endpoint);
         ready(Ok(BrowseResponse::default())).boxed()
+    }
+
+    /// The encoded SharesReply frame answering a browse request; on error the
+    /// client logs a warning and sends an empty response. Override to serve a
+    /// frame encoded once (e.g. with [`BrowseResponse::to_bytes_best`]) instead
+    /// of building and compressing the share list for every request. Default:
+    /// encodes [`Resolvers::browse`] off the async workers.
+    fn browse_frame(
+        &self,
+        username: String,
+        endpoint: SocketAddr,
+    ) -> BoxFuture<'static, Result<Bytes>> {
+        let response = self.browse(username, endpoint);
+        async move {
+            let response = response.await?;
+            tokio::task::spawn_blocking(move || response.to_bytes())
+                .await
+                .map_err(|error| Error::Other(format!("Could not encode browse response: {error}")))
+        }
+        .boxed()
     }
 
     /// Contents of `directory` for a folder contents request with `token`. On

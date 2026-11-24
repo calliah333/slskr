@@ -9,6 +9,7 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use soulseek::{
     BrowseResponse, Directory, Error, Resolvers, Result, SearchQuery, SearchResponse, UserInfo,
@@ -54,11 +55,11 @@ impl AppResolvers {
 }
 
 impl Resolvers for AppResolvers {
-    fn browse(
+    fn browse_frame(
         &self,
         username: String,
         endpoint: SocketAddr,
-    ) -> BoxFuture<'static, Result<BrowseResponse>> {
+    ) -> BoxFuture<'static, Result<Bytes>> {
         let app = self.app();
         Box::pin(async move {
             let app = app?;
@@ -67,12 +68,12 @@ impl Resolvers for AppResolvers {
                 .users
                 .is_blacklisted(&username, Some(endpoint.ip()))
             {
-                return Ok(BrowseResponse::default());
+                return Ok(BrowseResponse::default().to_bytes());
             }
+            // Usually a cached frame; may encode a snapshot loaded from the cache.
             let shares = app.services.shares.clone();
-            tokio::task::spawn_blocking(move || shares.browse())
+            tokio::task::spawn_blocking(move || shares.browse_frame())
                 .await
-                .map_err(other)?
                 .map_err(other)
         })
     }

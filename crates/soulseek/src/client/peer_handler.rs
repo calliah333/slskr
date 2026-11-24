@@ -249,19 +249,11 @@ async fn answer(
     let remote = connection.remote();
     let frame = match request {
         PeerIncoming::BrowseRequest(_) => {
-            let response = match resolvers.browse(username.into(), remote).await {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::warn!(%username, %remote, %error, "Browse resolver failed");
-                    BrowseResponse::default()
-                }
-            };
-            // Compressing a large share listing would stall this async worker.
-            match tokio::task::spawn_blocking(move || response.to_bytes()).await {
+            match resolvers.browse_frame(username.into(), remote).await {
                 Ok(frame) => frame,
                 Err(error) => {
-                    tracing::warn!(%username, %remote, %error, "Could not encode browse response");
-                    return;
+                    tracing::warn!(%username, %remote, %error, "Browse resolver failed");
+                    BrowseResponse::default().to_bytes()
                 }
             }
         }
