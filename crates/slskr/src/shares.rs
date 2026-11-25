@@ -6,7 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError, RwLock},
     time::Duration,
 };
 
@@ -255,34 +255,44 @@ struct Inner {
     core: Core,
     snapshot: RwLock<Option<Arc<Snapshot>>>,
     active: Mutex<Option<CancellationToken>>,
-    cache_path: Option<PathBuf>,
+    /// `db/shares-cache.json`: the last scan, restored at startup.
+    cache_path: PathBuf,
     changed: watch::Sender<()>,
 }
 
 impl ShareService {
     pub fn new(core: &Core) -> Result<Self> {
         let options = core.options.get();
-        let cache_path = Some(core.paths.db_dir.join("shares-cache.json"));
-        let snapshot = cache_path.as_deref().and_then(|path| {
+        let cache_path = core.paths.db_dir.join("shares-cache.json");
+        let snapshot = {
+            let path = cache_path.as_path();
             remove_partial(path);
             let result = File::open(path)
                 .context("opening share cache")
-                .and_then(|file| serde_json::from_reader::<_, Snapshot>(BufReader::new(file))
-                    .context("reading share cache"));
+                .and_then(|file| {
+                    serde_json::from_reader::<_, Snapshot>(BufReader::new(file))
+                        .context("reading share cache")
+                });
             match result {
-                Ok(snapshot) if snapshot.options.matches(&options) && snapshot_has_configured_roots(&snapshot) => {
+                Ok(snapshot)
+                    if snapshot.options.matches(&options)
+                        && snapshot_has_configured_roots(&snapshot) =>
+                {
                     snapshot.search_index();
                     Some(Arc::new(snapshot))
                 }
                 Ok(_) => None,
                 Err(error) => {
-                    if !error.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::NotFound) {
+                    if !error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+                    {
                         tracing::warn!(%error, path = %path.display(), "unable to restore share cache");
                     }
                     None
                 }
             }
-        });
+        };
         Ok(Self(Arc::new(Inner {
             core: core.clone(),
             snapshot: RwLock::new(snapshot),
@@ -303,7 +313,7 @@ impl ShareService {
         tokio::spawn(async move {
             let mut configured = ScanOptions::new(&options.borrow_and_update());
             let hour = Duration::from_secs(3600);
-            let mut retention = tokio::time::interval_at(tokio::time::Instant::now() + hour, hour);
+            let mut rescan = tokio::time::interval_at(tokio::time::Instant::now() + hour, hour);
             service.announce().await;
             loop {
                 tokio::select! {
@@ -327,7 +337,7 @@ impl ShareService {
                             service.0.changed.send_replace(());
                         }
                     },
-                    _ = retention.tick() => {
+                    _ = rescan.tick() => {
                         let options = service.0.core.options.get();
                         if options.shares.rescan_interval.is_some() && service.needs_scan(&options)
                         {
@@ -354,7 +364,7 @@ impl ShareService {
     }
 
     fn refresh_state(&self) {
-        let active = self.0.active.lock().unwrap();
+        let active = self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
         let snapshot = self.snapshot();
         let counts = snapshot.as_deref().map_or((0, 0), snapshot_counts);
         self.0.core.state.update(|s| {
@@ -386,7 +396,7 @@ impl ShareService {
     }
 
     pub(crate) fn launch_scan(&self, cancel: CancellationToken) -> Option<JoinHandle<Result<()>>> {
-        let mut active = self.0.active.lock().unwrap();
+        let mut active = self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
         if active.is_some() {
             return None;
         }
@@ -409,7 +419,11 @@ impl ShareService {
             match result {
                 Ok(result) => result,
                 Err(error) => {
-                    let mut active = service.0.active.lock().unwrap();
+                    let mut active = service
+                        .0
+                        .active
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     service.finish_scan(
                         Err(error.into()),
                         active.take().is_some_and(|c| c.is_cancelled()),
@@ -437,25 +451,24 @@ impl ShareService {
         })
         .and_then(|snapshot| {
             ensure!(!cancel.is_cancelled(), "share scan cancelled");
-            if let Some(path) = &self.0.cache_path {
-                fs::create_dir_all(path.parent().expect("share cache parent"))?;
-                let mut writer = BufWriter::new(
-                    OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(partial_path(path))?,
-                );
-                serde_json::to_writer(&mut writer, &snapshot)?;
-                writer.flush()?;
-                writer.get_ref().sync_all()?;
-            }
+            let path = &self.0.cache_path;
+            fs::create_dir_all(path.parent().expect("share cache parent"))?;
+            let mut writer = BufWriter::new(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(partial_path(path))?,
+            );
+            serde_json::to_writer(&mut writer, &snapshot)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
             // Index on this blocking thread, not in the first incoming search.
             snapshot.search_index();
             // Likewise encode the share list here, not in the first browse.
             snapshot.browse_frame();
             Ok(snapshot)
         });
-        let mut active = self.0.active.lock().unwrap();
+        let mut active = self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
         let cancelled = cancel.is_cancelled();
         let result = snapshot.and_then(|snapshot| {
             ensure!(!cancelled, "share scan cancelled");
@@ -463,16 +476,17 @@ impl ShareService {
                 snapshot.options.matches(&self.0.core.options.get()),
                 "share configuration changed during the scan"
             );
-            if let Some(path) = &self.0.cache_path {
-                fs::rename(partial_path(path), path)?;
-            }
-            *self.0.snapshot.write().unwrap() = Some(Arc::new(snapshot));
+            let path = &self.0.cache_path;
+            fs::rename(partial_path(path), path)?;
+            *self
+                .0
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(snapshot));
             Ok(())
         });
-        if result.is_err()
-            && let Some(path) = &self.0.cache_path
-        {
-            remove_partial(path);
+        if result.is_err() {
+            remove_partial(&self.0.cache_path);
         }
         *active = None;
         self.finish_scan(result, cancelled)
@@ -503,17 +517,22 @@ impl ShareService {
     }
 
     fn cancel_scan(&self) -> bool {
-        self.0.active.lock().unwrap().as_ref().is_some_and(|token| {
-            token.cancel();
-            true
-        })
+        self.0
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|token| {
+                token.cancel();
+                true
+            })
     }
 
     fn snapshot_for(&self, options: &Config) -> Option<Arc<Snapshot>> {
         self.0
             .snapshot
             .read()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .filter(|snapshot| snapshot.options.matches(options))
             .cloned()

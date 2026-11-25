@@ -172,11 +172,12 @@ impl Database {
                 {
                     slot.maintained_at = Some(Instant::now());
                     let started = Instant::now();
-                    if let Err(error) = maintain(&slot.connection) {
-                        tracing::warn!(%error, "could not maintain database");
+                    match maintain(&slot.connection) {
+                        Ok(()) => tracing::info!(database = %inner.label,
+                            ms = started.elapsed().as_millis() as u64, "maintained database"),
+                        Err(error) => tracing::warn!(database = %inner.label, %error,
+                            "could not maintain database"),
                     }
-                    tracing::info!(database = %inner.label, ms = started.elapsed().as_millis() as u64,
-                        "maintained database");
                 }
                 result
             })

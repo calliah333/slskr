@@ -15,21 +15,10 @@ use slskr_types::{
 };
 
 use crate::{
-    app::{AppState, Core},
+    app::AppState,
     auth::{Authenticated, RequireReadWrite},
     http::{ApiError, ApiResult, Json, Path, Query, Routes},
 };
-
-#[derive(Clone)]
-pub struct FileService;
-
-impl FileService {
-    pub fn new(_core: &Core) -> anyhow::Result<Self> {
-        Ok(Self)
-    }
-
-    pub fn start(&self, _app: AppState) {}
-}
 
 #[derive(Deserialize)]
 struct ListQuery {
@@ -70,8 +59,12 @@ async fn list(
 ) -> ApiResult<Json<FilesystemDirectory>> {
     let root = root_path(&state.options.get(), &root)?;
     let relative = relative_path(&query.path)?;
-    let path = confined(&root, &relative, true)?;
-    Ok(Json(directory(&path, &relative, query.recursive)?))
+    let listing = blocking(move || {
+        let path = confined(&root, &relative, true)?;
+        directory(&path, &relative, query.recursive)
+    })
+    .await?;
+    Ok(Json(listing))
 }
 
 /// Deletes a file, or a directory with everything in it (204).
@@ -88,18 +81,31 @@ async fn remove(
             "Operation on the root directory is not permitted".into(),
         ));
     }
-    let path = confined(&root, &relative, false)?;
-    let metadata = fs::symlink_metadata(&path).map_err(map_io)?;
-    if metadata.is_file() {
-        fs::remove_file(path).map_err(map_io)?;
-    } else if metadata.is_dir() {
-        fs::remove_dir_all(path).map_err(map_io)?;
-    } else {
-        return Err(ApiError::BadRequest(
-            "Path is neither a file nor a directory".into(),
-        ));
-    }
+    blocking(move || {
+        let path = confined(&root, &relative, false)?;
+        let metadata = fs::symlink_metadata(&path).map_err(map_io)?;
+        if metadata.is_file() {
+            fs::remove_file(path).map_err(map_io)
+        } else if metadata.is_dir() {
+            fs::remove_dir_all(path).map_err(map_io)
+        } else {
+            Err(ApiError::BadRequest(
+                "Path is neither a file nor a directory".into(),
+            ))
+        }
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Runs file system work (a recursive listing or delete can take a while) off the async
+/// workers.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> ApiResult<T> + Send + 'static,
+) -> ApiResult<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?
 }
 
 fn relative_path(path: &str) -> ApiResult<PathBuf> {

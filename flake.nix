@@ -104,6 +104,8 @@
               "-p"
               "slskr"
               "-p"
+              "slskr-types"
+              "-p"
               "soulseek"
             ];
             doCheck = false;

@@ -1,4 +1,4 @@
-//! slskr web UI: Leptos CSR port of the slskd React UI.
+//! slskr web UI: a client-side rendered Leptos app.
 
 mod components;
 mod config;

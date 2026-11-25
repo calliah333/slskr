@@ -318,7 +318,7 @@ async fn get_file(
     Path(filename): Path<String>,
 ) -> ApiResult<axum::response::Response> {
     let file = safe_log_path(&state.core.paths.logs_dir, &filename)?;
-    let data = std::fs::read(file).map_err(|e| {
+    let data = tokio::fs::read(file).await.map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             ApiError::not_found()
         } else {
@@ -337,7 +337,7 @@ async fn get_file(
     Ok(response.into_response())
 }
 
-fn safe_log_path(root: &PathBuf, filename: &str) -> ApiResult<PathBuf> {
+fn safe_log_path(root: &std::path::Path, filename: &str) -> ApiResult<PathBuf> {
     if filename.trim().is_empty()
         || filename.contains('/')
         || filename.contains('\\')

@@ -13,10 +13,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::Deserialize;
 use slskr_types::events::{Event, EventData, EventType};
-use tokio::{
-    sync::{broadcast, mpsc},
-    time::MissedTickBehavior,
-};
+use tokio::{sync::mpsc, time::MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::{
@@ -42,7 +39,6 @@ const MIGRATIONS: &[&str] = &[
     // History pages and retention order by time.
     "CREATE INDEX events_timestamp ON events(timestamp);",
 ];
-const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Header of `GET /api/events/history` carrying the number of recorded events.
 const TOTAL_COUNT: HeaderName = HeaderName::from_static("x-total-count");
 /// Events older than this are removed from the history.
@@ -59,7 +55,6 @@ pub struct EventService(Arc<Inner>);
 
 struct Inner {
     database: Database,
-    subscribers: broadcast::Sender<Event>,
     writer: mpsc::UnboundedSender<Event>,
 }
 
@@ -77,28 +72,17 @@ fn default_limit() -> u32 {
 impl EventService {
     /// Opens `events.db` and starts its writer, which stops when the service is dropped.
     pub fn new(core: &Core) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(&core.paths.db_dir)?;
         let path = core.paths.db_dir.join("events.db");
         let database = Database::open(&path, MIGRATIONS)?;
-        let (subscribers, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (writer, queue) = mpsc::unbounded_channel();
         tokio::spawn(run_writer(database.clone(), queue));
-        Ok(Self(Arc::new(Inner {
-            database,
-            subscribers,
-            writer,
-        })))
+        Ok(Self(Arc::new(Inner { database, writer })))
     }
 
-    /// Records an event and notifies subscribers.
+    /// Records an event in the history.
     pub fn raise(&self, data: EventData) {
         let event = Event::new(Uuid::new_v4().to_string(), Utc::now(), data);
-        let _ = self.0.writer.send(event.clone());
-        let _ = self.0.subscribers.send(event);
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.0.subscribers.subscribe()
+        let _ = self.0.writer.send(event);
     }
 
     /// Newest first; unreadable rows are skipped.

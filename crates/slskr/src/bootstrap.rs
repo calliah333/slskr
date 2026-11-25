@@ -9,10 +9,9 @@ use axum::{
     http::StatusCode,
     response::Response,
     routing::{any, get},
-    serve::{Listener, ListenerExt},
 };
 use slskr_types::config::Config;
-use tokio::{net::TcpListener, task::JoinSet};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
@@ -68,17 +67,24 @@ pub async fn run(cli: Cli) -> Result<()> {
     let _cancel_events_on_drop = client_events_done.clone().drop_guard();
     let client_events = app.start(client_events_done.clone());
 
-    let mut servers = JoinSet::new();
     tracing::info!(address = %tcp.local_addr()?, "HTTP listener started");
-    serve(&mut servers, tcp, router, app.shutdown.clone());
+    let shutdown = app.shutdown.clone();
+    let mut server = tokio::spawn(async move {
+        axum::serve(
+            tcp,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+    });
 
+    let mut server_ended = false;
     let exit: Result<()> = tokio::select! {
         _ = app.shutdown.cancelled() => Ok(()),
         signal = termination_signal() => signal,
-        result = servers.join_next() => match result {
-            Some(Ok(result)) => result.context("serving HTTP requests"),
-            Some(Err(error)) => Err(error).context("HTTP server task"),
-            None => Ok(()),
+        result = &mut server => {
+            server_ended = true;
+            served(result)
         }
     };
     app.shutdown.cancel();
@@ -87,16 +93,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     client_events
         .await
         .context("application event listener task")?;
-    match tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(result) = servers.join_next().await {
-            result??;
+    if !server_ended {
+        // Open connections (the events WebSocket) get a moment to close cleanly.
+        match tokio::time::timeout(Duration::from_secs(10), &mut server).await {
+            Ok(result) => served(result)?,
+            Err(_) => server.abort(),
         }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    {
-        Ok(drained) => drained?,
-        Err(_) => servers.shutdown().await,
     }
     exit?;
     if app.restart_requested() {
@@ -177,7 +179,6 @@ async fn assemble(
     let events = events::EventService::new(&core)?;
     let users = users::UserService::new(&core)?;
     let shares = shares::ShareService::new(&core)?;
-    let files = files::FileService::new(&core)?;
     let transfers = transfers::TransferService::new(&core, &events, &users, &shares)?;
     let telemetry = telemetry::TelemetryService::new(&core, &transfers)?;
     let search = search::SearchService::new(&core).await?;
@@ -186,7 +187,6 @@ async fn assemble(
         events,
         users,
         shares,
-        files,
         transfers,
         telemetry,
         search,
@@ -369,30 +369,22 @@ fn restart() -> Result<()> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut process = std::process::Command::new(std::env::current_exe()?);
     process.args(args);
+    // `exec` only returns on failure; elsewhere the new process outlives this one.
     #[cfg(unix)]
-    {
+    let started = {
         use std::os::unix::process::CommandExt;
-        return Err(process.exec()).context("restarting daemon");
-    }
+        Err(process.exec())
+    };
     #[cfg(not(unix))]
-    process.spawn().context("restarting daemon").map(|_| ())
+    let started = process.spawn().map(|_| ());
+    started.context("restarting daemon")
 }
 
-fn serve<L: Listener<Addr = SocketAddr>>(
-    tasks: &mut JoinSet<std::io::Result<()>>,
-    listener: L,
-    router: Router,
-    shutdown: CancellationToken,
-) {
-    tasks.spawn(async move {
-        // Axum supplies Connected for TapIo listeners with their declared peer address.
-        axum::serve(
-            listener.tap_io(|_| {}),
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await
-    });
+/// The outcome of the HTTP server task.
+fn served(result: Result<std::io::Result<()>, tokio::task::JoinError>) -> Result<()> {
+    result
+        .context("HTTP server task")?
+        .context("serving HTTP requests")
 }
 
 /// An application on `data_dir` with `file` as `slskr.toml` and `env` as `SLSKR_*`

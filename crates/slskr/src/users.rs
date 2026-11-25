@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
-    sync::{Arc, LazyLock, RwLock},
+    sync::{Arc, LazyLock, PoisonError, RwLock},
     time::Duration,
 };
 
@@ -35,14 +35,6 @@ static LEECHERS_GROUP: LazyLock<Arc<str>> = LazyLock::new(|| LEECHERS.into());
 static BLACKLISTED_GROUP: LazyLock<Arc<str>> = LazyLock::new(|| BLACKLISTED.into());
 const BROWSE_RETENTION: Duration = Duration::from_secs(5);
 const INFO_RETENTION: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct GroupUploadInfo {
-    pub slots: u32,
-    pub strategy: &'static str,
-    pub speed_limit: u32,
-    pub priority: u32,
-}
 
 #[derive(Default)]
 struct Cache {
@@ -94,7 +86,7 @@ impl Drop for ActiveBrowse<'_> {
         if self.completed {
             return;
         }
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(PoisonError::into_inner);
         if cache
             .browses
             .get(self.username)
@@ -173,16 +165,20 @@ impl UserService {
     /// The policy of the current configuration, compiled on first use after a change.
     fn policy(&self) -> Arc<Policy> {
         let config = self.core.options.get();
-        let current = self.policy.read().unwrap().clone();
+        let current = self
+            .policy
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if Arc::ptr_eq(&current.config, &config) {
             return current;
         }
         let policy = Arc::new(Policy::new(config));
-        *self.policy.write().unwrap() = policy.clone();
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = policy.clone();
         policy
     }
 
-    pub fn start(&self, _app: AppState) {
+    pub fn start(&self) {
         let mut events = self.core.client.subscribe();
         let service = self.clone();
         tokio::spawn(async move {
@@ -192,7 +188,7 @@ impl UserService {
             loop {
                 tokio::select! {
                     _ = service.core.shutdown.cancelled() => break,
-                    now = expiry.tick() => service.cache.write().unwrap().expire(now),
+                    now = expiry.tick() => service.cache.write().unwrap_or_else(PoisonError::into_inner).expire(now),
                     event = events.recv() => match event {
                         Ok(event) => service.client_event(event),
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -202,16 +198,22 @@ impl UserService {
                     }
                 }
             }
-            service.cache.write().unwrap().reset_session();
+            service
+                .cache
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reset_session();
         });
     }
 
     fn client_event(&self, event: soulseek::Event) {
         use soulseek::Event;
         match event {
-            Event::Connected | Event::Disconnected { .. } => {
-                self.cache.write().unwrap().reset_session()
-            }
+            Event::Connected | Event::Disconnected { .. } => self
+                .cache
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reset_session(),
             Event::UserStatusChanged(status) => {
                 let value = convert_status(&status);
                 self.cache
@@ -229,14 +231,23 @@ impl UserService {
                     .insert(statistics.username, value);
             }
             Event::PrivilegedUserListReceived(usernames) => {
-                self.cache.write().unwrap().privileged = usernames.into_iter().collect();
+                self.cache
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .privileged = usernames.into_iter().collect();
             }
             Event::BrowseProgressUpdated {
                 username,
                 bytes_transferred,
                 size,
             } => {
-                if let Some(browse) = self.cache.write().unwrap().browses.get_mut(&username) {
+                if let Some(browse) = self
+                    .cache
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .browses
+                    .get_mut(&username)
+                {
                     browse.progress.bytes_transferred = bytes_transferred;
                     browse.progress.bytes_remaining = size.saturating_sub(bytes_transferred);
                     browse.progress.size = size;
@@ -258,7 +269,7 @@ impl UserService {
             return BLACKLISTED_GROUP.clone();
         }
         let (privileged, stats) = {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().unwrap_or_else(PoisonError::into_inner);
             (
                 cache.privileged.contains(username)
                     || cache.status.get(username).is_some_and(|s| s.is_privileged),
@@ -284,24 +295,20 @@ impl UserService {
             DEFAULT_GROUP.clone()
         }
     }
+
     pub fn is_blacklisted(&self, username: &str, ip: Option<IpAddr>) -> bool {
         self.policy().is_blacklisted(username, ip)
     }
-    pub fn group_upload_options(&self, group: &str) -> GroupUploadInfo {
-        let options = self.core.options.get();
-        let g = crate::transfers::group_config(&options, group);
-        GroupUploadInfo {
-            slots: g.slots,
-            strategy: g.strategy.as_str(),
-            speed_limit: g.speed_limit,
-            priority: g.priority,
-        }
-    }
+
     async fn status(&self, username: &str) -> soulseek::Result<Status> {
-        let session = self.cache.read().unwrap().session;
+        let session = self
+            .cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .session;
         let remote = self.core.client.get_user_status(username).await?;
         let value = convert_status(&remote);
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(PoisonError::into_inner);
         if cache.session == session {
             cache.status.insert(remote.username, value);
         }
@@ -309,10 +316,14 @@ impl UserService {
     }
 
     async fn statistics(&self, username: &str) -> soulseek::Result<Statistics> {
-        let session = self.cache.read().unwrap().session;
+        let session = self
+            .cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .session;
         let remote = self.core.client.get_user_statistics(username).await?;
         let value = convert_statistics(&remote);
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(PoisonError::into_inner);
         if cache.session == session {
             cache.statistics.insert(remote.username, value);
         }
@@ -321,7 +332,7 @@ impl UserService {
 
     async fn info(&self, username: &str) -> soulseek::Result<Arc<Info>> {
         let session = {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().unwrap_or_else(PoisonError::into_inner);
             if let Some((expires, info)) = cache.info.get(username)
                 && Instant::now() < *expires
             {
@@ -343,7 +354,7 @@ impl UserService {
             queue_length: remote.queue_length,
             upload_slots: remote.upload_slots,
         });
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(PoisonError::into_inner);
         if cache.session == session {
             cache.info.insert(
                 username.into(),
@@ -358,7 +369,7 @@ impl UserService {
         username: &str,
     ) -> soulseek::Result<Arc<BrowseResponse>> {
         let id = {
-            let mut cache = self.cache.write().unwrap();
+            let mut cache = self.cache.write().unwrap_or_else(PoisonError::into_inner);
             if let Some(browse) = cache.browses.get(username) {
                 match &browse.result {
                     Some((expires, response)) if Instant::now() < *expires => {
@@ -414,7 +425,7 @@ impl UserService {
                 .map(convert_directory)
                 .collect(),
         });
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(browse) = cache
             .browses
             .get_mut(username)
@@ -432,7 +443,7 @@ impl UserService {
     fn browse_status(&self, username: &str) -> Option<BrowseStatus> {
         self.cache
             .read()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .browses
             .get(username)
             .filter(|browse| {

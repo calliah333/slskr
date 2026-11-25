@@ -1,7 +1,7 @@
-//! Formatting and browser helpers (port of slskd `lib/util.js`).
+//! Formatting and browser helpers.
 //!
-//! Number formatting reproduces JavaScript semantics (`Number.prototype.toFixed`,
-//! `Number.prototype.toString`, `Math.round`) so output matches the React UI exactly.
+//! Number formatting follows JavaScript semantics (`Number.prototype.toFixed`,
+//! `Number.prototype.toString`, `Math.round`).
 
 use wasm_bindgen::{JsCast, JsValue};
 

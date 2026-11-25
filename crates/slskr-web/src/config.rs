@@ -1,4 +1,4 @@
-//! Runtime configuration (port of slskd `src/config.js`).
+//! Runtime configuration: the `web.url_base` the daemon injects into `index.html`.
 
 use std::cell::OnceCell;
 

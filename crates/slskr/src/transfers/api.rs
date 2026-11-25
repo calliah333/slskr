@@ -434,13 +434,15 @@ async fn create_batch(
     let service = &app.services.transfers;
     let _permit = service.request_permit().ok_or_else(throttled)?;
     service.ready().await?;
+    // Reach the peer first: a batch stored for an offline peer would have no transfers,
+    // and retrying with the same id would then conflict.
+    prepare_peer(&app, &batch.username).await?;
     if !store::create_batch(service.database(), batch.clone()).await? {
         return Err(ApiError::Conflict(format!(
             "A batch with id {} already exists",
             batch.id
         )));
     }
-    prepare_peer(&app, &batch.username).await?;
     let id = batch.id.clone();
     let username = batch.username.clone();
     let context = DownloadContext::new(&app, Some(batch)).await;

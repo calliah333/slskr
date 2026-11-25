@@ -22,10 +22,10 @@ src/auth/             Auth (sessions, API keys, Origin checks, extractors); sess
 src/resolvers.rs      impl soulseek::Resolvers by delegating to services
 src/logging.rs        tracing setup, LogBuffer (ring buffer, "log" events), /logs routes, file logs
 src/realtime/         EventBus (internal publish/subscribe) + socket.rs: the /api/events WebSocket
-src/events.rs         EventService (raise/list/subscribe) + /events/history route, events.db
+src/events.rs         EventService (raise/list) + /events/history route, events.db
 src/users.rs          UserService (peer info/browse cache, group and blacklist policy) + /users routes
 src/shares.rs         ShareService (atomic scan snapshots, persisted cache, search/browse/resolve) + /shares routes
-src/files.rs          FileService + /files routes (downloads/incomplete dirs)
+src/files.rs          /files routes (browse and delete below the downloads/incomplete dirs)
 src/telemetry/        TelemetryService ("metrics" events, prometheus) + /metrics and /reports routes (reports from transfers.db)
 src/profiling.rs      always-on timings (database calls per call site, API routes, transfer ends, CPU/RSS/tasks): slskr_profile_* metrics and a log report every 15 min
 src/transfers/        TransferService (downloads, uploads, upload queue, governor) + /transfers and /batches routes, transfers.db
@@ -259,7 +259,6 @@ client-side routes deep-link.
 EventService::new(&core) -> anyhow::Result<Self>
 UserService::new(&core) -> anyhow::Result<Self>
 ShareService::new(&core) -> anyhow::Result<Self>
-FileService::new(&core) -> anyhow::Result<Self>
 TransferService::new(&core, &events, &users, &shares) -> anyhow::Result<Self>
 TelemetryService::new(&core, &transfers) -> anyhow::Result<Self>
 SearchService::new(&core).await -> anyhow::Result<Self>
@@ -272,22 +271,19 @@ subscriptions, timers, options watchers) on every service in the same order.
 ### Cross-service methods
 ```rust
 // events
-EventService::raise(&self, data: slskr_types::events::EventData);   // record (events.db) + notify subscribers
-EventService::subscribe(&self) -> tokio::sync::broadcast::Receiver<slskr_types::events::Event>;
+EventService::raise(&self, data: slskr_types::events::EventData);   // record (events.db)
 // users
-UserService::group(&self, username: &str) -> String;                 // "privileged" | "default" | "leechers" | "blacklisted" | user-defined
+UserService::group(&self, username: &str) -> Arc<str>;               // "privileged" | "default" | "leechers" | "blacklisted" | user-defined
 UserService::is_blacklisted(&self, username: &str, ip: Option<IpAddr>) -> bool;
-UserService::group_upload_options(&self, group: &str) -> GroupUploadInfo { slots: u32, strategy: &'static str, speed_limit: u32, priority: u32 };
 // shares
-ShareService::browse(&self) -> anyhow::Result<soulseek::BrowseResponse>;
+ShareService::browse_frame(&self) -> bytes::Bytes;                    // encoded SharesReply, cached per snapshot
 ShareService::list_directory(&self, directory: &str) -> anyhow::Result<Vec<soulseek::Directory>>;
-ShareService::search(&self, query: &soulseek::SearchQuery) -> anyhow::Result<Vec<soulseek::File>>;
+ShareService::search(&self, query: &soulseek::SearchQuery, limit: usize) -> anyhow::Result<Vec<soulseek::File>>;
 ShareService::resolve_file(&self, remote_filename: &str) -> anyhow::Result<(std::path::PathBuf, u64)>; // local path + size
 ShareService::counts(&self) -> (u32 /*dirs*/, u32 /*files*/);
 // transfers
 TransferService::enqueue_upload(&self, username: &str, endpoint: SocketAddr, filename: &str) -> Result<(), String>; // Err = reject reason
 TransferService::place_in_queue(&self, username: &str, filename: &str) -> Option<u32>;
-TransferService::upload_info(&self) -> (u32 /*slots*/, u32 /*queue length*/, bool /*has free slot*/);
 TransferService::upload_info_for(&self, username: &str) -> (u32, u32, bool); // user group forecast
 TransferService::database(&self) -> &Database;                       // transfers.db, read by telemetry
 ```

@@ -294,14 +294,6 @@ impl UploadQueue {
         };
         (slots as u32, position.min(u32::MAX as usize) as u32, false)
     }
-
-    pub(super) fn info(&self, slots: u32) -> (u32, u32, bool) {
-        (
-            slots,
-            self.pending.len().min(u32::MAX as usize) as u32,
-            self.running.len() < slots as usize,
-        )
-    }
 }
 
 struct Completion {

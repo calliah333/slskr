@@ -74,11 +74,6 @@ pub fn icon_markup(name: &str) -> Option<&'static str> {
         .map(|index| ICONS[index].1)
 }
 
-/// All icon names (lucide names, sorted), e.g. for documentation.
-pub fn icon_names() -> impl Iterator<Item = &'static str> {
-    ICONS.iter().map(|(name, _)| *name)
-}
-
 /// An inline SVG icon: `<svg class="icon icon--{size}">`, `1rem` square by default and
 /// drawn in `currentColor`.
 ///

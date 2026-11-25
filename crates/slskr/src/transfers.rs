@@ -10,7 +10,6 @@ mod queue;
 mod store;
 
 pub use api::routes;
-pub(crate) use queue::group_options as group_config;
 
 /// Parses a `downloads.file_mode` value (octal or `rwxr-xr-x`); empty is `None`.
 pub(crate) fn parse_file_mode(value: &str) -> io::Result<Option<u32>> {
@@ -433,11 +432,6 @@ impl TransferService {
             .position(&self.0.users, &cfg, username, filename)
     }
 
-    pub fn upload_info(&self) -> (u32, u32, bool) {
-        let cfg = self.0.core.options.get();
-        self.runtime().uploads.info(self.upload_slots(&cfg))
-    }
-
     pub fn upload_info_for(&self, username: &str) -> (u32, u32, bool) {
         let cfg = self.0.core.options.get();
         self.runtime()
@@ -659,10 +653,11 @@ impl TransferService {
                 let transfer = transfer.clone();
                 let cancel = {
                     let mut runtime = service.runtime();
-                    let entry = runtime
-                        .active
-                        .get_mut(&transfer.id)
-                        .expect("reserved download");
+                    // Nothing removes an unstored entry today; skip rather than panic if
+                    // that changes, since the rows are already stored.
+                    let Some(entry) = runtime.active.get_mut(&transfer.id) else {
+                        continue;
+                    };
                     entry.stored = true;
                     entry.cancel.clone()
                 };
@@ -698,9 +693,6 @@ impl TransferService {
         self.finish(id, result).await;
     }
 
-    /// Keeps an upload queued while its file is backing off for this user after repeated
-    /// failures (see [`backoff`]). It does not take a slot meanwhile, and the peer sees it
-    /// queued, with the time of the next attempt.
     /// Runs the upload queue again once a held user's delay has passed.
     fn wake_held_uploads(&self) {
         let mut runtime = self.runtime();
@@ -710,6 +702,9 @@ impl TransferService {
         }
     }
 
+    /// Keeps an upload queued while its file is backing off for this user after repeated
+    /// failures (see [`backoff`]). It does not take a slot meanwhile, and the peer sees it
+    /// queued, with the time of the next attempt.
     async fn hold_failing_upload(&self, t: &Transfer, cancel: &CancellationToken) {
         let delay = {
             let mut runtime = self.runtime();
@@ -1611,11 +1606,6 @@ fn retryable(error: &Error) -> bool {
     )
 }
 
-/// Whether a failed upload was the peer accepting it and then closing the file connection
-/// before asking for any data (instead of sending the resume offset). Only this counts
-/// towards the automatic ban: it is what broken or abusive clients loop on, while failing
-/// to reach the peer, a refusal, a timeout, a dropped connection mid-file (a bad link, on
-/// either side) and errors reading the file here can all happen to well-behaved users.
 /// Whether an upload failed on this side (the shared file, the server connection), not
 /// because of the peer: such failures do not count toward holding the user.
 fn local_failure(result: &soulseek::Result<PathBuf>) -> bool {
@@ -1633,6 +1623,11 @@ fn local_failure(result: &soulseek::Result<PathBuf>) -> bool {
     )
 }
 
+/// Whether a failed upload was the peer accepting it and then closing the file connection
+/// before asking for any data (instead of sending the resume offset). Only this counts
+/// towards the automatic ban: it is what broken or abusive clients loop on, while failing
+/// to reach the peer, a refusal, a timeout, a dropped connection mid-file (a bad link, on
+/// either side) and errors reading the file here can all happen to well-behaved users.
 fn peer_aborted(prior: TransferState, result: &soulseek::Result<PathBuf>) -> bool {
     matches!(
         (prior, result),

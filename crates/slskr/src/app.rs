@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::Auth, config::ConfigStore, events::EventService, files::FileService, logging::LogBuffer,
+    auth::Auth, config::ConfigStore, events::EventService, logging::LogBuffer,
     messaging::MessagingService, realtime::EventBus, search::SearchService, shares::ShareService,
     state::StateStore, telemetry::TelemetryService, transfers::TransferService, users::UserService,
 };
@@ -69,7 +69,6 @@ pub struct Services {
     pub events: EventService,
     pub users: UserService,
     pub shares: ShareService,
-    pub files: FileService,
     pub telemetry: TelemetryService,
     pub transfers: TransferService,
     pub search: SearchService,
@@ -217,9 +216,8 @@ impl AppState {
         crate::logging::start_retention(&self.core);
         self.auth.sessions().spawn_pruner(self.shutdown.clone());
         crate::setup::sync(self);
-        self.services.users.start(self.clone());
+        self.services.users.start();
         self.services.shares.start();
-        self.services.files.start(self.clone());
         self.services.transfers.start(self.clone());
         self.services.telemetry.start(&self.core);
         crate::profiling::start(self.shutdown.clone());
