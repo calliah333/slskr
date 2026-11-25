@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -19,6 +20,31 @@ pub(crate) fn group_options<'a>(settings: &'a Config, group: &str) -> &'a GroupC
         "default" | "privileged" => &groups.default,
         "leechers" => &groups.leechers,
         _ => groups.custom.get(group).unwrap_or(&groups.default),
+    }
+}
+
+/// Looks up each user's group once per queue walk: a queue holds many files per user,
+/// and search responses walk it.
+struct Groups<'a> {
+    users: &'a UserService,
+    known: HashMap<String, Arc<str>>,
+}
+
+impl<'a> Groups<'a> {
+    fn new(users: &'a UserService) -> Self {
+        Self {
+            users,
+            known: HashMap::new(),
+        }
+    }
+
+    fn of(&mut self, username: &str) -> Arc<str> {
+        if let Some(group) = self.known.get(username) {
+            return group.clone();
+        }
+        let group = self.users.group(username);
+        self.known.insert(username.to_owned(), group.clone());
+        group
     }
 }
 
@@ -50,7 +76,7 @@ struct Pending {
 pub(super) struct UploadQueue {
     pending: Vec<Pending>,
     // Group membership is pinned for the life of a slot, even on a config reload.
-    running: HashMap<String, (String, String)>,
+    running: HashMap<String, (String, Arc<str>)>,
     rotation: HashMap<String, u64>,
     turn: u64,
 }
@@ -91,11 +117,12 @@ impl UploadQueue {
 
     pub(super) fn dispatch(&mut self, users: &UserService, cfg: &Config, slots: u32) {
         let slots = slots as usize;
+        let mut groups = Groups::new(users);
         while self.running.len() < slots {
             let mut running_groups = HashMap::<&str, usize>::new();
             let mut running_users = HashSet::with_capacity(self.running.len());
             for (user, group) in self.running.values() {
-                *running_groups.entry(group.as_str()).or_default() += 1;
+                *running_groups.entry(group).or_default() += 1;
                 running_users.insert(user.as_str());
             }
             let best = self
@@ -109,9 +136,9 @@ impl UploadQueue {
                     {
                         return None;
                     }
-                    let group = users.group(&p.username);
+                    let group = groups.of(&p.username);
                     let options = group_options(cfg, &group);
-                    let (priority, group_slots, fifo) = match group.as_str() {
+                    let (priority, group_slots, fifo) = match &*group {
                         "blacklisted" => return None,
                         "privileged" => (0, slots, true),
                         _ => (
@@ -123,7 +150,7 @@ impl UploadQueue {
                             fifo(options),
                         ),
                     };
-                    if running_groups.get(group.as_str()).copied().unwrap_or(0) >= group_slots {
+                    if running_groups.get(&*group).copied().unwrap_or(0) >= group_slots {
                         return None;
                     }
                     let turn = if fifo {
@@ -145,7 +172,7 @@ impl UploadQueue {
     }
 
     pub(super) fn group(&self, id: &str) -> Option<&str> {
-        self.running.get(id).map(|(_, group)| group.as_str())
+        self.running.get(id).map(|(_, group)| &**group)
     }
 
     pub(super) fn position(
@@ -159,12 +186,13 @@ impl UploadQueue {
             .pending
             .iter()
             .position(|p| p.username == username && p.filename == filename)?;
-        let group = users.group(username);
+        let mut groups = Groups::new(users);
+        let group = groups.of(username);
         let settings = group_options(cfg, &group);
-        let position = if group == "privileged" || fifo(settings) {
+        let position = if &*group == "privileged" || fifo(settings) {
             self.pending[..target]
                 .iter()
-                .filter(|p| users.group(&p.username) == group)
+                .filter(|p| groups.of(&p.username) == group)
                 .count()
         } else {
             let own = self.pending[..target]
@@ -173,7 +201,7 @@ impl UploadQueue {
                 .count();
             let mut counts = HashMap::<&str, usize>::new();
             for p in &self.pending {
-                if p.username != username && users.group(&p.username) == group {
+                if p.username != username && groups.of(&p.username) == group {
                     *counts.entry(&p.username).or_default() += 1;
                 }
             }
@@ -192,13 +220,14 @@ impl UploadQueue {
         global: u32,
         username: &str,
     ) -> (u32, u32, bool) {
-        let group = users.group(username);
-        if group == "blacklisted" {
+        let mut groups = Groups::new(users);
+        let group = groups.of(username);
+        if &*group == "blacklisted" {
             return (0, 0, false);
         }
         let global = global as usize;
         let settings = group_options(cfg, &group);
-        let slots = if group == "privileged" {
+        let slots = if &*group == "privileged" {
             global
         } else {
             match settings.slots {
@@ -209,7 +238,7 @@ impl UploadQueue {
         let used = self
             .running
             .values()
-            .filter(|(_, name)| name == &group)
+            .filter(|(_, name)| *name == group)
             .count();
         let free = self.running.len() < global
             && used < slots
@@ -220,8 +249,8 @@ impl UploadQueue {
         let waiting = self
             .pending
             .iter()
-            .filter(|p| users.group(&p.username) == group);
-        let position = if group == "privileged" || fifo(settings) {
+            .filter(|p| groups.of(&p.username) == group);
+        let position = if &*group == "privileged" || fifo(settings) {
             waiting.count()
         } else {
             waiting

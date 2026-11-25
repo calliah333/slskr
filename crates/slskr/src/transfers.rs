@@ -270,8 +270,11 @@ impl TransferService {
                         }
                         let cfg = service.0.core.options.get();
                         let pruned = store::prune(service.database(), &cfg.retention).await;
-                        service.wrote(TransferDirection::Download);
-                        service.wrote(TransferDirection::Upload);
+                        // Most ticks remove nothing; keep idle lists cacheable then.
+                        if pruned.as_ref().map_or(true, |removed| !removed.is_empty()) {
+                            service.wrote(TransferDirection::Download);
+                            service.wrote(TransferDirection::Upload);
+                        }
                         match pruned {
                             Ok(removed) => service.publish_removed(removed),
                             Err(error) => tracing::warn!(%error, "could not apply transfer retention"),

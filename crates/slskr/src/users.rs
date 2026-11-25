@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
-    sync::{Arc, RwLock},
+    sync::{Arc, LazyLock, RwLock},
     time::Duration,
 };
 
@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::Engine;
 use serde::Deserialize;
+use slskr_types::config::Config;
 use slskr_types::users::{
     BrowseResponse, BrowseStatus, Directory, Endpoint, Info, Statistics, Status, UserPresence,
 };
@@ -20,7 +21,7 @@ use tokio::{sync::broadcast, time::Instant};
 
 use crate::{
     app::{AppState, Core},
-    auth::{Authenticated, RequireReadWrite},
+    auth::{Authenticated, RequireReadWrite, ip::IpRange},
     http::{ApiError, ApiResult, Json, Path, Query, Routes},
 };
 
@@ -28,6 +29,10 @@ const DEFAULT: &str = "default";
 const PRIVILEGED: &str = "privileged";
 const LEECHERS: &str = "leechers";
 const BLACKLISTED: &str = "blacklisted";
+static DEFAULT_GROUP: LazyLock<Arc<str>> = LazyLock::new(|| DEFAULT.into());
+static PRIVILEGED_GROUP: LazyLock<Arc<str>> = LazyLock::new(|| PRIVILEGED.into());
+static LEECHERS_GROUP: LazyLock<Arc<str>> = LazyLock::new(|| LEECHERS.into());
+static BLACKLISTED_GROUP: LazyLock<Arc<str>> = LazyLock::new(|| BLACKLISTED.into());
 const BROWSE_RETENTION: Duration = Duration::from_secs(5);
 const INFO_RETENTION: Duration = Duration::from_secs(60);
 
@@ -100,10 +105,60 @@ impl Drop for ActiveBrowse<'_> {
     }
 }
 
+/// The blacklist and custom group members of one configuration, ready to match.
+///
+/// Queue checks ask for the group of every queued user on each search response, so
+/// matching must not re-parse ranges or lowercase patterns per call.
+struct Policy {
+    config: Arc<Config>,
+    /// ASCII-lowercased: names match ASCII case-insensitively.
+    users: HashSet<String>,
+    /// Lowercased.
+    patterns: Vec<String>,
+    cidrs: Vec<IpRange>,
+    /// ASCII-lowercased member to group; the first group by name wins.
+    members: HashMap<String, Arc<str>>,
+}
+
+impl Policy {
+    fn new(config: Arc<Config>) -> Self {
+        let b = &config.blacklist;
+        let users = b.users.iter().map(|u| u.to_ascii_lowercase()).collect();
+        let patterns = b.patterns.iter().map(|p| p.to_lowercase()).collect();
+        let cidrs = b.cidrs.iter().filter_map(|c| c.parse().ok()).collect();
+        let mut members = HashMap::new();
+        for (name, group) in &config.groups.custom {
+            let name: Arc<str> = name.as_str().into();
+            for member in &group.members {
+                members
+                    .entry(member.to_ascii_lowercase())
+                    .or_insert_with(|| name.clone());
+            }
+        }
+        Self {
+            config,
+            users,
+            patterns,
+            cidrs,
+            members,
+        }
+    }
+
+    fn is_blacklisted(&self, username: &str, ip: Option<IpAddr>) -> bool {
+        (!self.users.is_empty() && self.users.contains(&username.to_ascii_lowercase()))
+            || (!self.patterns.is_empty() && {
+                let username = username.to_lowercase();
+                self.patterns.iter().any(|p| wildcard(p, &username))
+            })
+            || ip.is_some_and(|ip| self.cidrs.iter().any(|r| r.contains(ip)))
+    }
+}
+
 #[derive(Clone)]
 pub struct UserService {
     core: Core,
     cache: Arc<RwLock<Cache>>,
+    policy: Arc<RwLock<Arc<Policy>>>,
 }
 
 impl UserService {
@@ -111,7 +166,20 @@ impl UserService {
         Ok(Self {
             core: core.clone(),
             cache: Arc::new(RwLock::new(Cache::default())),
+            policy: Arc::new(RwLock::new(Arc::new(Policy::new(core.options.get())))),
         })
+    }
+
+    /// The policy of the current configuration, compiled on first use after a change.
+    fn policy(&self) -> Arc<Policy> {
+        let config = self.core.options.get();
+        let current = self.policy.read().unwrap().clone();
+        if Arc::ptr_eq(&current.config, &config) {
+            return current;
+        }
+        let policy = Arc::new(Policy::new(config));
+        *self.policy.write().unwrap() = policy.clone();
+        policy
     }
 
     pub fn start(&self, _app: AppState) {
@@ -183,10 +251,11 @@ impl UserService {
         }
     }
 
-    pub fn group(&self, username: &str) -> String {
-        let options = self.core.options.get();
-        if self.is_blacklisted(username, None) {
-            return BLACKLISTED.into();
+    /// The upload group of `username`; cheap to clone and compare.
+    pub fn group(&self, username: &str) -> Arc<str> {
+        let policy = self.policy();
+        if policy.is_blacklisted(username, None) {
+            return BLACKLISTED_GROUP.clone();
         }
         let (privileged, stats) = {
             let cache = self.cache.read().unwrap();
@@ -197,37 +266,26 @@ impl UserService {
             )
         };
         if privileged {
-            return PRIVILEGED.into();
+            return PRIVILEGED_GROUP.clone();
         }
-        if let Some((name, _)) = options
-            .groups
-            .custom
-            .iter()
-            .find(|(_, g)| g.members.iter().any(|u| u.eq_ignore_ascii_case(username)))
+        if !policy.members.is_empty()
+            && let Some(name) = policy.members.get(&username.to_ascii_lowercase())
         {
             return name.clone();
         }
-        let leechers = &options.groups.leechers;
+        let leechers = &policy.config.groups.leechers;
         let leecher = stats.is_some_and(|s| {
             s.file_count < leechers.min_shared_files.unwrap_or(1)
                 || s.directory_count < leechers.min_shared_directories.unwrap_or(1)
         });
         if leecher {
-            LEECHERS.into()
+            LEECHERS_GROUP.clone()
         } else {
-            DEFAULT.into()
+            DEFAULT_GROUP.clone()
         }
     }
     pub fn is_blacklisted(&self, username: &str, ip: Option<IpAddr>) -> bool {
-        let b = &self.core.options.get().blacklist;
-        b.users.iter().any(|v| v.eq_ignore_ascii_case(username))
-            || b.patterns.iter().any(|p| wildcard(p, username))
-            || ip.is_some_and(|ip| {
-                b.cidrs
-                    .iter()
-                    .filter_map(|c| c.parse::<crate::auth::ip::IpRange>().ok())
-                    .any(|r| r.contains(ip))
-            })
+        self.policy().is_blacklisted(username, ip)
     }
     pub fn group_upload_options(&self, group: &str) -> GroupUploadInfo {
         let options = self.core.options.get();
@@ -407,10 +465,10 @@ fn convert_statistics(remote: &soulseek::UserStatistics) -> Statistics {
     }
 }
 
+/// Matches a lowercased `pattern` against a lowercased `value`.
 fn wildcard(pattern: &str, value: &str) -> bool {
-    let (p, v) = (pattern.to_lowercase(), value.to_lowercase());
     let (mut i, mut j, mut star, mut mark) = (0, 0, None, 0);
-    let (p, v) = (p.as_bytes(), v.as_bytes());
+    let (p, v) = (pattern.as_bytes(), value.as_bytes());
     while j < v.len() {
         if i < p.len() && (p[i] == b'?' || p[i] == v[j]) {
             i += 1;
@@ -561,8 +619,33 @@ mod tests {
     use super::*;
     #[test]
     fn blacklist_glob_is_case_insensitive_and_anchored() {
-        assert!(wildcard("bad*name?", "BadUserName1"));
-        assert!(!wildcard("bad*name", "prefixBadUserName"));
+        let policy = |patterns: &[&str]| {
+            let mut config = Config::default();
+            config.blacklist.patterns = patterns.iter().map(|p| (*p).into()).collect();
+            Policy::new(Arc::new(config))
+        };
+        assert!(policy(&["Bad*Name?"]).is_blacklisted("BadUserName1", None));
+        assert!(!policy(&["bad*name"]).is_blacklisted("prefixBadUserName", None));
+    }
+
+    #[test]
+    fn policy_matches_names_ranges_and_first_custom_group() {
+        let mut config = Config::default();
+        config.blacklist.users = vec!["Spammer".into()];
+        config.blacklist.cidrs = vec!["10.0.0.0/8".into(), "not a range".into()];
+        for (name, members) in [("a_friends", ["Pal"]), ("b_others", ["pal"])] {
+            let group = slskr_types::config::GroupConfig {
+                members: members.iter().map(|m| (*m).into()).collect(),
+                ..Default::default()
+            };
+            config.groups.custom.insert(name.into(), group);
+        }
+        let policy = Policy::new(Arc::new(config));
+        assert!(policy.is_blacklisted("spammer", None));
+        assert!(!policy.is_blacklisted("someone", None));
+        assert!(policy.is_blacklisted("someone", Some("10.1.2.3".parse().unwrap())));
+        assert!(!policy.is_blacklisted("someone", Some("11.1.2.3".parse().unwrap())));
+        assert_eq!(policy.members.get("pal").map(|g| &**g), Some("a_friends"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ impl TransferService {
             && runtime.backoff.looping_files(username) >= LOOP_FILES
             && !username.eq_ignore_ascii_case(&cfg.soulseek.username)
             && !self.0.users.is_blacklisted(username, None)
-            && self.0.users.group(username) != "privileged";
+            && &*self.0.users.group(username) != "privileged";
         if due {
             runtime.backoff.forget(username);
         }
