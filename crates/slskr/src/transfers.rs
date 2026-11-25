@@ -135,6 +135,14 @@ struct DownloadContext {
 }
 
 impl Runtime {
+    /// Starts queued uploads in free slots, skipping users the backoff holds.
+    fn dispatch_uploads(&mut self, users: &UserService, cfg: &Config, slots: u32) {
+        let Runtime {
+            uploads, backoff, ..
+        } = self;
+        uploads.dispatch(users, cfg, slots, |user| backoff.user_delay(user));
+    }
+
     fn has(&self, direction: TransferDirection, username: &str, filename: &str) -> bool {
         self.files[direction_index(direction)]
             .get(username)
@@ -266,7 +274,10 @@ impl TransferService {
             loop {
                 tokio::select! {
                     _ = service.0.core.shutdown.cancelled() => { service.flush_all().await; break; }
-                    _ = progress.tick() => { service.flush().await; }
+                    _ = progress.tick() => {
+                        service.flush().await;
+                        service.wake_held_uploads();
+                    }
                     _ = retention.tick() => {
                         {
                             let mut runtime = service.runtime();
@@ -302,7 +313,7 @@ impl TransferService {
                                 entry.cancel.cancel();
                             }
                         }
-                        runtime.uploads.dispatch(&service.0.users, &cfg, service.upload_slots(&cfg));
+                        runtime.dispatch_uploads(&service.0.users, &cfg, service.upload_slots(&cfg));
                         drop(runtime);
                         if cfg.blacklist != blacklist {
                             blacklist = cfg.blacklist.clone();
@@ -690,6 +701,15 @@ impl TransferService {
     /// Keeps an upload queued while its file is backing off for this user after repeated
     /// failures (see [`backoff`]). It does not take a slot meanwhile, and the peer sees it
     /// queued, with the time of the next attempt.
+    /// Runs the upload queue again once a held user's delay has passed.
+    fn wake_held_uploads(&self) {
+        let mut runtime = self.runtime();
+        if runtime.uploads.wake_due() {
+            let cfg = self.0.core.options.get();
+            runtime.dispatch_uploads(&self.0.users, &cfg, self.upload_slots(&cfg));
+        }
+    }
+
     async fn hold_failing_upload(&self, t: &Transfer, cancel: &CancellationToken) {
         let delay = {
             let mut runtime = self.runtime();
@@ -763,9 +783,7 @@ impl TransferService {
             {
                 let mut runtime = service.runtime();
                 runtime.uploads.ready(&id);
-                runtime
-                    .uploads
-                    .dispatch(&service.0.users, &cfg, service.upload_slots(&cfg));
+                runtime.dispatch_uploads(&service.0.users, &cfg, service.upload_slots(&cfg));
             }
             Box::pin(async move {
                 slot.ok_or(Error::Cancelled)?
@@ -1164,10 +1182,10 @@ impl TransferService {
             if transfer.direction == TransferDirection::Upload {
                 runtime.uploads.release(id);
                 runtime.history.record(&transfer);
-                runtime.backoff.record(&transfer, offset, aborted);
                 runtime
-                    .uploads
-                    .dispatch(&self.0.users, &cfg, self.upload_slots(&cfg));
+                    .backoff
+                    .record(&transfer, offset, aborted, local_failure(&result));
+                runtime.dispatch_uploads(&self.0.users, &cfg, self.upload_slots(&cfg));
             }
             let completed = &mut runtime.completed[direction_index(transfer.direction)];
             if disposition == TransferState::Succeeded {
@@ -1598,6 +1616,23 @@ fn retryable(error: &Error) -> bool {
 /// towards the automatic ban: it is what broken or abusive clients loop on, while failing
 /// to reach the peer, a refusal, a timeout, a dropped connection mid-file (a bad link, on
 /// either side) and errors reading the file here can all happen to well-behaved users.
+/// Whether an upload failed on this side (the shared file, the server connection), not
+/// because of the peer: such failures do not count toward holding the user.
+fn local_failure(result: &soulseek::Result<PathBuf>) -> bool {
+    !matches!(
+        result,
+        Ok(_)
+            | Err(Error::Timeout(_)
+                | Error::Connection(_)
+                | Error::UserOffline(_)
+                | Error::UserNotFound(_)
+                | Error::UserEndPoint(_)
+                | Error::NoResponse(_)
+                | Error::TransferRejected(_)
+                | Error::TransferReportedFailed(_))
+    )
+}
+
 fn peer_aborted(prior: TransferState, result: &soulseek::Result<PathBuf>) -> bool {
     matches!(
         (prior, result),

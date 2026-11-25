@@ -79,6 +79,8 @@ pub(super) struct UploadQueue {
     running: HashMap<String, (String, Arc<str>)>,
     rotation: HashMap<String, u64>,
     turn: u64,
+    /// When the earliest held user (see [`Self::dispatch`]) may start again.
+    wake: Option<Instant>,
 }
 
 impl UploadQueue {
@@ -115,9 +117,35 @@ impl UploadQueue {
         }
     }
 
-    pub(super) fn dispatch(&mut self, users: &UserService, cfg: &Config, slots: u32) {
+    /// Starts pending uploads while slots are free. Users for whom `held` returns a delay
+    /// (see [`super::backoff`]) are skipped; [`Self::wake_due`] says when to try again.
+    pub(super) fn dispatch(
+        &mut self,
+        users: &UserService,
+        cfg: &Config,
+        slots: u32,
+        held: impl Fn(&str) -> Option<Duration>,
+    ) {
         let slots = slots as usize;
         let mut groups = Groups::new(users);
+        self.wake = None;
+        let mut checked = HashMap::<&str, bool>::new();
+        let mut wake = None::<Instant>;
+        let mut skip = HashSet::<String>::new();
+        for p in &self.pending {
+            let held = *checked.entry(&p.username).or_insert_with(|| {
+                held(&p.username).is_some_and(|delay| {
+                    let at = Instant::now() + delay;
+                    wake = Some(wake.map_or(at, |wake: Instant| wake.min(at)));
+                    true
+                })
+            });
+            if held {
+                skip.insert(p.username.clone());
+            }
+        }
+        drop(checked);
+        self.wake = wake;
         while self.running.len() < slots {
             let mut running_groups = HashMap::<&str, usize>::new();
             let mut running_users = HashSet::with_capacity(self.running.len());
@@ -132,6 +160,7 @@ impl UploadQueue {
                 .filter_map(|(i, p)| {
                     if !p.ready
                         || running_users.contains(p.username.as_str())
+                        || skip.contains(&p.username)
                         || p.start.is_closed()
                     {
                         return None;
@@ -169,6 +198,11 @@ impl UploadQueue {
                 self.running.insert(p.id, (p.username, group));
             }
         }
+    }
+
+    /// Whether a held user's delay has passed, so [`Self::dispatch`] should run again.
+    pub(super) fn wake_due(&self) -> bool {
+        self.wake.is_some_and(|wake| wake <= Instant::now())
     }
 
     pub(super) fn group(&self, id: &str) -> Option<&str> {
@@ -509,5 +543,31 @@ mod tests {
         assert_eq!(second, 1_024);
         assert!(next >= ready + Duration::from_millis(100));
         assert_eq!(bandwidth.grant(&cfg, Some("privileged"), 8_192).0, 8_192);
+    }
+
+    #[tokio::test]
+    async fn held_users_wait_while_others_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::bootstrap::test_app(dir.path(), "[soulseek]\nconnect = false\n", &[])
+            .await
+            .unwrap();
+        let cfg = Config::default();
+        let mut queue = UploadQueue::default();
+        let mut started = Vec::new();
+        for user in ["held", "free"] {
+            let t = new_transfer(TransferDirection::Upload, user, "f".into(), 1, None);
+            started.push(queue.push(&t));
+            queue.ready(&t.id);
+        }
+        let hold = |user: &str| (user == "held").then_some(Duration::from_millis(50));
+        queue.dispatch(&app.services.users, &cfg, 2, hold);
+        assert!(started[1].try_recv().is_ok());
+        assert!(started[0].try_recv().is_err());
+        assert!(!queue.wake_due());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(queue.wake_due());
+        queue.dispatch(&app.services.users, &cfg, 2, |_| None);
+        assert!(started[0].try_recv().is_ok());
+        assert!(!queue.wake_due());
     }
 }

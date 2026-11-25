@@ -206,7 +206,7 @@ mod tests {
             for file in files {
                 for _ in 0..crate::transfers::backoff::LOOP_FAILURES {
                     let t = ended(user, file, TransferState::Errored);
-                    runtime.backoff.record(&t, 0, true);
+                    runtime.backoff.record(&t, 0, true, false);
                 }
             }
         };

@@ -12,6 +12,15 @@
 //! re-queuing. A success, or a failure that resumed past where the last one ended, clears
 //! the record.
 //!
+//! A user whose uploads fail [`FREE_USER_FAILURES`] times in a row, across all their
+//! files, with no success between, is held the same way as a whole: the queue starts
+//! none of their files until the delay has passed, then one, and a success clears it.
+//! Peers that went offline, whose client hangs, or that abort every file would otherwise
+//! fail each queued file in turn (two free failures per file of a 16-track album is 32
+//! errors in a minute). On two days of live logs this would have avoided about 60% of
+//! failed uploads while delaying 10 successful ones. Failures on this side (the shared
+//! file changed, the server connection was down) count for neither.
+//!
 //! For the automatic ban, a file is *looping* once the peer has aborted it (accepted the
 //! upload, then closed the connection before asking for any data) [`LOOP_FAILURES`]
 //! times over at least [`LOOP_DURATION`], with no upload to that user succeeding since
@@ -28,6 +37,8 @@ use tokio::time::Instant;
 
 /// Failures in a row that are retried at once, as transient errors usually are.
 const FREE_FAILURES: u32 = 2;
+/// Failures in a row across a user's files, with no success, before the user is held.
+const FREE_USER_FAILURES: u32 = 5;
 const BASE_DELAY: Duration = Duration::from_secs(60);
 const MAX_DELAY: Duration = Duration::from_secs(3600);
 /// A record with no failure for this long is forgotten.
@@ -49,27 +60,44 @@ struct Strikes {
     reached: u64,
 }
 
+/// A user's failures in a row, across files.
+struct Streak {
+    failures: u32,
+    last: Instant,
+}
+
 #[derive(Default)]
-pub(super) struct UploadBackoff(HashMap<(String, String), Strikes>);
+pub(super) struct UploadBackoff {
+    files: HashMap<(String, String), Strikes>,
+    users: HashMap<String, Streak>,
+}
 
 impl UploadBackoff {
     /// How long the next upload of `filename` to `username` should wait, if at all.
     pub(super) fn delay(&self, username: &str, filename: &str) -> Option<Duration> {
-        let strikes = self.0.get(&(username.to_owned(), filename.to_owned()))?;
-        let wait = backoff(strikes.failures)?;
-        wait.checked_sub(strikes.last.elapsed())
-            .filter(|wait| !wait.is_zero())
+        let strikes = self
+            .files
+            .get(&(username.to_owned(), filename.to_owned()))?;
+        remaining(backoff(strikes.failures, FREE_FAILURES)?, strikes.last)
     }
 
-    /// Records how an upload ended; `offset` is where the peer asked it to start, and
-    /// `aborted` whether the peer accepted the upload and then dropped it.
-    pub(super) fn record(&mut self, t: &Transfer, offset: u64, aborted: bool) {
+    /// How long until any upload to `username` may start, if they are held.
+    pub(super) fn user_delay(&self, username: &str) -> Option<Duration> {
+        let streak = self.users.get(username)?;
+        remaining(backoff(streak.failures, FREE_USER_FAILURES)?, streak.last)
+    }
+
+    /// Records how an upload ended; `offset` is where the peer asked it to start,
+    /// `aborted` whether the peer accepted the upload and then dropped it, and `local`
+    /// whether it failed on this side.
+    pub(super) fn record(&mut self, t: &Transfer, offset: u64, aborted: bool, local: bool) {
         let key = (t.username.clone(), t.filename.clone());
         match t.state {
             TransferState::Succeeded => {
-                self.0.remove(&key);
+                self.files.remove(&key);
+                self.users.remove(&t.username);
                 // A user who gets files is not abusing the queue.
-                for ((user, _), strikes) in &mut self.0 {
+                for ((user, _), strikes) in &mut self.files {
                     if *user == t.username {
                         strikes.aborts = 0;
                         strikes.aborting_since = None;
@@ -78,10 +106,15 @@ impl UploadBackoff {
             }
             // Cancelled here: not the peer failing.
             TransferState::Cancelled => {}
+            _ if local => {}
             _ => {
                 // `bytes_transferred` counts from the start of the file.
                 let reached = t.bytes_transferred.max(offset);
-                let strikes = self.0.entry(key).or_insert(Strikes {
+                let streak = self.users.entry(t.username.clone()).or_insert(Streak {
+                    failures: 0,
+                    last: Instant::now(),
+                });
+                let strikes = self.files.entry(key).or_insert(Strikes {
                     failures: 0,
                     aborts: 0,
                     aborting_since: None,
@@ -94,7 +127,10 @@ impl UploadBackoff {
                     strikes.failures = 0;
                     strikes.aborts = 0;
                     strikes.aborting_since = None;
+                    streak.failures = 0;
                 }
+                streak.failures = streak.failures.saturating_add(1);
+                streak.last = Instant::now();
                 strikes.failures = strikes.failures.saturating_add(1);
                 if aborted {
                     strikes.aborts = strikes.aborts.saturating_add(1);
@@ -108,7 +144,7 @@ impl UploadBackoff {
 
     /// Files of `username` whose uploads are looping (see [`LOOP_FAILURES`]).
     pub(super) fn looping_files(&self, username: &str) -> usize {
-        self.0
+        self.files
             .iter()
             .filter(|((user, _), strikes)| {
                 user == username
@@ -122,13 +158,14 @@ impl UploadBackoff {
 
     /// Forgets `username`, once banned.
     pub(super) fn forget(&mut self, username: &str) {
-        self.0.retain(|(user, _), _| user != username);
+        self.files.retain(|(user, _), _| user != username);
+        self.users.remove(username);
     }
 
     /// Moves every abort streak of `username` `by` into the past.
     #[cfg(test)]
     pub(super) fn backdate(&mut self, username: &str, by: Duration) {
-        for ((user, _), strikes) in &mut self.0 {
+        for ((user, _), strikes) in &mut self.files {
             if user == username {
                 strikes.aborting_since = strikes.aborting_since.map(|since| since - by);
             }
@@ -136,13 +173,22 @@ impl UploadBackoff {
     }
 
     pub(super) fn prune(&mut self) {
-        self.0
+        self.files
             .retain(|_, strikes| strikes.last.elapsed() < FORGET_AFTER);
+        self.users
+            .retain(|_, streak| streak.last.elapsed() < FORGET_AFTER);
     }
 }
 
-fn backoff(failures: u32) -> Option<Duration> {
-    let over = failures.checked_sub(FREE_FAILURES)?;
+/// What is left of `wait` since `since`, if anything.
+fn remaining(wait: Duration, since: Instant) -> Option<Duration> {
+    wait.checked_sub(since.elapsed())
+        .filter(|wait| !wait.is_zero())
+}
+
+/// The delay after `failures` in a row, once more than `free`.
+fn backoff(failures: u32, free: u32) -> Option<Duration> {
+    let over = failures.checked_sub(free)?;
     Some(
         BASE_DELAY
             .saturating_mul(1_u32 << over.min(16))
@@ -163,11 +209,12 @@ mod tests {
             super::super::new_transfer(TransferDirection::Upload, USER, FILE.into(), 100, None);
         t.state = state;
         t.bytes_transferred = offset + bytes;
-        backoff.record(&t, offset, true);
+        backoff.record(&t, offset, true, false);
     }
 
     #[test]
     fn backoff_starts_after_the_free_failures_and_doubles_to_a_cap() {
+        let backoff = |failures| backoff(failures, FREE_FAILURES);
         assert_eq!(backoff(0), None);
         assert_eq!(backoff(1), None);
         assert_eq!(backoff(2), Some(Duration::from_secs(60)));
@@ -197,7 +244,7 @@ mod tests {
         assert_eq!(backoff.delay(USER, FILE), Some(Duration::from_secs(120)));
         end(&mut backoff, TransferState::Succeeded, 0, 100);
         assert_eq!(backoff.delay(USER, FILE), None);
-        assert!(backoff.0.is_empty());
+        assert!(backoff.files.is_empty() && backoff.users.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -219,7 +266,7 @@ mod tests {
         end(&mut backoff, TransferState::Errored, 0, 0);
         tokio::time::advance(FORGET_AFTER).await;
         backoff.prune();
-        assert!(backoff.0.is_empty());
+        assert!(backoff.files.is_empty() && backoff.users.is_empty());
     }
 
     #[test]
@@ -229,7 +276,7 @@ mod tests {
             let mut t =
                 super::super::new_transfer(TransferDirection::Upload, USER, file.into(), 100, None);
             t.state = state;
-            backoff.record(&t, 0, aborted);
+            backoff.record(&t, 0, aborted, false);
         };
         for _ in 0..LOOP_FAILURES {
             end(&mut backoff, "a", TransferState::Errored, true);
@@ -250,6 +297,38 @@ mod tests {
         assert_eq!(backoff.looping_files(USER), 0);
 
         backoff.forget(USER);
-        assert!(backoff.0.is_empty());
+        assert!(backoff.files.is_empty() && backoff.users.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_user_failing_every_file_is_held_until_the_delay_or_a_success() {
+        let mut backoff = UploadBackoff::default();
+        let end = |backoff: &mut UploadBackoff, file: &str, state: TransferState, local: bool| {
+            let mut t =
+                super::super::new_transfer(TransferDirection::Upload, USER, file.into(), 100, None);
+            t.state = state;
+            backoff.record(&t, 0, false, local);
+        };
+        for n in 0..FREE_USER_FAILURES - 1 {
+            end(
+                &mut backoff,
+                &format!("f{n}"),
+                TransferState::Errored,
+                false,
+            );
+        }
+        // Failures on this side and cancellations do not count.
+        end(&mut backoff, "x", TransferState::Errored, true);
+        end(&mut backoff, "y", TransferState::Cancelled, false);
+        assert_eq!(backoff.user_delay(USER), None);
+        end(&mut backoff, "z", TransferState::TimedOut, false);
+        assert_eq!(backoff.user_delay(USER), Some(Duration::from_secs(60)));
+        assert_eq!(backoff.user_delay("other"), None);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(backoff.user_delay(USER), None);
+        end(&mut backoff, "z", TransferState::TimedOut, false);
+        assert_eq!(backoff.user_delay(USER), Some(Duration::from_secs(120)));
+        end(&mut backoff, "w", TransferState::Succeeded, false);
+        assert_eq!(backoff.user_delay(USER), None);
     }
 }

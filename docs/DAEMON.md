@@ -357,7 +357,12 @@ Upload backoff (`transfers/backoff.rs`): after two failures in a row of one file
 user, the next upload of it waits queued (`next_attempt_at` set, no slot held) for 1 min,
 doubling to 1 h. Peers that re-queue on every `UploadFailed` otherwise loop every few
 seconds. A success, or a failure that resumed past the furthest byte reached, resets it;
-records are kept in memory and forgotten after 6 h without a failure.
+records are kept in memory and forgotten after 6 h without a failure. A user whose
+uploads fail five times in a row across files, with no success, is held as a whole:
+`UploadQueue::dispatch` skips them for 1 min, doubling to 1 h, and the progress tick
+runs it again when the hold ends. Offline peers, hung clients and peers that abort every
+file otherwise fail each queued file in turn. Failures on this side (`local_failure`)
+count for neither.
 
 Queued uploads are stored in groups (`transfers/inserts.rs`): a peer queues a folder as
 one request per file, so each new upload joins a queue and one writer task stores all
