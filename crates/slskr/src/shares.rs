@@ -523,6 +523,11 @@ impl ShareService {
         self.snapshot_for(&self.0.core.options.get())
     }
 
+    /// Whether shared files can be resolved: a scan of the current share settings exists.
+    pub fn is_indexed(&self) -> bool {
+        self.snapshot().is_some()
+    }
+
     pub fn counts(&self) -> (u32, u32) {
         self.snapshot().as_deref().map_or((0, 0), snapshot_counts)
     }

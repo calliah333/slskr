@@ -215,15 +215,32 @@ fn transfer(row: &Row<'_>) -> rusqlite::Result<Transfer> {
     Ok(transfer)
 }
 
-pub(super) async fn initialize(db: &Database) -> anyhow::Result<(Vec<Transfer>, Vec<Transfer>)> {
+/// Unfinished transfers found in the store at startup, already moved back to the queue.
+pub(super) struct Recovered {
+    /// Uploads started in the last week, for the upload limits.
+    pub history: Vec<Transfer>,
+    pub downloads: Vec<Transfer>,
+    /// Uploads that were queued or running, in the order they were queued.
+    pub uploads: Vec<Transfer>,
+}
+
+pub(super) async fn initialize(db: &Database) -> anyhow::Result<Recovered> {
     db.call(|db| {
         let tx = db.transaction()?;
         let now = Utc::now();
         tx.execute(
             "UPDATE transfers SET state = 1040, state_description = 'aborted', ended_at = ?1,
                 next_attempt_at = NULL, exception = 'OperationCanceledException: Interrupted by daemon shutdown'
-                WHERE (state & 16) = 0 AND (direction = 'Upload' OR removed)",
+                WHERE (state & 16) = 0 AND removed",
             [timestamp(now)],
+        )?;
+        // The peer still wants an upload that a restart interrupted: queue it again in
+        // its old place. Sending resumes from whatever offset the peer then asks for.
+        tx.execute(
+            "UPDATE transfers SET state = 2050, state_description = 'queued_locally', ended_at = NULL,
+                started_at = NULL, next_attempt_at = NULL, place_in_queue = NULL, exception = NULL
+                WHERE direction = 'Upload' AND (state & 16) = 0",
+            [],
         )?;
         // An interrupted negotiation is not a failed attempt. Move it back to the
         // queue once, while preserving delays for already scheduled retries.
@@ -238,12 +255,14 @@ pub(super) async fn initialize(db: &Database) -> anyhow::Result<(Vec<Transfer>, 
             let mut stmt = tx.prepare(select!("WHERE direction = 'Upload' AND started_at >= ?1"))?;
             stmt.query_map([timestamp(now - chrono::TimeDelta::days(7))], transfer)?.collect::<rusqlite::Result<_>>()?
         };
-        let downloads = {
-            let mut stmt = tx.prepare(select!("WHERE direction = 'Download' AND (state & 16) = 0 ORDER BY rowid"))?;
-            stmt.query_map([], transfer)?.collect::<rusqlite::Result<_>>()?
+        let unfinished = |direction: &str| -> rusqlite::Result<Vec<Transfer>> {
+            let mut stmt = tx.prepare(select!("WHERE direction = ?1 AND (state & 16) = 0 ORDER BY rowid"))?;
+            stmt.query_map([direction], transfer)?.collect()
         };
+        let downloads = unfinished("Download")?;
+        let uploads = unfinished("Upload")?;
         tx.commit()?;
-        Ok((history, downloads))
+        Ok(Recovered { history, downloads, uploads })
     }).await
 }
 
@@ -664,9 +683,18 @@ mod tests {
         drop(db);
 
         let db = Database::open(&path, MIGRATIONS).unwrap();
-        let (history, pending) = initialize(&db).await.unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].state, TransferState::Aborted);
+        let Recovered {
+            history,
+            downloads: pending,
+            uploads,
+        } = initialize(&db).await.unwrap();
+        // The interrupted upload is queued again rather than counted as a failure.
+        assert!(history.is_empty());
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].id, upload.id);
+        assert_eq!(uploads[0].state, TransferState::QueuedLocally);
+        assert_eq!(uploads[0].started_at, None);
+        assert_eq!(uploads[0].ended_at, None);
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].next_attempt_at, Some(scheduled));
         assert_eq!(pending[0].attempts, 2);
@@ -674,7 +702,53 @@ mod tests {
         assert_eq!(pending[1].state, TransferState::QueuedLocally);
         assert_eq!(pending[1].attempts, 1);
         assert!(pending[1].next_attempt_at.is_some());
-        assert_eq!(initialize(&db).await.unwrap().1[1].attempts, 1);
+        assert_eq!(initialize(&db).await.unwrap().downloads[1].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn requeues_uploads_in_order_and_aborts_removed_ones() {
+        let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
+        let upload = |name: &str| {
+            new_transfer(
+                TransferDirection::Upload,
+                "peer",
+                format!("album\\{name}"),
+                9,
+                None,
+            )
+        };
+        let (first, second, removed, done) =
+            (upload("one"), upload("two"), upload("gone"), upload("done"));
+        insert(
+            &db,
+            vec![first.clone(), second.clone(), removed.clone(), done.clone()],
+        )
+        .await
+        .unwrap();
+        db.call({
+            let (removed, done) = (removed.id.clone(), done.id.clone());
+            move |db| {
+                db.execute("UPDATE transfers SET removed = 1 WHERE id = ?1", [removed])?;
+                db.execute(
+                    "UPDATE transfers SET state = 48, started_at = ?2 WHERE id = ?1",
+                    params![done, timestamp(Utc::now())],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let recovered = initialize(&db).await.unwrap();
+        let ids: Vec<_> = recovered.uploads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, [first.id.as_str(), second.id.as_str()]);
+        assert_eq!(recovered.history.len(), 1);
+        assert_eq!(recovered.history[0].id, done.id);
+        let gone = find(&db, TransferDirection::Upload, removed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gone.state, TransferState::Aborted);
     }
 
     #[tokio::test]
@@ -752,7 +826,7 @@ mod tests {
         drop(db);
 
         let db = Database::open(&path, MIGRATIONS).unwrap();
-        let (_, pending) = initialize(&db).await.unwrap();
+        let pending = initialize(&db).await.unwrap().downloads;
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].id, "old");
         assert_eq!(pending[0].root, None);

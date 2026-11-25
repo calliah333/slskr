@@ -345,6 +345,14 @@ doubling to 1 h. Peers that re-queue on every `UploadFailed` otherwise loop ever
 seconds. A success, or a failure that resumed past the furthest byte reached, resets it;
 records are kept in memory and forgotten after 6 h without a failure.
 
+Restarts (`transfers::store::initialize`, `TransferService::recover`): unfinished
+downloads and uploads go back to `queued_locally`, in their stored order; removed ones are
+marked aborted. A requeued upload waits for the server login and the share index, then
+resolves its file again and fails if the file is no longer shared or changed size. Sending
+resumes at the offset the peer asks for. At shutdown, uploads end by the disconnect rather
+than by cancellation, so the peer is not sent `UploadDenied` for a file it will be offered
+again; a user's cancellation still sends it.
+
 ### Folder downloads and the download layout
 A download's local folder is computed from its stored record each time it is attempted
 (`transfers::destination::derive`), so retries and restarts install to the same place. The

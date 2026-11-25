@@ -239,8 +239,8 @@ impl TransferService {
             service.wrote(TransferDirection::Download);
             service.wrote(TransferDirection::Upload);
             match initialized {
-                Ok((history, downloads)) => {
-                    service.recover(&app, history, downloads).await;
+                Ok(recovered) => {
+                    service.recover(&app, recovered).await;
                     service.0.ready.send_replace(Some(Ok(())));
                     let pruner = service.clone();
                     tokio::spawn(async move { pruner.prune_banned().await });
@@ -456,7 +456,12 @@ impl TransferService {
         metrics
     }
 
-    async fn recover(&self, app: &AppState, history: Vec<Transfer>, downloads: Vec<Transfer>) {
+    async fn recover(&self, app: &AppState, recovered: store::Recovered) {
+        let store::Recovered {
+            history,
+            downloads,
+            uploads,
+        } = recovered;
         let mut contexts = HashMap::<String, Arc<DownloadContext>>::new();
         let mut jobs = Vec::with_capacity(downloads.len());
         let throttle = Arc::new(Semaphore::new(5));
@@ -483,6 +488,7 @@ impl TransferService {
             let cancel = self.0.core.shutdown.child_token();
             jobs.push((transfer, context, cancel));
         }
+        let mut upload_jobs = Vec::with_capacity(uploads.len());
         {
             let mut runtime = self.runtime();
             for transfer in history {
@@ -491,6 +497,19 @@ impl TransferService {
             for (transfer, _, cancel) in &jobs {
                 runtime.insert(transfer.clone(), cancel.clone(), None, true);
             }
+            // Pushed in the stored order, so uploads keep their places in the queue.
+            for transfer in uploads {
+                let cancel = self.0.core.shutdown.child_token();
+                let slot = runtime.uploads.push(&transfer);
+                runtime.insert(transfer.clone(), cancel.clone(), None, true);
+                upload_jobs.push((transfer, cancel, slot));
+            }
+        }
+        if !upload_jobs.is_empty() {
+            tracing::info!(
+                count = upload_jobs.len(),
+                "requeued uploads interrupted by a restart"
+            );
         }
         for (transfer, context, cancel) in jobs {
             let service = self.clone();
@@ -501,6 +520,56 @@ impl TransferService {
                     .await;
             });
         }
+        for (transfer, cancel, slot) in upload_jobs {
+            let service = self.clone();
+            tokio::spawn(async move { service.resume_upload(transfer, cancel, slot).await });
+        }
+    }
+
+    /// Runs an upload recovered from the store. It waits for the server login, since
+    /// sending needs a session, and for the share index, so the file can be resolved.
+    async fn resume_upload(
+        &self,
+        t: Transfer,
+        cancel: CancellationToken,
+        slot: oneshot::Receiver<()>,
+    ) {
+        let result = async {
+            self.wait_for_login(&cancel).await?;
+            let source = self.shared_source(&t, &cancel).await?;
+            self.upload(&t, source, cancel, slot).await
+        }
+        .await;
+        self.finish(&t.id, result).await;
+    }
+
+    /// The local path of a recovered upload, once the shares are indexed. Fails if the
+    /// peer is now blacklisted, or the file is no longer shared or has changed size.
+    async fn shared_source(
+        &self,
+        t: &Transfer,
+        cancel: &CancellationToken,
+    ) -> soulseek::Result<PathBuf> {
+        let mut states = self.0.core.state.subscribe();
+        while !self.0.shares.is_indexed() {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                changed = states.changed() => if changed.is_err() { return Err(Error::Cancelled) },
+            }
+        }
+        if self.0.users.is_blacklisted(&t.username, None) {
+            return Err(stream_error("File not shared."));
+        }
+        let shares = self.0.shares.clone();
+        let filename = t.filename.clone();
+        let (path, size) = tokio::task::spawn_blocking(move || shares.resolve_file(&filename))
+            .await
+            .map_err(task_error)?
+            .map_err(|_| stream_error("File not shared."))?;
+        if size != t.size {
+            return Err(stream_error("Shared file changed before upload began"));
+        }
+        Ok(path)
     }
 
     async fn enqueue_downloads(
@@ -717,13 +786,31 @@ impl TransferService {
                 })
             }));
         }
-        self.0
-            .core
-            .client
-            .enqueue_upload(&t.username, &t.filename, input, None, options, cancel)
-            .await?
-            .wait()
-            .await?;
+        // Cancelling tells the peer the upload was denied, after which it gives up on the
+        // file. A daemon shutdown instead ends uploads by disconnecting, which tells the
+        // peer nothing, so it still wants the file when the upload is requeued at startup.
+        let wire = CancellationToken::new();
+        let shutdown = &self.0.core.shutdown;
+        let forward = async {
+            cancel.cancelled().await;
+            if !shutdown.is_cancelled() {
+                wire.cancel();
+            }
+            std::future::pending::<()>().await
+        };
+        let send = async {
+            self.0
+                .core
+                .client
+                .enqueue_upload(&t.username, &t.filename, input, None, options, wire.clone())
+                .await?
+                .wait()
+                .await
+        };
+        tokio::select! {
+            result = send => { result?; }
+            () = forward => unreachable!(),
+        }
         Ok(local)
     }
 
