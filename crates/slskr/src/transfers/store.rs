@@ -47,6 +47,7 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
     "DROP INDEX ix_transfers_file;
      CREATE INDEX ix_transfers_listed_file ON transfers(direction, username, filename)
          WHERE removed = 0 AND (state & 16) != 0;",
+    include_str!("migrations/report_hours.sql"),
 ];
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,

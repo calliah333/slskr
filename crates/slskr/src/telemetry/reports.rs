@@ -87,6 +87,86 @@ fn ms(seconds: Option<f64>) -> u64 {
     (seconds.unwrap_or_default().max(0.0) * 1000.0).round() as u64
 }
 
+/// A report window split at whole hours: the hourly rollups cover `hours` (start
+/// inclusive, end exclusive, in epoch seconds) and the raw transfers cover the partial
+/// hours at either edge, each an inclusive `ended_at` range.
+struct Split {
+    hours: (i64, i64),
+    edges: [(i64, i64); 2],
+}
+
+impl Split {
+    const HOUR: i64 = 3600;
+
+    fn new(start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
+        let first = start.timestamp().div_euclid(Self::HOUR) * Self::HOUR;
+        let full_start = if start.timestamp() == first && start.timestamp_subsec_nanos() == 0 {
+            first
+        } else {
+            first + Self::HOUR
+        };
+        let full_end = end.timestamp().div_euclid(Self::HOUR) * Self::HOUR;
+        // Stored times are nanoseconds, clamped like `timestamp` outside i64.
+        let nanos = |seconds: i64| {
+            seconds
+                .checked_mul(1_000_000_000)
+                .unwrap_or(if seconds < 0 { i64::MIN } else { i64::MAX })
+        };
+        let (start, end) = (timestamp(start), timestamp(end));
+        Self {
+            hours: (full_start, full_end),
+            // Each edge has a single lower and upper bound for the date index.
+            edges: [
+                (start, end.min(nanos(full_start).saturating_sub(1))),
+                (nanos(full_start.max(full_end)), end),
+            ],
+        }
+    }
+
+    /// Binds `?1` to `?6`.
+    fn params(&self) -> [i64; 6] {
+        let Self { hours, edges } = self;
+        [
+            hours.0, hours.1, edges[0].0, edges[0].1, edges[1].0, edges[1].1,
+        ]
+    }
+}
+
+/// The rows of a split window: `rollup` over whole hours, then `raw` (the same columns,
+/// computed per transfer) over the edges where `filter` holds. Binds `?1` to `?6`.
+fn windowed(rollup: &str, raw: &str, filter: &str) -> String {
+    format!(
+        "{rollup} WHERE hour >= ?1 AND hour < ?2
+         UNION ALL {raw} FROM transfers WHERE ended_at BETWEEN ?3 AND ?4 AND {filter}
+         UNION ALL {raw} FROM transfers WHERE ended_at BETWEEN ?5 AND ?6 AND {filter}"
+    )
+}
+
+/// Completed transfers by direction, state and user (`transfer_user_hours`).
+fn user_rows() -> String {
+    windowed(
+        "SELECT direction, state, username, files, bytes, speed, wait, waits, duration, durations
+         FROM transfer_user_hours",
+        "SELECT direction, state, username, 1, size, average_speed,
+            started_at - enqueued_at + 0.0, started_at - enqueued_at IS NOT NULL,
+            ended_at - started_at + 0.0, ended_at - started_at IS NOT NULL",
+        concat!("state IN (", completed_states!(), ")"),
+    )
+}
+
+/// The averages over [`user_rows`]: speed, then wait and duration in seconds.
+const USER_AVERAGES: &str = "SUM(speed) / SUM(files),
+    SUM(wait) / NULLIF(SUM(waits), 0) / 1e9, SUM(duration) / NULLIF(SUM(durations), 0) / 1e9";
+
+/// A failed transfer's error without its exception type ('' for none), as
+/// `transfer_error_hours` keeps it.
+const ERROR_TEXT: &str = "coalesce(CASE WHEN instr(exception, ':') > 0
+    THEN substr(exception, instr(exception, ':') + 2) ELSE exception END, '')";
+
+/// A transfer's folder, as `transfer_directory_hours` keeps it.
+const DIRECTORY: &str =
+    r"rtrim(rtrim(filename, replace(replace(filename, '/', ''), '\', '')), '/\')";
+
 #[derive(Clone)]
 pub struct ReportsService {
     database: Database,
@@ -118,19 +198,18 @@ impl ReportsService {
         direction: Option<&str>,
         username: Option<&str>,
     ) -> anyhow::Result<TransferSummaryReport> {
-        let (start, end) = (timestamp(start), timestamp(end));
+        let split = Split::new(start, end);
         let direction = direction.map(str::to_owned);
         let username = username.map(str::to_owned);
         self.database.call(move |db| {
-            let mut stmt = db.prepare_cached(concat!(
-                "SELECT direction, state, SUM(size), COUNT(*), COUNT(DISTINCT username), AVG(average_speed),
-                    AVG(started_at - enqueued_at) / 1e9,
-                    AVG(ended_at - started_at) / 1e9
-                 FROM transfers WHERE ended_at BETWEEN ?1 AND ?2
-                    AND state IN (", completed_states!(), ") AND (?3 IS NULL OR direction = ?3)
-                    AND (?4 IS NULL OR username = ?4) GROUP BY direction, state"
+            let mut stmt = db.prepare_cached(&format!(
+                "SELECT direction, state, SUM(bytes), SUM(files), COUNT(DISTINCT username), {USER_AVERAGES}
+                 FROM ({}) WHERE (?7 IS NULL OR direction = ?7) AND (?8 IS NULL OR username = ?8)
+                 GROUP BY direction, state",
+                user_rows()
             ))?;
-            let mut rows = stmt.query(rusqlite::params![start, end, direction, username])?;
+            let [a, b, c, d, e, f] = split.params();
+            let mut rows = stmt.query(rusqlite::params![a, b, c, d, e, f, direction, username])?;
             let mut report = empty_summary();
             while let Some(row) = rows.next()? {
                 let direction = api_direction(&row.get::<_, String>(0)?);
@@ -217,44 +296,21 @@ impl ReportsService {
         end: DateTime<Utc>,
         seconds: i64,
     ) -> anyhow::Result<TransferHistogram> {
-        const HOUR: i64 = 3600;
-        let first = start.timestamp().div_euclid(HOUR) * HOUR;
-        let full_start = if start == utc(first, 0) {
-            first
-        } else {
-            first + HOUR
-        };
-        let full_end = end.timestamp().div_euclid(HOUR) * HOUR;
-        // Give both edge scans a single lower and upper bound for the date index.
-        let bounds = (
-            timestamp(start),
-            timestamp(end.min(utc(full_start, 0) - Duration::nanoseconds(1))),
-            timestamp(utc(full_start.max(full_end), 0)),
-            timestamp(end),
-        );
+        let split = Split::new(start, end);
         self.database
             .call(move |db| {
                 let mut histogram = empty_histogram(start, end, seconds);
-                let mut stmt = db.prepare_cached(concat!(
-                    "SELECT hour / ?1 * ?1, direction, state, SUM(bytes), SUM(files) FROM (
-                    SELECT hour, direction, state, bytes, files FROM transfer_chart_hours
-                    WHERE hour >= ?2 AND hour < ?3
-                    UNION ALL
-                    SELECT ended_at / 3600000000000 * 3600, direction, state, size, 1
-                    FROM transfers WHERE ended_at BETWEEN ?4 AND ?5
-                      AND state IN (",
-                    completed_states!(),
-                    ")
-                    UNION ALL
-                    SELECT ended_at / 3600000000000 * 3600, direction, state, size, 1
-                    FROM transfers WHERE ended_at BETWEEN ?6 AND ?7 AND state IN (",
-                    completed_states!(),
-                    ")
-                ) GROUP BY 1, 2, 3"
+                let mut stmt = db.prepare_cached(&format!(
+                    "SELECT hour / ?7 * ?7, direction, state, SUM(bytes), SUM(files) FROM ({})
+                     GROUP BY 1, 2, 3",
+                    windowed(
+                        "SELECT hour, direction, state, bytes, files FROM transfer_chart_hours",
+                        "SELECT ended_at / 3600000000000 * 3600, direction, state, size, 1",
+                        concat!("state IN (", completed_states!(), ")"),
+                    )
                 ))?;
-                let mut rows = stmt.query(rusqlite::params![
-                    seconds, full_start, full_end, bounds.0, bounds.1, bounds.2, bounds.3
-                ])?;
+                let [a, b, c, d, e, f] = split.params();
+                let mut rows = stmt.query(rusqlite::params![a, b, c, d, e, f, seconds])?;
                 while let Some(row) = rows.next()? {
                     let Some(summary) = DateTime::from_timestamp(row.get(0)?, 0)
                         .and_then(|at| histogram.get_mut(&at))
@@ -289,7 +345,7 @@ impl ReportsService {
         offset: i64,
     ) -> anyhow::Result<TransferLeaderboard> {
         let dir = direction.to_owned();
-        let (start, end) = (timestamp(start), timestamp(end));
+        let split = Split::new(start, end);
         let field = match sort {
             LeaderboardSortBy::Count => "count",
             LeaderboardSortBy::TotalBytes => "total_bytes",
@@ -300,20 +356,36 @@ impl ReportsService {
         } else {
             "DESC"
         };
-        self.database.call(move |db| {
-            let sql = format!(
-                "SELECT username, SUM(size) AS total_bytes, COUNT(*) AS count, AVG(average_speed) AS average_speed,
-                    AVG(started_at - enqueued_at) / 1e9,
-                    AVG(ended_at - started_at) / 1e9
-                 FROM transfers WHERE direction = ?1 AND state = 48 AND ended_at BETWEEN ?2 AND ?3
-                 GROUP BY username ORDER BY {field} {ordering}, username DESC LIMIT ?4 OFFSET ?5"
-            );
-            let mut stmt = db.prepare_cached(&sql)?;
-            let mut rows = stmt.query(rusqlite::params![dir, start, end, limit, offset])?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? { out.push(TransferSummary { username: row.get(0)?, total_bytes: row.get(1)?, count: row.get(2)?, average_speed: row.get::<_, Option<f64>>(3)?.unwrap_or_default(), average_wait_ms: ms(row.get(4)?), average_duration_ms: ms(row.get(5)?), ..Default::default() }); }
-            Ok(out)
-        }).await
+        self.database
+            .call(move |db| {
+                let sql = format!(
+                    "SELECT username, SUM(bytes) AS total_bytes, SUM(files) AS count,
+                    SUM(speed) / SUM(files) AS average_speed,
+                    SUM(wait) / NULLIF(SUM(waits), 0) / 1e9,
+                    SUM(duration) / NULLIF(SUM(durations), 0) / 1e9
+                 FROM ({}) WHERE direction = ?7 AND state = 48
+                 GROUP BY username ORDER BY {field} {ordering}, username DESC LIMIT ?8 OFFSET ?9",
+                    user_rows()
+                );
+                let mut stmt = db.prepare_cached(&sql)?;
+                let [a, b, c, d, e, f] = split.params();
+                let mut rows =
+                    stmt.query(rusqlite::params![a, b, c, d, e, f, dir, limit, offset])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    out.push(TransferSummary {
+                        username: row.get(0)?,
+                        total_bytes: row.get(1)?,
+                        count: row.get(2)?,
+                        average_speed: row.get::<_, Option<f64>>(3)?.unwrap_or_default(),
+                        average_wait_ms: ms(row.get(4)?),
+                        average_duration_ms: ms(row.get(5)?),
+                        ..Default::default()
+                    });
+                }
+                Ok(out)
+            })
+            .await
     }
 
     pub async fn errors(
@@ -359,19 +431,38 @@ impl ReportsService {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<TransferErrorSummary>> {
-        let (direction, start, end, username) = (
+        let (direction, split, username) = (
             direction.to_owned(),
-            timestamp(start),
-            timestamp(end),
+            Split::new(start, end),
             username.map(str::to_owned),
         );
-        self.database.call(move |db| {
-            let mut stmt = db.prepare_cached("SELECT CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END, COUNT(*), COUNT(DISTINCT username) FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) GROUP BY 1 ORDER BY COUNT(*) DESC, 1 LIMIT ?5 OFFSET ?6")?;
-            let mut rows = stmt.query(rusqlite::params![direction, start, end, username, limit, offset])?;
-            let mut out = Vec::new();
-            while let Some(r) = rows.next()? { out.push(TransferErrorSummary { error: r.get(0)?, count: r.get(1)?, distinct_users: r.get(2)? }); }
-            Ok(out)
-        }).await
+        self.database
+            .call(move |db| {
+                let mut stmt = db.prepare_cached(&format!(
+                    "SELECT NULLIF(error, ''), SUM(files), COUNT(DISTINCT username) FROM ({})
+                 WHERE direction = ?7 AND (?8 IS NULL OR username = ?8)
+                 GROUP BY error ORDER BY SUM(files) DESC, error LIMIT ?9 OFFSET ?10",
+                    windowed(
+                        "SELECT direction, error, username, files FROM transfer_error_hours",
+                        &format!("SELECT direction, {ERROR_TEXT}, username, 1"),
+                        "(state & ~48) != 0",
+                    )
+                ))?;
+                let [a, b, c, d, e, f] = split.params();
+                let mut rows = stmt.query(rusqlite::params![
+                    a, b, c, d, e, f, direction, username, limit, offset
+                ])?;
+                let mut out = Vec::new();
+                while let Some(r) = rows.next()? {
+                    out.push(TransferErrorSummary {
+                        error: r.get(0)?,
+                        count: r.get(1)?,
+                        distinct_users: r.get(2)?,
+                    });
+                }
+                Ok(out)
+            })
+            .await
     }
 
     pub async fn user_report(
@@ -431,14 +522,20 @@ impl ReportsService {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<TransferDirectorySummary>> {
-        let (start, end, username) = (
-            timestamp(start),
-            timestamp(end),
-            username.map(str::to_owned),
-        );
+        let (split, username) = (Split::new(start, end), username.map(str::to_owned));
         self.database.call(move |db| {
-            let mut stmt = db.prepare_cached("WITH dirs AS (SELECT rtrim(rtrim(filename, replace(replace(filename,'/',''),'\\','')), '/\\') AS directory, username FROM transfers WHERE direction='Upload' AND state=48 AND ended_at IS NOT NULL AND ended_at >= ?1 AND ended_at <= ?2 AND (?3 IS NULL OR username=?3)) SELECT directory, COUNT(*), COUNT(DISTINCT username) FROM dirs GROUP BY directory ORDER BY COUNT(DISTINCT username) DESC, COUNT(*) DESC, directory LIMIT ?4 OFFSET ?5")?;
-            let mut rows = stmt.query(rusqlite::params![start, end, username, limit, offset])?;
+            let mut stmt = db.prepare_cached(&format!(
+                "SELECT directory, SUM(files), COUNT(DISTINCT username) FROM ({})
+                 WHERE ?7 IS NULL OR username = ?7 GROUP BY directory
+                 ORDER BY COUNT(DISTINCT username) DESC, SUM(files) DESC, directory LIMIT ?8 OFFSET ?9",
+                windowed(
+                    "SELECT directory, username, files FROM transfer_directory_hours",
+                    &format!("SELECT {DIRECTORY}, username, 1"),
+                    "direction = 'Upload' AND state = 48",
+                )
+            ))?;
+            let [a, b, c, d, e, f] = split.params();
+            let mut rows = stmt.query(rusqlite::params![a, b, c, d, e, f, username, limit, offset])?;
             let mut out = Vec::new();
             while let Some(r) = rows.next()? { out.push(TransferDirectorySummary { directory: r.get(0)?, count: r.get(1)?, distinct_users: r.get(2)? }); }
             Ok(out)
@@ -994,5 +1091,134 @@ mod tests {
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].directory.as_deref(), Some(r"music\album"));
         assert_eq!((dirs[0].count, dirs[0].distinct_users), (2, 2));
+    }
+
+    /// Each rollup table, sorted, and what the migration's backfill makes of `transfers`.
+    fn rollups(db: &rusqlite::Connection) -> Vec<(Vec<String>, Vec<String>)> {
+        let backfill = include_str!("../transfers/migrations/report_hours.sql");
+        let dump = |sql: &str| -> Vec<String> {
+            let mut stmt = db.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            let mut rows: Vec<String> = stmt
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| {
+                            row.get::<_, rusqlite::types::Value>(i)
+                                .map(|v| format!("{v:?}"))
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|values| values.join("|"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.sort();
+            rows
+        };
+        [
+            "transfer_user_hours",
+            "transfer_error_hours",
+            "transfer_directory_hours",
+        ]
+        .into_iter()
+        .map(|table| {
+            let marker = format!("INSERT INTO {table}\nSELECT");
+            let start = backfill.find(&marker).unwrap() + marker.len() - "SELECT".len();
+            let end = start + backfill[start..].find(';').unwrap();
+            (
+                dump(&format!("SELECT * FROM {table}")),
+                dump(&backfill[start..end]),
+            )
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn report_hours_follow_transfer_changes() {
+        let (reports, _directory) = fixture();
+        let hour = |h: i64| stored("2026-01-01T00:00:00Z") + h * 3_600_000_000_000;
+        let changes = format!(
+            "INSERT INTO transfers (id, username, direction, filename, size, state, requested_at,
+                 enqueued_at, started_at, ended_at, average_speed, exception) VALUES
+                 ('u3', 'carol', 'Upload', 'music\\other\\a.flac', 5, 48, 0, {e}, {s}, {a}, 3, NULL),
+                 ('u4', 'carol', 'Upload', 'music\\other\\b.flac', 6, 272, 0, NULL, NULL, {b}, 0, 'X: timed out'),
+                 ('u5', 'dave', 'Upload', 'music/other/c.flac', 7, 2, 0, NULL, NULL, NULL, 0, NULL);
+             UPDATE transfers SET state = 48, ended_at = {b}, started_at = {b} - 3000000000, average_speed = 2 WHERE id = 'u5';
+             UPDATE transfers SET state = 1040, exception = 'Y: gone' WHERE id = 'u1';
+             UPDATE transfers SET username = 'erin', filename = 'music\\moved\\two.flac' WHERE id = 'u2';
+             UPDATE transfers SET ended_at = NULL, state = 2 WHERE id = 'd3';
+             DELETE FROM transfers WHERE id IN ('d2', 'u4');",
+            e = hour(1),
+            s = hour(1) + 2_000_000_000,
+            a = hour(1) + 5_000_000_000,
+            b = hour(2) + 1,
+        );
+        let tables = reports
+            .database
+            .call(move |db| {
+                let before = rollups(db);
+                db.execute_batch(&changes)?;
+                Ok((before, rollups(db)))
+            })
+            .await
+            .unwrap();
+        for (kept, recomputed) in [tables.0, tables.1].into_iter().flatten() {
+            assert!(!recomputed.is_empty());
+            assert_eq!(kept, recomputed);
+        }
+
+        // Whole hours come from the rollups and the edges from the transfers.
+        let start = START - Duration::minutes(30);
+        let end = START + Duration::hours(2) + Duration::minutes(30);
+        let summary = reports
+            .summary(start, end, Some("Upload"), None)
+            .await
+            .unwrap();
+        let succeeded = &summary[&TransferDirection::Upload][&TransferState::Succeeded];
+        assert_eq!(
+            (
+                succeeded.count,
+                succeeded.total_bytes,
+                succeeded.distinct_users
+            ),
+            (3, 82, 3)
+        );
+        assert_eq!(succeeded.average_speed, 4.0);
+        assert_eq!(succeeded.average_wait_ms, 2000);
+        assert_eq!(succeeded.average_duration_ms, 3000);
+        let top = reports
+            .leaderboard(
+                "Upload",
+                start,
+                end,
+                LeaderboardSortBy::TotalBytes,
+                SortOrder::Desc,
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (top[0].username.as_deref(), top[0].total_bytes),
+            (Some("erin"), 70)
+        );
+        let errors = reports
+            .error_pareto("Upload", start, end, None, 25, 0)
+            .await
+            .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            (errors[0].error.as_deref(), errors[0].count),
+            (Some("gone"), 1)
+        );
+        let dirs = reports.directories(start, end, None, 25, 0).await.unwrap();
+        let dirs: Vec<_> = dirs
+            .iter()
+            .map(|d| (d.directory.as_deref().unwrap(), d.count))
+            .collect();
+        assert_eq!(
+            dirs,
+            [("music/other", 1), (r"music\moved", 1), (r"music\other", 1)]
+        );
     }
 }

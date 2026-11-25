@@ -330,6 +330,15 @@ CREATE INDEX ix_transfers_listed_file ON transfers(direction, username, filename
 `TransferState` enum, and `state_description` holds the enum name for humans.
 `exception` holds the failure as `Kind: message`; the API calls it `error`.
 
+Reports read hourly rollups that triggers on `transfers` keep current:
+`transfer_chart_hours` (chart), `transfer_user_hours` (summary, leaderboards, user report),
+`transfer_error_hours` (error types) and `transfer_directory_hours` (popular folders).
+A window reads its whole hours from them and only the transfers of the partial hours at
+its edges (`telemetry::reports::Split`), so a year of history costs tens of thousands of
+rows rather than every transfer. A change to what a report counts must change its rollup,
+its triggers and its backfill together; `report_hours_follow_transfer_changes` checks that
+the triggers agree with the backfill.
+
 Upload backoff (`transfers/backoff.rs`): after two failures in a row of one file to one
 user, the next upload of it waits queued (`next_attempt_at` set, no slot held) for 1 min,
 doubling to 1 h. Peers that re-queue on every `UploadFailed` otherwise loop every few
