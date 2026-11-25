@@ -33,6 +33,8 @@ const INDIRECT_HEAD_START: Duration = Duration::from_secs(1);
 /// reverse connection at once.
 const UNREACHABLE_TTL: Duration = Duration::from_secs(30 * 60);
 const UNREACHABLE_CAPACITY: usize = 4096;
+const ABANDONED_TTL: Duration = Duration::from_secs(5 * 60);
+const ABANDONED_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -62,7 +64,17 @@ impl Kind {
 struct Solicitation {
     id: u64,
     username: String,
+    kind: Kind,
     result: oneshot::Sender<Result<Connection>>,
+}
+
+/// A solicitation that timed out, remembered for
+/// [`ABANDONED_TTL`] so a reverse connection that arrives too late is logged with how
+/// late it was, rather than dropped unseen.
+struct Abandoned {
+    username: String,
+    kind: Kind,
+    at: Instant,
 }
 
 /// Removes only its own entry on timeout, cancellation, or a direct win.
@@ -70,6 +82,8 @@ struct PendingSolicitation<'a> {
     manager: &'a PeerManager,
     token: u32,
     id: u64,
+    /// The peer did not connect back in time; only these are remembered as abandoned.
+    timed_out: bool,
 }
 
 impl Drop for PendingSolicitation<'_> {
@@ -79,8 +93,10 @@ impl Drop for PendingSolicitation<'_> {
             .solicitations
             .get(&self.token)
             .is_some_and(|entry| entry.id == self.id)
+            && let Some(entry) = state.solicitations.remove(&self.token)
+            && self.timed_out
         {
-            state.solicitations.remove(&self.token);
+            state.abandon(self.token, entry);
         }
     }
 }
@@ -113,12 +129,31 @@ struct State {
     message_dials: HashMap<String, Arc<MessageDial>>,
     reverse_message_dials: HashMap<String, Arc<CancellationToken>>,
     solicitations: HashMap<u32, Solicitation>,
+    abandoned: HashMap<u32, Abandoned>,
     next_solicitation_id: u64,
     /// Users whose last direct dial failed, until when to skip the head start.
     unreachable: HashMap<String, Instant>,
 }
 
 impl State {
+    fn abandon(&mut self, token: u32, entry: Solicitation) {
+        let now = Instant::now();
+        if self.abandoned.len() >= ABANDONED_CAPACITY {
+            self.abandoned
+                .retain(|_, abandoned| now.duration_since(abandoned.at) < ABANDONED_TTL);
+        }
+        if self.abandoned.len() < ABANDONED_CAPACITY {
+            self.abandoned.insert(
+                token,
+                Abandoned {
+                    username: entry.username,
+                    kind: entry.kind,
+                    at: now,
+                },
+            );
+        }
+    }
+
     fn is_unreachable(&self, username: &str) -> bool {
         self.unreachable
             .get(username)
@@ -418,6 +453,7 @@ impl PeerManager {
                 Solicitation {
                     id,
                     username: username.to_owned(),
+                    kind,
                     result: send,
                 },
             );
@@ -426,11 +462,13 @@ impl PeerManager {
                     manager: self,
                     token,
                     id,
+                    timed_out: false,
                 },
                 result,
             )
         };
-        tokio::time::timeout(timeout, async {
+        let mut pending = pending;
+        let answered = tokio::time::timeout(timeout, async {
             client
                 .inner()
                 .send_server(
@@ -444,8 +482,9 @@ impl PeerManager {
                 .await?;
             result.await.map_err(|_| disconnected())?
         })
-        .await
-        .map_err(|_| {
+        .await;
+        pending.timed_out = answered.is_err();
+        answered.map_err(|_| {
             Error::Timeout(format!(
                 "{username} did not connect back within {} s",
                 timeout.as_secs()
@@ -490,9 +529,20 @@ impl PeerManager {
         token: u32,
         conn: Connection,
     ) {
-        if let Some(pending) = self.lock().solicitations.remove(&token) {
+        let mut state = self.lock();
+        if let Some(pending) = state.solicitations.remove(&token) {
             // The initiating operation already knows whether this is a P, F or D socket.
             let _ = pending.result.send(Ok(conn));
+        } else if let Some(late) = state.abandoned.remove(&token) {
+            let late_ms = late.at.elapsed().as_millis() as u64;
+            if late.at.elapsed() < ABANDONED_TTL {
+                tracing::info!(
+                    username = %late.username,
+                    kind = late.kind.code(),
+                    late_ms,
+                    "peer connected back after the solicitation was given up"
+                );
+            }
         }
     }
 
@@ -1412,6 +1462,32 @@ mod dial_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn only_timed_out_solicitations_are_remembered_for_late_answers() {
+        let manager = PeerManager::new();
+        for (token, timed_out) in [(7, true), (8, false)] {
+            let (result, _) = oneshot::channel();
+            manager.lock().solicitations.insert(
+                token,
+                Solicitation {
+                    id: 1,
+                    username: "remote".into(),
+                    kind: Kind::File,
+                    result,
+                },
+            );
+            drop(PendingSolicitation {
+                manager: &manager,
+                token,
+                id: 1,
+                timed_out,
+            });
+        }
+        let state = manager.lock();
+        assert!(state.solicitations.is_empty());
+        assert_eq!(state.abandoned.keys().collect::<Vec<_>>(), [&7]);
     }
 
     #[tokio::test]

@@ -103,7 +103,7 @@ Core listener (`net/listener.rs`), after reading the first init frame:
 * `PeerInit { connection_type: "P" }` -> `peers.handle_incoming_peer_init(&client, username, token, conn: Connection)`
 * `PeerInit { "F" }` -> `transfers.handle_incoming_transfer_connection(&client, username, conn: Connection)` (reads the u32 token itself)
 * `PeerInit { "D" }` -> `distributed.handle_incoming_child(&client, username, conn: Connection)`
-* `PierceFirewall { token }` -> `peers.handle_pierce_firewall(&client, token, conn: Connection)` (PeerManager owns the solicitation registry for P, F and D)
+* `PierceFirewall { token }` -> `peers.handle_pierce_firewall(&client, token, conn: Connection)` (PeerManager owns the solicitation registry for P, F and D). A solicitation that times out is remembered for 5 min; a PierceFirewall for it is logged ("peer connected back after the solicitation was given up", with `late_ms`) and dropped
 
 Peers provides:
 * `peers.get_message_connection(&client, username: &str, cancel: &CancellationToken) -> Result<MessageConnection>`
