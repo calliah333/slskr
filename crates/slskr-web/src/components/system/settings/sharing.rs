@@ -328,13 +328,15 @@ pub fn Groups() -> impl IntoView {
 pub fn Blacklist() -> impl IntoView {
     view! {
         <Section id="settings-blacklist" title="Blacklist"
-            description="Users who can not search, browse or download from you.">
+            description="Users who can not search, browse or download from you. Failed uploads to them are deleted from the history.">
             <Setting key="blacklist.users" label="Users" kind=Kind::List("Username, then Enter")
                 help="Exact usernames, case-insensitive."/>
             <Setting key="blacklist.patterns" label="Username patterns" kind=Kind::MonoList("e.g. spam*, then Enter")
                 help="Wildcards * and ?, case-insensitive."/>
             <Setting key="blacklist.cidrs" label="IP ranges" kind=Kind::MonoList("e.g. 203.0.113.0/24, then Enter")
                 help="Search responses and downloads also check the peer's address."/>
+            <Setting key="blacklist.ban_upload_loops" label="Ban looping peers" kind=Kind::Toggle
+                help="Add a user here when their client has been requesting files and dropping them before any data, over and over for a day, without one completing. Unreachable or slow users are never banned."/>
         </Section>
     }
 }

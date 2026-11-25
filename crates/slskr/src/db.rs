@@ -184,6 +184,12 @@ impl Database {
         }
     }
 
+    /// Gives free pages back to the file system now if they are a tenth of the file, after
+    /// a large delete.
+    pub async fn release_free_pages(&self) -> anyhow::Result<()> {
+        self.call(|connection| release_free_pages(connection)).await
+    }
+
     /// Runs [`maintain`] now.
     #[cfg(test)]
     pub(crate) async fn maintain_now(&self) -> anyhow::Result<()> {

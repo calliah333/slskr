@@ -2,6 +2,7 @@
 
 mod api;
 mod backoff;
+mod bans;
 mod destination;
 mod folder;
 mod queue;
@@ -241,6 +242,8 @@ impl TransferService {
                 Ok((history, downloads)) => {
                     service.recover(&app, history, downloads).await;
                     service.0.ready.send_replace(Some(Ok(())));
+                    let pruner = service.clone();
+                    tokio::spawn(async move { pruner.prune_banned().await });
                 }
                 Err(error) => {
                     tracing::error!(%error, "could not initialize transfers");
@@ -250,6 +253,7 @@ impl TransferService {
             }
 
             let mut options = service.0.core.options.subscribe();
+            let mut blacklist = options.borrow().blacklist.clone();
             let mut progress = tokio::time::interval(Duration::from_millis(250));
             let mut retention = tokio::time::interval(Duration::from_secs(60));
             progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -285,6 +289,12 @@ impl TransferService {
                             }
                         }
                         runtime.uploads.dispatch(&service.0.users, &cfg, service.upload_slots(&cfg));
+                        drop(runtime);
+                        if cfg.blacklist != blacklist {
+                            blacklist = cfg.blacklist.clone();
+                            let pruner = service.clone();
+                            tokio::spawn(async move { pruner.prune_banned().await });
+                        }
                     }
                 }
             }
@@ -1030,7 +1040,7 @@ impl TransferService {
     }
 
     async fn finish(&self, id: &str, result: soulseek::Result<PathBuf>) {
-        let (transfer, last) = {
+        let (transfer, last, ban) = {
             let cfg = self.0.core.options.get();
             let mut runtime = self.runtime();
             let Some(entry) = runtime.active.get_mut(id) else {
@@ -1041,6 +1051,7 @@ impl TransferService {
                 return;
             }
             let t = &mut entry.transfer;
+            let aborted = peer_aborted(t.state, &result);
             let (disposition, reason) = match &result {
                 Ok(_) => (TransferState::Succeeded, None),
                 Err(error) => (failure_state(error), Some(exception_text(error))),
@@ -1057,7 +1068,7 @@ impl TransferService {
             if transfer.direction == TransferDirection::Upload {
                 runtime.uploads.release(id);
                 runtime.history.record(&transfer);
-                runtime.backoff.record(&transfer, offset);
+                runtime.backoff.record(&transfer, offset, aborted);
                 runtime
                     .uploads
                     .dispatch(&self.0.users, &cfg, self.upload_slots(&cfg));
@@ -1079,10 +1090,16 @@ impl TransferService {
                         && t.username == transfer.username
                         && destination::remote_directory(&t.filename) == directory
                 });
-            (transfer, last)
+            let ban = transfer.direction == TransferDirection::Upload
+                && disposition != TransferState::Succeeded
+                && self.loop_ban_due(&mut runtime, &cfg, &transfer.username);
+            (transfer, last, ban)
         };
         self.flush().await;
         log_outcome(&transfer, &result);
+        if ban {
+            self.ban_looping_user(transfer.username.clone());
+        }
         if let Ok(local) = result {
             self.raise_completed(transfer, local, last);
         }
@@ -1479,6 +1496,23 @@ fn retryable(error: &Error) -> bool {
             | Error::TransferReportedFailed(_)
     )
 }
+
+/// Whether a failed upload was the peer accepting it and then closing the file connection
+/// before asking for any data (instead of sending the resume offset). Only this counts
+/// towards the automatic ban: it is what broken or abusive clients loop on, while failing
+/// to reach the peer, a refusal, a timeout, a dropped connection mid-file (a bad link, on
+/// either side) and errors reading the file here can all happen to well-behaved users.
+fn peer_aborted(prior: TransferState, result: &soulseek::Result<PathBuf>) -> bool {
+    matches!(
+        (prior, result),
+        (TransferState::Initializing, Err(Error::Connection(message)))
+            if message.starts_with(UPLOAD_OFFSET_FAILURE)
+    )
+}
+
+/// How the client words a peer closing the file connection before the resume offset
+/// (`soulseek::client::transfers::stream::upload`).
+const UPLOAD_OFFSET_FAILURE: &str = "Could not read the upload resume offset";
 
 fn failure_state(error: &Error) -> TransferState {
     match error {

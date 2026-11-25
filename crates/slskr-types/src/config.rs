@@ -435,7 +435,7 @@ impl QueueStrategy {
 }
 
 /// `[blacklist]`: users refused every service.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BlacklistConfig {
     /// Usernames, case-insensitive.
@@ -444,6 +444,20 @@ pub struct BlacklistConfig {
     pub patterns: Vec<String>,
     /// IP ranges. When set, search responses and downloads also look up the peer's address.
     pub cidrs: Vec<String>,
+    /// Add a user to `users` when their client keeps accepting uploads and dropping them
+    /// before any data, for a day, on several files, with none succeeding.
+    pub ban_upload_loops: bool,
+}
+
+impl Default for BlacklistConfig {
+    fn default() -> Self {
+        Self {
+            users: Vec::new(),
+            patterns: Vec::new(),
+            cidrs: Vec::new(),
+            ban_upload_loops: true,
+        }
+    }
 }
 
 /// `[search]`: incoming search requests.

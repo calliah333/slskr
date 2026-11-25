@@ -163,13 +163,16 @@ user-defined groups only in the UI or the file.
 
 ## `[blacklist]`
 
-Users refused searches, browsing and transfers.
+Users refused searches, browsing and transfers. Failed and cancelled uploads to blacklisted
+users are deleted from the transfer history when the blacklist changes and at startup;
+their successful uploads stay for the reports.
 
 | Key | Default | Environment | Restart | Description |
 | --- | --- | --- | --- | --- |
 | `blacklist.users` | `[]` | `SLSKR_BLACKLIST_USERS` | | Usernames, case-insensitive. |
 | `blacklist.patterns` | `[]` | `SLSKR_BLACKLIST_PATTERNS` | | Username wildcards with `*` and `?`, case-insensitive. |
 | `blacklist.cidrs` | `[]` | `SLSKR_BLACKLIST_CIDRS` | | IP ranges; when set, search responses and downloads also check the peer's address. |
+| `blacklist.ban_upload_loops` | `true` | `SLSKR_BLACKLIST_BAN_UPLOAD_LOOPS` | | Adds a user to `blacklist.users` once five of their files have each been accepted and then dropped before any data 20 times over at least 24 hours, with no upload to them succeeding meanwhile. Unreachable or slow peers, refusals and connections lost mid-file never count; the own account and privileged users are never banned. Each ban is logged and can be undone by removing the name. |
 
 ## `[search]`
 
