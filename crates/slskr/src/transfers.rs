@@ -5,6 +5,7 @@ mod backoff;
 mod bans;
 mod destination;
 mod folder;
+mod inserts;
 mod queue;
 mod store;
 
@@ -78,6 +79,7 @@ struct Inner {
     list_revisions: [AtomicU64; 2],
     runtime: Mutex<Runtime>,
     writes: tokio::sync::Mutex<()>,
+    upload_inserts: Mutex<inserts::UploadInserts>,
     ready: watch::Sender<Option<Result<(), String>>>,
     download_requests: Semaphore,
 }
@@ -229,6 +231,7 @@ impl TransferService {
             list_revisions: Default::default(),
             runtime: Mutex::default(),
             writes: tokio::sync::Mutex::new(()),
+            upload_inserts: Mutex::default(),
             ready: watch::channel(None).0,
             download_requests: Semaphore::new(2),
         })))
@@ -671,15 +674,10 @@ impl TransferService {
         slot: oneshot::Receiver<()>,
     ) {
         let id = &transfer.id;
-        let inserted = store::insert(self.database(), vec![transfer.clone()]).await;
-        self.wrote(transfer.direction);
-        match inserted {
-            Ok(superseded) => self.publish_removed(superseded),
-            Err(error) => {
-                tracing::warn!(%error, %id, "could not persist queued upload");
-                self.runtime().remove(id);
-                return;
-            }
+        if let Err(error) = self.store_upload(transfer.clone()).await {
+            tracing::warn!(%error, %id, "could not persist queued upload");
+            self.runtime().remove(id);
+            return;
         }
         if let Some(entry) = self.runtime().active.get_mut(id) {
             entry.stored = true;

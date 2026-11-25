@@ -359,6 +359,11 @@ doubling to 1 h. Peers that re-queue on every `UploadFailed` otherwise loop ever
 seconds. A success, or a failure that resumed past the furthest byte reached, resets it;
 records are kept in memory and forgotten after 6 h without a failure.
 
+Queued uploads are stored in groups (`transfers/inserts.rs`): a peer queues a folder as
+one request per file, so each new upload joins a queue and one writer task stores all
+queued rows per transaction (at most 500). Before, a burst of hundreds of single-row
+transactions queued on the writer connection for seconds.
+
 Restarts (`transfers::store::initialize`, `TransferService::recover`): unfinished
 downloads and uploads go back to `queued_locally`, in their stored order; removed ones are
 marked aborted. A requeued upload waits for the server login and the share index, then
