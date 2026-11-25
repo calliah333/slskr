@@ -7,7 +7,6 @@ use std::collections::{HashSet, VecDeque};
 use chrono::{DateTime, Duration, Local, Utc};
 use leptos::prelude::*;
 use leptos_router::components::A;
-use leptos_router::hooks::use_navigate;
 use slskr_types::{
     telemetry::{
         CurrentMetrics, TransferDirectorySummary, TransferErrorDetail, TransferErrorSummary,
@@ -15,14 +14,13 @@ use slskr_types::{
     },
     transfers::{TransferDirection, TransferState},
 };
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
     components::app::AppContext,
     config,
-    services::{api, util},
-    ui::{Alert, Badge, Button, Card, Icon, PageHeader, TabItem, Tabs},
+    services::util,
+    ui::{Alert, Badge, Card, Icon, PageHeader, TabItem, Tabs},
 };
 use charts::{HistoryChart, Sparkline};
 
@@ -201,38 +199,9 @@ pub(crate) fn time_ago(time: DateTime<Utc>) -> impl IntoView {
     view! { <time class="nowrap" datetime=stamp title=full>{relative_time(time)}</time> }
 }
 
-fn new_search_id() -> String {
-    format!(
-        "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
-        (js_sys::Math::random() * u32::MAX as f64) as u32,
-        (js_sys::Math::random() * u16::MAX as f64) as u16,
-        (js_sys::Math::random() * 4096.0) as u16,
-        (js_sys::Math::random() * 4096.0) as u16,
-        (js_sys::Math::random() * 0x1_0000_0000_0000u64 as f64) as u64,
-    )
-}
-
-/// Whether a key press happened in a text field (so `/` types rather than focuses search).
-fn typing(event: &web_sys::KeyboardEvent) -> bool {
-    event
-        .target()
-        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
-        .is_some_and(|element| {
-            matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
-                || element.has_attribute("contenteditable")
-        })
-}
-
 #[component]
 pub fn Dashboard() -> impl IntoView {
     let cache = expect_context::<ReportCache>();
-    let state = expect_context::<AppContext>().state;
-    let connected = Signal::derive(move || state.with(|state| state.server.state.is_connected()));
-    let search = NodeRef::<leptos::html::Input>::new();
-    let navigate = use_navigate();
-    let text = RwSignal::new(String::new());
-    let creating = RwSignal::new(false);
-    let search_error = RwSignal::new(None::<String>);
     let period = RwSignal::new(2_usize);
     let data = Reports::new();
     let tab = RwSignal::new("users".to_owned());
@@ -302,55 +271,6 @@ pub fn Dashboard() -> impl IntoView {
         window
     });
 
-    // `/` focuses the search box from anywhere on the page.
-    let shortcut = window_event_listener(leptos::ev::keydown, move |event| {
-        if event.key() == "/"
-            && !event.ctrl_key()
-            && !event.meta_key()
-            && !event.alt_key()
-            && !typing(&event)
-            && let Some(input) = search.get_untracked()
-        {
-            event.prevent_default();
-            let _ = input.focus();
-        }
-    });
-    on_cleanup(move || shortcut.remove());
-
-    let submit = move || {
-        let phrase = text.get_untracked().trim().to_owned();
-        if phrase.is_empty() || creating.get_untracked() || !connected.get_untracked() {
-            return;
-        }
-        creating.set(true);
-        search_error.set(None);
-        let id = new_search_id();
-        let navigate = navigate.clone();
-        spawn_local(async move {
-            let request = slskr_types::search::SearchRequest {
-                id: Some(id.clone()),
-                query: phrase,
-                ..Default::default()
-            };
-            match api::post::<_, serde_json::Value>("/searches", &request).await {
-                Ok(_) => {
-                    if creating.try_set(false).is_some() {
-                        return;
-                    }
-                    text.set(String::new());
-                    navigate(
-                        &format!("/searches/{}", util::encode_uri_component(&id)),
-                        Default::default(),
-                    );
-                }
-                Err(error) => {
-                    let _ = search_error.try_set(Some(error.to_string()));
-                    let _ = creating.try_set(false);
-                }
-            }
-        });
-    };
-
     let period_items = PERIODS
         .iter()
         .map(|period| TabItem::new(period.label, period.label))
@@ -366,26 +286,6 @@ pub fn Dashboard() -> impl IntoView {
         <div class="dashboard stack">
             <PageHeader title="Overview" description="Live transfers, history and reports."/>
             <LiveStats/>
-            <Card compact=true class="quick-search">
-                <form class="quick-search__form" role="search" aria-label="Search the network"
-                    on:submit=move |ev| { ev.prevent_default(); submit(); }>
-                    <label class="sr-only" for="dashboard-search">"Search phrase"</label>
-                    <div class="input-icon quick-search__field">
-                        <Icon name="search"/>
-                        <input id="dashboard-search" class="input" node_ref=search type="search" autocomplete="off"
-                            placeholder=move || if connected.get() { "Search the Soulseek network…" } else { "Connect to the server to search" }
-                            disabled=move || !connected.get()
-                            prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))/>
-                        <kbd class="kbd quick-search__kbd hide-sm" aria-hidden="true">"/"</kbd>
-                    </div>
-                    <Button variant="primary" button_type="submit" icon="search" text="Search" loading=creating
-                        disabled=Signal::derive(move || !connected.get() || text.with(|text| text.trim().is_empty()))/>
-                </form>
-                {move || (!connected.get()).then(|| view! {
-                    <p class="help quick-search__help">"Searching needs a connection to the Soulseek server. Use the connection button in the header."</p>
-                })}
-                {move || search_error.get().map(|error| view! { <Alert variant="danger" class="quick-search__error">{error}</Alert> })}
-            </Card>
             <Card title="History" description="Completed transfers in the selected period." title_id="history-heading"
                 class="history" actions=ViewFn::from(move || view! {
                     <Tabs items=period_items.clone() value=period_value on_change=pick_period label="History range"/>

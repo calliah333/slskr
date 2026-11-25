@@ -354,7 +354,11 @@ fn TransferDirectory(
     } else {
         directory.clone()
     };
-    let short = if directory.is_empty() { title.clone() } else { label };
+    let short = if directory.is_empty() {
+        title.clone()
+    } else {
+        label
+    };
     let dir = StoredValue::new(directory);
     let ids = Memo::new(move |_| {
         dir.with_value(|dir| {

@@ -34,25 +34,6 @@
   overflow: visible;
 }
 
-/* Quick search: one input with a search icon and the primary button. */
-.quick-search__form { display: flex; align-items: center; gap: var(--space-2); }
-.quick-search__field { position: relative; flex: 1 1 auto; }
-.quick-search__field > .input { padding-right: 2.5rem; }
-.quick-search__kbd {
-  position: absolute;
-  right: 0.625rem;
-  top: 50%;
-  transform: translateY(-50%);
-  color: hsl(var(--muted-foreground));
-  pointer-events: none;
-}
-.quick-search__help,
-.quick-search__error { margin-top: var(--space-3); }
-@media (max-width: 639px) {
-  .quick-search__form { flex-wrap: wrap; }
-  .quick-search__field { flex-basis: 100%; }
-  .quick-search__form > .btn { width: 100%; }
-}
 
 /* History card. */
 .history > .card__header > .card__actions { max-width: 100%; }
