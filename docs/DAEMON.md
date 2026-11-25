@@ -331,8 +331,8 @@ thousands of files, and failures repeat a few hundred texts once `mask_addresses
 the peer addresses in them with `<address>`. Reads go through `transfer_details`; writes
 and filters use the ids. `state` stores the `soulseek::TransferState` bit values
 (`state & 16` is "completed"); `transfers::store::{state_from_bits, state_to_bits}` convert
-them to and from the API's `TransferState` enum. `exception` holds the failure as
-`Kind: message`; the API calls it `error`.
+them to and from the API's `TransferState` enum. `exception` holds the failure message
+(the state says how it failed); the API calls it `error`.
 
 Rows removed from the list (cleared, superseded or pruned by `retention.*`) are deleted
 [`store::PURGE_AFTER`] (30 days) after they ended, by `store::purge` on the retention tick.

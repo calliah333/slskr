@@ -942,7 +942,7 @@ impl TransferService {
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
         t.next_attempt_at = Some(at);
         t.state = TransferState::QueuedLocally;
-        t.error = Some(exception_text(error));
+        t.error = Some(error_text(error));
         entry.touch();
         Some(at)
     }
@@ -1163,7 +1163,7 @@ impl TransferService {
             let aborted = peer_aborted(t.state, &result);
             let (disposition, reason) = match &result {
                 Ok(_) => (TransferState::Succeeded, None),
-                Err(error) => (failure_state(error), Some(exception_text(error))),
+                Err(error) => (failure_state(error), Some(error_text(error))),
             };
             t.state = disposition;
             t.error = reason;
@@ -1680,22 +1680,10 @@ fn log_outcome(t: &Transfer, result: &soulseek::Result<PathBuf>) {
     }
 }
 
-fn exception_text(error: &Error) -> String {
-    let kind = match error {
-        Error::Cancelled => "OperationCanceledException",
-        Error::Timeout(_) => "TimeoutException",
-        Error::NoResponse(_) => "NoResponseException",
-        Error::UserOffline(_) => "UserOfflineException",
-        Error::TransferRejected(_) => "TransferRejectedException",
-        Error::TransferSizeMismatch { .. } => "TransferSizeMismatchException",
-        Error::TransferStream(_) => "TransferStreamException",
-        Error::TransferReportedFailed(_) => "TransferReportedFailedException",
-        Error::Connection(_) => "ConnectionException",
-        Error::Io(_) => "IOException",
-        _ => "TransferException",
-    };
-    // Masked as stored, so the live and stored error agree.
-    store::mask_addresses(&format!("{kind}: {error}")).into_owned()
+/// A failed transfer's error as shown and stored: the message, with peer addresses masked
+/// as stored, so the live and stored error agree.
+fn error_text(error: &Error) -> String {
+    store::mask_addresses(&error.to_string()).into_owned()
 }
 
 #[cfg(test)]

@@ -173,10 +173,22 @@ fn user_hour_rows() -> String {
 const USER_AVERAGES: &str = "SUM(speed) / SUM(files),
     SUM(wait) / NULLIF(SUM(waits), 0) / 1e9, SUM(duration) / NULLIF(SUM(durations), 0) / 1e9";
 
-/// A failed transfer's error without its exception type ('' for none), as
-/// `transfer_error_hours` keeps it.
-const ERROR_TEXT: &str = "coalesce(CASE WHEN instr(exception, ':') > 0
-    THEN substr(exception, instr(exception, ':') + 2) ELSE exception END, '')";
+/// A failed transfer's error ('' for none), as `transfer_error_hours` keeps it.
+const ERROR_TEXT: &str = "coalesce(exception, '')";
+
+/// One page of a report list: at most `limit` rows after skipping `offset`.
+#[derive(Clone, Copy, Debug)]
+pub struct Page {
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl Page {
+    /// The first `limit` rows.
+    const fn first(limit: i64) -> Self {
+        Self { limit, offset: 0 }
+    }
+}
 
 #[derive(Clone)]
 pub struct ReportsService {
@@ -374,9 +386,9 @@ impl ReportsService {
         end: DateTime<Utc>,
         sort: LeaderboardSortBy,
         order: SortOrder,
-        limit: i64,
-        offset: i64,
+        page: Page,
     ) -> anyhow::Result<TransferLeaderboard> {
+        let Page { limit, offset } = page;
         let dir = direction.to_owned();
         let split = Split::new(start, end);
         let field = match sort {
@@ -428,9 +440,9 @@ impl ReportsService {
         end: DateTime<Utc>,
         username: Option<&str>,
         order: SortOrder,
-        limit: i64,
-        offset: i64,
+        page: Page,
     ) -> anyhow::Result<Vec<TransferErrorDetail>> {
+        let Page { limit, offset } = page;
         let (direction, start, end, username) = (
             direction.to_owned(),
             timestamp(start),
@@ -438,7 +450,7 @@ impl ReportsService {
             username.map(str::to_owned),
         );
         self.database.call(move |db| {
-            let sql = format!("SELECT id, username, direction, filename, size, state, requested_at, enqueued_at, started_at, ended_at, bytes_transferred, average_speed, CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END FROM transfer_details WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) ORDER BY ended_at {} LIMIT ?5 OFFSET ?6", if order == SortOrder::Asc { "ASC" } else { "DESC" });
+            let sql = format!("SELECT id, username, direction, filename, size, state, requested_at, enqueued_at, started_at, ended_at, bytes_transferred, average_speed, exception FROM transfer_details WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) ORDER BY ended_at {} LIMIT ?5 OFFSET ?6", if order == SortOrder::Asc { "ASC" } else { "DESC" });
             let mut stmt = db.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![direction, start, end, username, limit, offset])?;
             let mut out = Vec::new();
@@ -461,9 +473,9 @@ impl ReportsService {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         username: Option<&str>,
-        limit: i64,
-        offset: i64,
+        page: Page,
     ) -> anyhow::Result<Vec<TransferErrorSummary>> {
+        let Page { limit, offset } = page;
         let (direction, split, username) = (
             direction.to_owned(),
             Split::new(start, end),
@@ -529,7 +541,13 @@ impl ReportsService {
             .fold(0_u64, u64::saturating_add);
             let cancelled = count(TransferState::Cancelled);
             let errors = self
-                .error_pareto(db_direction(direction), start, end, Some(username), 25, 0)
+                .error_pareto(
+                    db_direction(direction),
+                    start,
+                    end,
+                    Some(username),
+                    Page::first(25),
+                )
                 .await?;
             result.insert(
                 direction,
@@ -553,9 +571,9 @@ impl ReportsService {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         username: Option<&str>,
-        limit: i64,
-        offset: i64,
+        page: Page,
     ) -> anyhow::Result<Vec<TransferDirectorySummary>> {
+        let Page { limit, offset } = page;
         let (split, username) = (Split::new(start, end), username.map(str::to_owned));
         self.database.call(move |db| {
             let mut stmt = db.prepare_cached(&format!(
@@ -634,12 +652,15 @@ impl Window {
             .filter(|value| !value.trim().is_empty())
     }
 
-    fn paging(&self) -> ApiResult<(i64, i64)> {
+    fn paging(&self) -> ApiResult<Page> {
         let limit = self.limit.unwrap_or(25);
         if limit == 0 {
             return Err(bad_request("limit must be greater than zero"));
         }
-        Ok((limit.into(), self.offset.unwrap_or(0).into()))
+        Ok(Page {
+            limit: limit.into(),
+            offset: self.offset.unwrap_or(0).into(),
+        })
     }
 
     /// Bucket width in seconds.
@@ -733,7 +754,7 @@ async fn leaderboard(
 ) -> ApiResult<Json<TransferLeaderboard>> {
     let direction = q.required_direction()?;
     let (start, end) = q.bounds(GENESIS, Utc::now())?;
-    let (limit, offset) = q.paging()?;
+    let page = q.paging()?;
     Ok(Json(
         state
             .services
@@ -745,8 +766,7 @@ async fn leaderboard(
                 end,
                 q.sort_by.unwrap_or_default(),
                 q.sort_order.unwrap_or_default(),
-                limit,
-                offset,
+                page,
             )
             .await?,
     ))
@@ -759,7 +779,7 @@ async fn errors(
 ) -> ApiResult<Json<Vec<TransferErrorDetail>>> {
     let direction = q.required_direction()?;
     let (start, end) = q.bounds(MIN_TIME, MAX_TIME)?;
-    let (limit, offset) = q.paging()?;
+    let page = q.paging()?;
     Ok(Json(
         state
             .services
@@ -771,8 +791,7 @@ async fn errors(
                 end,
                 q.username(),
                 q.sort_order.unwrap_or_default(),
-                limit,
-                offset,
+                page,
             )
             .await?,
     ))
@@ -785,13 +804,13 @@ async fn pareto(
 ) -> ApiResult<Json<Vec<TransferErrorSummary>>> {
     let direction = q.required_direction()?;
     let (start, end) = q.bounds(MIN_TIME, MAX_TIME)?;
-    let (limit, offset) = q.paging()?;
+    let page = q.paging()?;
     Ok(Json(
         state
             .services
             .telemetry
             .reports
-            .error_pareto(direction, start, end, q.username(), limit, offset)
+            .error_pareto(direction, start, end, q.username(), page)
             .await?,
     ))
 }
@@ -822,13 +841,13 @@ async fn directories(
     Query(q): Query<Window>,
 ) -> ApiResult<Json<Vec<TransferDirectorySummary>>> {
     let (start, end) = q.bounds(GENESIS, MAX_TIME)?;
-    let (limit, offset) = q.paging()?;
+    let page = q.paging()?;
     Ok(Json(
         state
             .services
             .telemetry
             .reports
-            .directories(start, end, q.username(), limit, offset)
+            .directories(start, end, q.username(), page)
             .await?,
     ))
 }
@@ -1115,8 +1134,7 @@ mod tests {
                 END,
                 LeaderboardSortBy::TotalBytes,
                 SortOrder::Desc,
-                1,
-                0,
+                Page::first(1),
             )
             .await
             .unwrap();
@@ -1128,15 +1146,21 @@ mod tests {
                 END,
                 LeaderboardSortBy::AverageSpeed,
                 SortOrder::Desc,
-                1,
-                0,
+                Page::first(1),
             )
             .await
             .unwrap();
         assert_eq!(top[0].username.as_deref(), Some("alice"));
 
         let details = reports
-            .errors("Download", MIN_TIME, MAX_TIME, None, SortOrder::Desc, 25, 0)
+            .errors(
+                "Download",
+                MIN_TIME,
+                MAX_TIME,
+                None,
+                SortOrder::Desc,
+                Page::first(25),
+            )
             .await
             .unwrap();
         assert_eq!(details.len(), 1);
@@ -1155,7 +1179,10 @@ mod tests {
         );
         assert_eq!(user[&TransferDirection::Upload].statistics.successful, 1);
 
-        let dirs = reports.directories(START, END, None, 25, 0).await.unwrap();
+        let dirs = reports
+            .directories(START, END, None, Page::first(25))
+            .await
+            .unwrap();
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].directory.as_deref(), Some(r"music\album"));
         assert_eq!((dirs[0].count, dirs[0].distinct_users), (2, 2));
@@ -1211,8 +1238,8 @@ mod tests {
             "music/other/c.flac",
             r"music\moved\two.flac",
         ];
-        let (timed_out, timed_out_id) = error("X: timed out");
-        let (gone, gone_id) = error("Y: gone");
+        let (timed_out, timed_out_id) = error("timed out");
+        let (gone, gone_id) = error("gone");
         let changes = format!(
             "{interned} {timed_out} {gone}
              INSERT INTO transfers (id, username, direction, file_id, size, state, requested_at,
@@ -1275,8 +1302,7 @@ mod tests {
                 end,
                 LeaderboardSortBy::TotalBytes,
                 SortOrder::Desc,
-                1,
-                0,
+                Page::first(1),
             )
             .await
             .unwrap();
@@ -1285,7 +1311,7 @@ mod tests {
             (Some("erin"), 70)
         );
         let errors = reports
-            .error_pareto("Upload", start, end, None, 25, 0)
+            .error_pareto("Upload", start, end, None, Page::first(25))
             .await
             .unwrap();
         assert_eq!(errors.len(), 1);
@@ -1293,7 +1319,10 @@ mod tests {
             (errors[0].error.as_deref(), errors[0].count),
             (Some("gone"), 1)
         );
-        let dirs = reports.directories(start, end, None, 25, 0).await.unwrap();
+        let dirs = reports
+            .directories(start, end, None, Page::first(25))
+            .await
+            .unwrap();
         let dirs: Vec<_> = dirs
             .iter()
             .map(|d| (d.directory.as_deref().unwrap(), d.count))

@@ -60,6 +60,7 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
          WHERE removed = 0 AND (state & 16) != 0;",
     include_str!("migrations/report_hours.sql"),
     include_str!("migrations/compact.sql"),
+    include_str!("migrations/error_messages.sql"),
 ];
 
 /// `error` with the IPv4 peer addresses in it (`a.b.c.d` or `a.b.c.d:port`) replaced by
@@ -339,7 +340,7 @@ pub(super) async fn initialize(db: &Database) -> anyhow::Result<Recovered> {
                 WHERE (state & 16) = 0 AND removed",
             params![
                 timestamp(now),
-                error_id(&tx, Some("OperationCanceledException: Interrupted by daemon shutdown"))?
+                error_id(&tx, Some("Interrupted by daemon shutdown"))?
             ],
         )?;
         // The peer still wants an upload that a restart interrupted: queue it again in
@@ -1106,7 +1107,7 @@ mod tests {
         let ended = rows.clone().map(|mut t| {
             let age_days = if t.filename.contains("old") { 40 } else { 1 };
             t.state = TransferState::Errored;
-            t.error = Some("ConnectionException: refused by 1.2.3.4:5".into());
+            t.error = Some("refused by 1.2.3.4:5".into());
             t.ended_at = Some(Utc::now() - chrono::TimeDelta::days(age_days));
             t.removed = t.filename.contains("removed");
             t
@@ -1147,11 +1148,99 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(kept.filename, "music\\old-listed");
-        assert_eq!(
-            kept.error.as_deref(),
-            Some("ConnectionException: refused by <address>")
-        );
+        assert_eq!(kept.error.as_deref(), Some("refused by <address>"));
         assert_eq!(purge(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn exception_names_are_dropped_and_their_errors_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transfers.db");
+        let before = MIGRATIONS
+            .iter()
+            .position(|sql| *sql == include_str!("migrations/error_messages.sql"))
+            .unwrap();
+        let errors = [
+            "TimeoutException: no answer",
+            "System.TimeoutException: no answer",
+            "ConnectionException: A: b",
+            "A: b",
+            "no name",
+        ];
+        let rows: Vec<_> = (0..errors.len())
+            .map(|i| {
+                new_transfer(
+                    TransferDirection::Upload,
+                    "peer",
+                    format!("music\\{i}.flac"),
+                    10,
+                    None,
+                )
+            })
+            .collect();
+        let failed: Vec<_> = rows
+            .iter()
+            .zip(errors)
+            .map(|(t, error)| {
+                let mut t = t.clone();
+                t.state = TransferState::Errored;
+                t.error = Some(error.into());
+                t.ended_at = Some(Utc::now());
+                t
+            })
+            .collect();
+        let rollups = |db: &Database| {
+            db.call(|db| {
+                let mut stmt = db.prepare(
+                    "SELECT error, SUM(files) FROM transfer_error_hours GROUP BY error ORDER BY error",
+                )?;
+                stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+        };
+        let old = Database::open(&path, &MIGRATIONS[..before]).unwrap();
+        insert(&old, rows.clone()).await.unwrap();
+        save(&old, failed.iter().map(Snapshot::new).collect())
+            .await
+            .unwrap();
+        let rolled_up = rollups(&old).await.unwrap();
+        assert_eq!(
+            rolled_up,
+            [
+                ("A: b".to_owned(), 1),
+                ("b".to_owned(), 1),
+                ("no answer".to_owned(), 2),
+                ("no name".to_owned(), 1)
+            ]
+        );
+        drop(old);
+
+        let db = Database::open(&path, MIGRATIONS).unwrap();
+        let stored = db
+            .call(|db| {
+                let mut stmt = db.prepare("SELECT exception FROM transfer_errors ORDER BY 1")?;
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, ["A: b", "b", "no answer", "no name"]);
+        for (row, error) in rows
+            .iter()
+            .zip(["no answer", "no answer", "A: b", "b", "no name"])
+        {
+            let found = find(&db, TransferDirection::Upload, row.id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.error.as_deref(), Some(error));
+        }
+        // The rollups are unchanged, and the recreated delete trigger finds each row's key.
+        assert_eq!(rollups(&db).await.unwrap(), rolled_up);
+        db.call(|db| db.execute("DELETE FROM transfers", []))
+            .await
+            .unwrap();
+        assert!(rollups(&db).await.unwrap().is_empty());
     }
 
     #[test]
