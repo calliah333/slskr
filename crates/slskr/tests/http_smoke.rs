@@ -671,15 +671,21 @@ async fn daemon_http_smoke() {
         assert!(error["error"].is_string(), "{path} {body}");
     }
     // Seed history before taking the first snapshot, with Soulseek disconnected. Times are
-    // stored as nanoseconds since the epoch (2025-01-01T00:00:00Z and a minute later).
+    // stored as nanoseconds since the epoch (2025-01-01T00:00:00Z and a minute later), ids
+    // as their 16 UUID bytes, and paths in the interned path tables.
     const TRANSFER_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const STORED_ID: &str = "unhex(replace(?1, '-', ''))";
     rusqlite::Connection::open(data_dir.path().join("db/transfers.db"))
         .unwrap()
-        .execute(
-            "INSERT INTO transfers (id, username, direction, filename, size, state, requested_at, ended_at)
-             VALUES (?1, 'peer', 'Download', 'album/track.flac', 1, 48, 1735689600000000000, 1735689660000000000)",
-            [TRANSFER_ID],
-        )
+        .execute_batch(&format!(
+            "INSERT INTO transfer_directories (path) VALUES ('album/');
+             INSERT INTO transfer_files (directory_id, name)
+                 SELECT directory_id, 'track.flac' FROM transfer_directories WHERE path = 'album/';
+             INSERT INTO transfers (id, username, direction, file_id, size, state, requested_at, ended_at)
+             VALUES (unhex('{}'), 'peer', 'Download', last_insert_rowid(), 1, 48,
+                 1735689600000000000, 1735689660000000000);",
+            TRANSFER_ID.replace('-', "")
+        ))
         .unwrap();
     let report = format!(
         "{api}/reports/transfers/summary?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z"
@@ -696,7 +702,10 @@ async fn daemon_http_smoke() {
     assert_eq!(report_size(&summary), Some(1));
     rusqlite::Connection::open(data_dir.path().join("db/transfers.db"))
         .unwrap()
-        .execute("UPDATE transfers SET size = 2 WHERE id = ?1", [TRANSFER_ID])
+        .execute(
+            &format!("UPDATE transfers SET size = 2 WHERE id = {STORED_ID}"),
+            [TRANSFER_ID],
+        )
         .unwrap();
     let cached: Value = client
         .get(&report)

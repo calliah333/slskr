@@ -313,30 +313,44 @@ supported local files without loading tags or cover art.
 ### transfers.db schema (owned by transfers, read by telemetry)
 ```sql
 CREATE TABLE transfers (
-  id TEXT PRIMARY KEY, batch_id TEXT, username TEXT NOT NULL, direction TEXT NOT NULL, -- 'Download' | 'Upload'
-  filename TEXT NOT NULL, size INTEGER NOT NULL, start_offset INTEGER NOT NULL DEFAULT 0,
-  state INTEGER NOT NULL, state_description TEXT, requested_at TEXT NOT NULL, enqueued_at TEXT,
-  started_at TEXT, ended_at TEXT, bytes_transferred INTEGER NOT NULL DEFAULT 0,
-  average_speed REAL NOT NULL DEFAULT 0, exception TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-  next_attempt_at TEXT, removed INTEGER NOT NULL DEFAULT 0, place_in_queue INTEGER,
-  root TEXT -- migration 2: the remote folder of a folder download
+  id BLOB NOT NULL, -- 16 UUID bytes (`store::key`/`store::id`); text if not a canonical UUID
+  batch_id TEXT, username TEXT NOT NULL, direction TEXT NOT NULL, -- 'Download' | 'Upload'
+  file_id INTEGER NOT NULL, size INTEGER NOT NULL, state INTEGER NOT NULL,
+  requested_at INTEGER NOT NULL, enqueued_at INTEGER, started_at INTEGER, ended_at INTEGER, -- ns
+  bytes_transferred INTEGER NOT NULL DEFAULT 0, average_speed REAL NOT NULL DEFAULT 0,
+  error_id INTEGER, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER,
+  removed INTEGER NOT NULL DEFAULT 0, place_in_queue INTEGER,
+  root TEXT -- the remote folder of a folder download
 );
-CREATE INDEX ix_transfers_username ON transfers(username);
-CREATE INDEX ix_transfers_listed_file ON transfers(direction, username, filename)
+CREATE TABLE transfer_directories (directory_id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+CREATE TABLE transfer_files (file_id INTEGER PRIMARY KEY, directory_id INTEGER NOT NULL,
+  name TEXT NOT NULL, UNIQUE (directory_id, name)); -- filename = path || name
+CREATE TABLE transfer_errors (error_id INTEGER PRIMARY KEY, exception TEXT NOT NULL UNIQUE);
+CREATE VIEW transfer_details; -- transfers with seq (rowid), filename, directory and exception
+CREATE INDEX ix_transfers_listed_file ON transfers(direction, username, file_id)
   WHERE removed = 0 AND (state & 16) != 0; -- superseding a listed transfer of the same file
 ```
-`state` stores the `soulseek::TransferState` bit values (`state & 16` is "completed");
-`transfers::store::{state_from_bits, state_to_bits}` convert them to and from the API's
-`TransferState` enum, and `state_description` holds the enum name for humans.
-`exception` holds the failure as `Kind: message`; the API calls it `error`.
+Paths and errors are interned (`store::file_id`, `store::error_id`): a share has tens of
+thousands of files, and failures repeat a few hundred texts once `mask_addresses` replaces
+the peer addresses in them with `<address>`. Reads go through `transfer_details`; writes
+and filters use the ids. `state` stores the `soulseek::TransferState` bit values
+(`state & 16` is "completed"); `transfers::store::{state_from_bits, state_to_bits}` convert
+them to and from the API's `TransferState` enum. `exception` holds the failure as
+`Kind: message`; the API calls it `error`.
+
+Rows removed from the list (cleared, superseded or pruned by `retention.*`) are deleted
+[`store::PURGE_AFTER`] (30 days) after they ended, by `store::purge` on the retention tick.
+It marks them `removed = 2` first, which the rollup delete triggers skip, so the reports
+keep their totals. Other deletes (the failures of banned users) leave the rollups too.
 
 Reports read hourly rollups that triggers on `transfers` keep current:
-`transfer_chart_hours` (chart), `transfer_user_hours` (summary, leaderboards, user report),
+`transfer_chart_hours` (chart), `transfer_user_hours` (summary, leaderboards, user report,
+histograms with whole-hour buckets),
 `transfer_error_hours` (error types) and `transfer_directory_hours` (popular folders).
 A window reads its whole hours from them and only the transfers of the partial hours at
 its edges (`telemetry::reports::Split`), so a year of history costs tens of thousands of
 rows rather than every transfer. A change to what a report counts must change its rollup,
-its triggers and its backfill together; `report_hours_follow_transfer_changes` checks that
+its triggers and its backfill (`migrations/compact.sql`) together; `report_hours_follow_transfer_changes` checks that
 the triggers agree with the backfill.
 
 Upload backoff (`transfers/backoff.rs`): after two failures in a row of one file to one

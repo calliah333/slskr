@@ -21,7 +21,7 @@ axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "1"
-rusqlite = { version = "0.37", features = ["bundled", "limits"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "limits"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 lofty = "0.25"

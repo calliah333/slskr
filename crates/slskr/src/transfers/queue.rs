@@ -281,17 +281,26 @@ pub(super) struct UploadHistory(HashMap<String, Vec<Completion>>);
 
 impl UploadHistory {
     pub(super) fn record(&mut self, transfer: &Transfer) {
-        if let Some(started) = transfer
-            .started_at
-            .filter(|start| *start >= Utc::now() - TimeDelta::days(7))
-        {
+        if let Some(started_at) = transfer.started_at {
+            self.record_start(super::store::Started {
+                username: transfer.username.clone(),
+                started_at,
+                size: transfer.size,
+                succeeded: transfer.state == TransferState::Succeeded,
+            });
+        }
+    }
+
+    /// Records an upload read back from the store at startup.
+    pub(super) fn record_start(&mut self, started: super::store::Started) {
+        if started.started_at >= Utc::now() - TimeDelta::days(7) {
             self.0
-                .entry(transfer.username.clone())
+                .entry(started.username)
                 .or_default()
                 .push(Completion {
-                    started,
-                    size: transfer.size,
-                    success: transfer.state == TransferState::Succeeded,
+                    started: started.started_at,
+                    size: started.size,
+                    success: started.succeeded,
                 });
         }
     }

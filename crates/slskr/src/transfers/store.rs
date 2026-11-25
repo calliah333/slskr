@@ -1,11 +1,22 @@
+use std::{borrow::Cow, sync::LazyLock, time::Duration};
+
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use regex::Regex;
+use rusqlite::{
+    Connection, OptionalExtension, Row, params,
+    types::{Value, ValueRef},
+};
 use slskr_types::{
     config::RetentionConfig,
     transfers::{Batch, Transfer, TransferDirection, TransferState},
 };
+use uuid::Uuid;
 
 use crate::db::Database;
+
+/// Rows removed from the list are deleted this long after they ended. Their totals stay
+/// in the report rollups.
+pub(super) const PURGE_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
 
 pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
@@ -48,7 +59,93 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
      CREATE INDEX ix_transfers_listed_file ON transfers(direction, username, filename)
          WHERE removed = 0 AND (state & 16) != 0;",
     include_str!("migrations/report_hours.sql"),
+    include_str!("migrations/compact.sql"),
 ];
+
+/// `error` with the IPv4 peer addresses in it (`a.b.c.d` or `a.b.c.d:port`) replaced by
+/// `<address>`, so the same failure from different peers is stored once and counted
+/// together in the reports.
+pub(crate) fn mask_addresses(error: &str) -> Cow<'_, str> {
+    static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b").expect("valid address pattern")
+    });
+    ADDRESS.replace_all(error, "<address>")
+}
+
+/// A transfer id as stored: the 16 bytes of a canonical (lowercase, hyphenated) UUID,
+/// else the text as given.
+pub(crate) fn key(id: &str) -> Value {
+    match Uuid::try_parse(id) {
+        Ok(uuid) if uuid.hyphenated().to_string() == id => Value::Blob(uuid.as_bytes().to_vec()),
+        _ => Value::Text(id.to_owned()),
+    }
+}
+
+/// A stored transfer id (see [`key`]).
+pub(crate) fn id(row: &Row<'_>, i: usize) -> rusqlite::Result<String> {
+    match row.get_ref(i)? {
+        ValueRef::Blob(bytes) => Uuid::from_slice(bytes)
+            .map(|uuid| uuid.hyphenated().to_string())
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    i,
+                    rusqlite::types::Type::Blob,
+                    Box::new(error),
+                )
+            }),
+        _ => row.get(i),
+    }
+}
+
+/// The id of a stored text, inserting it first if it is new.
+fn intern(
+    db: &Connection,
+    select: &str,
+    insert: &str,
+    values: &[&dyn rusqlite::ToSql],
+) -> rusqlite::Result<i64> {
+    if let Some(id) = db
+        .prepare_cached(select)?
+        .query_row(values, |row| row.get(0))
+        .optional()?
+    {
+        return Ok(id);
+    }
+    db.prepare_cached(insert)?.execute(values)?;
+    Ok(db.last_insert_rowid())
+}
+
+/// The `transfer_files` id of `filename`.
+fn file_id(db: &Connection, filename: &str) -> rusqlite::Result<i64> {
+    // Split after the last separator, as the migration does.
+    let (path, name) = filename.split_at(filename.rfind(['/', '\\']).map_or(0, |i| i + 1));
+    let directory = intern(
+        db,
+        "SELECT directory_id FROM transfer_directories WHERE path = ?1",
+        "INSERT INTO transfer_directories (path) VALUES (?1)",
+        &[&path],
+    )?;
+    intern(
+        db,
+        "SELECT file_id FROM transfer_files WHERE directory_id = ?1 AND name = ?2",
+        "INSERT INTO transfer_files (directory_id, name) VALUES (?1, ?2)",
+        &[&directory, &name],
+    )
+}
+
+/// The `transfer_errors` id of an error, masked.
+fn error_id(db: &Connection, error: Option<&str>) -> rusqlite::Result<Option<i64>> {
+    error
+        .map(|error| {
+            intern(
+                db,
+                "SELECT error_id FROM transfer_errors WHERE exception = ?1",
+                "INSERT INTO transfer_errors (exception) VALUES (?1)",
+                &[&mask_addresses(error)],
+            )
+        })
+        .transpose()
+}
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
 // Initializing 4, InProgress 8, Completed 16, Succeeded 32, Cancelled 64, TimedOut 128,
@@ -100,14 +197,14 @@ pub(crate) fn state_to_bits(state: TransferState) -> u32 {
     }
 }
 
-/// `SELECT <the columns [`transfer`] reads> FROM transfers <rest>`, as a constant for
-/// `prepare_cached`.
+/// `SELECT <the columns [`transfer`] reads> FROM transfer_details <rest>`, as a constant
+/// for `prepare_cached`. `seq` is the row's `rowid`.
 macro_rules! select {
     ($($rest:literal),+) => {
         concat!(
             "SELECT id, batch_id, username, direction, filename, size, state, requested_at, \
              enqueued_at, started_at, ended_at, bytes_transferred, average_speed, place_in_queue, \
-             exception, attempts, next_attempt_at, removed, root FROM transfers ",
+             exception, attempts, next_attempt_at, removed, root FROM transfer_details ",
             $($rest),+
         )
     };
@@ -115,15 +212,15 @@ macro_rules! select {
 
 // List queries per `(recent_completed, username)`. Separate statements, rather than
 // `(?n IS NULL OR username = ?n)`, let SQLite use the username and partial state indexes.
-const LIST: &str = select!("WHERE direction = ?1 AND (?2 OR NOT removed) ORDER BY rowid");
+const LIST: &str = select!("WHERE direction = ?1 AND (?2 OR NOT removed) ORDER BY seq");
 const LIST_USER: &str =
-    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?3 ORDER BY rowid");
+    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?3 ORDER BY seq");
 const LIST_RECENT: &str = concat!(
     select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND (state & 16) = 0"),
     " UNION ALL SELECT * FROM (",
     select!(
         "WHERE direction = ?1 AND (?2 OR NOT removed) AND (state & 16) != 0 ",
-        "ORDER BY ended_at DESC, rowid DESC LIMIT ?3"
+        "ORDER BY ended_at DESC, seq DESC LIMIT ?3"
     ),
     ")"
 );
@@ -132,7 +229,7 @@ const LIST_RECENT_USER: &str = concat!(
     " UNION ALL SELECT * FROM (",
     select!(
         "WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?4 AND (state & 16) != 0 ",
-        "ORDER BY ended_at DESC, rowid DESC LIMIT ?3"
+        "ORDER BY ended_at DESC, seq DESC LIMIT ?3"
     ),
     ")"
 );
@@ -183,7 +280,7 @@ fn text_date(row: &Row<'_>, i: usize) -> rusqlite::Result<Option<DateTime<Utc>>>
 
 fn transfer(row: &Row<'_>) -> rusqlite::Result<Transfer> {
     let mut transfer = Transfer {
-        id: row.get(0)?,
+        id: id(row, 0)?,
         batch_id: row.get(1)?,
         username: row.get(2)?,
         direction: if row.get_ref(3)?.as_str()? == "Upload" {
@@ -215,10 +312,18 @@ fn transfer(row: &Row<'_>) -> rusqlite::Result<Transfer> {
     Ok(transfer)
 }
 
+/// An upload started in the last week, for the upload limits.
+pub(super) struct Started {
+    pub username: String,
+    pub started_at: DateTime<Utc>,
+    pub size: u64,
+    pub succeeded: bool,
+}
+
 /// Unfinished transfers found in the store at startup, already moved back to the queue.
 pub(super) struct Recovered {
     /// Uploads started in the last week, for the upload limits.
-    pub history: Vec<Transfer>,
+    pub history: Vec<Started>,
     pub downloads: Vec<Transfer>,
     /// Uploads that were queued or running, in the order they were queued.
     pub uploads: Vec<Transfer>,
@@ -229,34 +334,43 @@ pub(super) async fn initialize(db: &Database) -> anyhow::Result<Recovered> {
         let tx = db.transaction()?;
         let now = Utc::now();
         tx.execute(
-            "UPDATE transfers SET state = 1040, state_description = 'aborted', ended_at = ?1,
-                next_attempt_at = NULL, exception = 'OperationCanceledException: Interrupted by daemon shutdown'
+            "UPDATE transfers SET state = 1040, ended_at = ?1,
+                next_attempt_at = NULL, error_id = ?2
                 WHERE (state & 16) = 0 AND removed",
-            [timestamp(now)],
+            params![
+                timestamp(now),
+                error_id(&tx, Some("OperationCanceledException: Interrupted by daemon shutdown"))?
+            ],
         )?;
         // The peer still wants an upload that a restart interrupted: queue it again in
         // its old place. Sending resumes from whatever offset the peer then asks for.
         tx.execute(
-            "UPDATE transfers SET state = 2050, state_description = 'queued_locally', ended_at = NULL,
-                started_at = NULL, next_attempt_at = NULL, place_in_queue = NULL, exception = NULL
+            "UPDATE transfers SET state = 2050, ended_at = NULL,
+                started_at = NULL, next_attempt_at = NULL, place_in_queue = NULL, error_id = NULL
                 WHERE direction = 'Upload' AND (state & 16) = 0",
             [],
         )?;
         // An interrupted negotiation is not a failed attempt. Move it back to the
         // queue once, while preserving delays for already scheduled retries.
         tx.execute(
-            "UPDATE transfers SET state = 2050, state_description = 'queued_locally', ended_at = NULL,
+            "UPDATE transfers SET state = 2050, ended_at = NULL,
                 attempts = CASE WHEN next_attempt_at IS NULL THEN MAX(0, attempts - 1) ELSE attempts END,
                 next_attempt_at = COALESCE(next_attempt_at, ?1), place_in_queue = NULL
                 WHERE direction = 'Download' AND (state & 16) = 0",
             [timestamp(now)],
         )?;
         let history = {
-            let mut stmt = tx.prepare(select!("WHERE direction = 'Upload' AND started_at >= ?1"))?;
-            stmt.query_map([timestamp(now - chrono::TimeDelta::days(7))], transfer)?.collect::<rusqlite::Result<_>>()?
+            let mut stmt = tx.prepare("SELECT username, started_at, size, state FROM transfers
+                WHERE direction = 'Upload' AND started_at >= ?1")?;
+            stmt.query_map([timestamp(now - chrono::TimeDelta::days(7))], |row| Ok(Started {
+                username: row.get(0)?,
+                started_at: date(row, 1)?.ok_or(rusqlite::Error::InvalidQuery)?,
+                size: row.get(2)?,
+                succeeded: state_from_bits(row.get(3)?) == TransferState::Succeeded,
+            }))?.collect::<rusqlite::Result<_>>()?
         };
         let unfinished = |direction: &str| -> rusqlite::Result<Vec<Transfer>> {
-            let mut stmt = tx.prepare(select!("WHERE direction = ?1 AND (state & 16) = 0 ORDER BY rowid"))?;
+            let mut stmt = tx.prepare(select!("WHERE direction = ?1 AND (state & 16) = 0 ORDER BY seq"))?;
             stmt.query_map([direction], transfer)?.collect()
         };
         let downloads = unfinished("Download")?;
@@ -274,16 +388,17 @@ pub(super) async fn insert(db: &Database, transfers: Vec<Transfer>) -> anyhow::R
         let mut superseded = Vec::new();
         {
             let mut supersede = tx.prepare_cached("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND username = ?2
-                AND filename = ?3 AND removed = 0 AND (state & 16) != 0 RETURNING id")?;
-            let mut insert = tx.prepare_cached("INSERT INTO transfers (id, batch_id, username, direction, filename, size,
-                state, state_description, requested_at, enqueued_at, removed, root) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)")?;
+                AND file_id = ?3 AND removed = 0 AND (state & 16) != 0 RETURNING id")?;
+            let mut insert = tx.prepare_cached("INSERT INTO transfers (id, batch_id, username, direction, file_id, size,
+                state, requested_at, enqueued_at, removed, root) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")?;
             for t in transfers {
                 let direction = direction_name(t.direction);
-                for id in supersede.query_map(params![direction, t.username, t.filename], |row| row.get(0))? {
+                let file = file_id(&tx, &t.filename)?;
+                for id in supersede.query_map(params![direction, t.username, file], |row| id(row, 0))? {
                     superseded.push(id?);
                 }
-                insert.execute(params![t.id, t.batch_id, t.username, direction, t.filename, t.size,
-                    state_to_bits(t.state), t.state.as_str(), timestamp(t.requested_at), t.enqueued_at.map(timestamp), t.removed, t.root])?;
+                insert.execute(params![key(&t.id), t.batch_id, t.username, direction, file, t.size,
+                    state_to_bits(t.state), timestamp(t.requested_at), t.enqueued_at.map(timestamp), t.removed, t.root])?;
             }
         }
         tx.commit()?;
@@ -294,7 +409,6 @@ pub(super) async fn insert(db: &Database, transfers: Vec<Transfer>) -> anyhow::R
 pub(super) struct Snapshot {
     id: String,
     size: u64,
-    offset: u64,
     state: TransferState,
     enqueued: Option<DateTime<Utc>>,
     started: Option<DateTime<Utc>>,
@@ -309,11 +423,10 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn new(t: &Transfer, offset: u64) -> Self {
+    pub(super) fn new(t: &Transfer) -> Self {
         Self {
             id: t.id.clone(),
             size: t.size,
-            offset,
             state: t.state,
             enqueued: t.enqueued_at,
             started: t.started_at,
@@ -333,14 +446,15 @@ pub(super) async fn save(db: &Database, snapshots: Vec<Snapshot>) -> anyhow::Res
     db.call(move |db| {
         let tx = db.transaction()?;
         {
-            let mut stmt = tx.prepare_cached("UPDATE transfers SET size = ?2, start_offset = ?3, state = ?4, enqueued_at = ?5,
-                started_at = ?6, ended_at = ?7, bytes_transferred = ?8, average_speed = ?9, exception = ?10,
-                attempts = ?11, next_attempt_at = ?12, removed = MAX(removed, ?13), state_description = ?14, place_in_queue = ?15
-                WHERE id = ?1 AND (state & 16) = 0 AND attempts <= ?11")?;
+            let mut stmt = tx.prepare_cached("UPDATE transfers SET size = ?2, state = ?3, enqueued_at = ?4,
+                started_at = ?5, ended_at = ?6, bytes_transferred = ?7, average_speed = ?8, error_id = ?9,
+                attempts = ?10, next_attempt_at = ?11, removed = MAX(removed, ?12), place_in_queue = ?13
+                WHERE id = ?1 AND (state & 16) = 0 AND attempts <= ?10")?;
             for t in snapshots {
-                stmt.execute(params![t.id, t.size, t.offset, state_to_bits(t.state), t.enqueued.map(timestamp),
-                    t.started.map(timestamp), t.ended.map(timestamp), t.bytes, t.speed,
-                    t.error, t.attempts, t.next_attempt.map(timestamp), t.removed, t.state.as_str(), t.position])?;
+                let error = error_id(&tx, t.error.as_deref())?;
+                stmt.execute(params![key(&t.id), t.size, state_to_bits(t.state), t.enqueued.map(timestamp),
+                    t.started.map(timestamp), t.ended.map(timestamp), t.bytes, t.speed.max(0.0),
+                    error, t.attempts, t.next_attempt.map(timestamp), t.removed, t.position])?;
             }
         }
         tx.commit()
@@ -388,7 +502,7 @@ pub(super) async fn find(
 ) -> anyhow::Result<Option<Transfer>> {
     db.call(move |db| {
         db.prepare_cached(select!("WHERE id = ?1 AND direction = ?2"))?
-            .query_row(params![id, direction_name(direction)], transfer)
+            .query_row(params![key(&id), direction_name(direction)], transfer)
             .optional()
     })
     .await
@@ -398,7 +512,7 @@ pub(super) async fn set_position(db: &Database, id: String, position: u32) -> an
     db.call(move |db| {
         db.execute(
             "UPDATE transfers SET place_in_queue = ?2 WHERE id = ?1",
-            params![id, position],
+            params![key(&id), position],
         )
     })
     .await?;
@@ -412,11 +526,11 @@ pub(super) async fn remove(
     id: Option<String>,
 ) -> anyhow::Result<Vec<String>> {
     db.call(move |db| {
-        let id_of = |row: &Row<'_>| row.get(0);
+        let id_of = |row: &Row<'_>| self::id(row, 0);
         match id {
             Some(id) => db
                 .prepare_cached("UPDATE transfers SET removed = 1 WHERE id = ?1 AND direction = ?2 RETURNING id")?
-                .query_map(params![id, direction_name(dir)], id_of)?
+                .query_map(params![key(&id), direction_name(dir)], id_of)?
                 .collect(),
             None => db
                 .prepare_cached("UPDATE transfers SET removed = 1 WHERE direction = ?1 AND NOT removed AND (state & 16) != 0 RETURNING id")?
@@ -439,7 +553,7 @@ pub(super) async fn batch(db: &Database, id: String) -> anyhow::Result<Option<Ba
         let Some(mut batch) = batch_metadata(db, &id)? else {
             return Ok(None);
         };
-        let mut stmt = db.prepare_cached(select!("WHERE batch_id = ?1 ORDER BY rowid"))?;
+        let mut stmt = db.prepare_cached(select!("WHERE batch_id = ?1 ORDER BY seq"))?;
         batch.transfers = stmt
             .query_map([id], transfer)?
             .collect::<rusqlite::Result<_>>()?;
@@ -509,7 +623,7 @@ pub(super) async fn prune(db: &Database, r: &RetentionConfig) -> anyhow::Result<
                     };
                     for id in stmt
                         .query_map(params![direction, state, timestamp(cutoff)], |row| {
-                            row.get(0)
+                            self::id(row, 0)
                         })?
                     {
                         removed.push(id?);
@@ -519,6 +633,24 @@ pub(super) async fn prune(db: &Database, r: &RetentionConfig) -> anyhow::Result<
         }
         tx.commit()?;
         Ok(removed)
+    })
+    .await
+}
+
+/// Deletes rows removed from the list more than [`PURGE_AFTER`] ago, keeping their totals
+/// in the report rollups (the delete triggers skip rows marked `removed = 2`). Returns
+/// how many were deleted.
+pub(super) async fn purge(db: &Database) -> anyhow::Result<usize> {
+    let cutoff = Utc::now() - PURGE_AFTER;
+    db.call(move |db| {
+        let tx = db.transaction()?;
+        tx.prepare_cached("UPDATE transfers SET removed = 2 WHERE removed AND ended_at < ?1")?
+            .execute([timestamp(cutoff)])?;
+        let deleted = tx
+            .prepare_cached("DELETE FROM transfers WHERE removed = 2")?
+            .execute([])?;
+        tx.commit()?;
+        Ok(deleted)
     })
     .await
 }
@@ -675,7 +807,7 @@ mod tests {
             &db,
             [&retry, &live, &upload]
                 .into_iter()
-                .map(|t| Snapshot::new(t, 0))
+                .map(Snapshot::new)
                 .collect(),
         )
         .await
@@ -728,10 +860,13 @@ mod tests {
         db.call({
             let (removed, done) = (removed.id.clone(), done.id.clone());
             move |db| {
-                db.execute("UPDATE transfers SET removed = 1 WHERE id = ?1", [removed])?;
+                db.execute(
+                    "UPDATE transfers SET removed = 1 WHERE id = ?1",
+                    [key(&removed)],
+                )?;
                 db.execute(
                     "UPDATE transfers SET state = 48, started_at = ?2 WHERE id = ?1",
-                    params![done, timestamp(Utc::now())],
+                    params![key(&done), timestamp(Utc::now())],
                 )?;
                 Ok(())
             }
@@ -743,7 +878,14 @@ mod tests {
         let ids: Vec<_> = recovered.uploads.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, [first.id.as_str(), second.id.as_str()]);
         assert_eq!(recovered.history.len(), 1);
-        assert_eq!(recovered.history[0].id, done.id);
+        assert_eq!(
+            (
+                recovered.history[0].username.as_str(),
+                recovered.history[0].size
+            ),
+            ("peer", 9)
+        );
+        assert!(recovered.history[0].succeeded);
         let gone = find(&db, TransferDirection::Upload, removed.id)
             .await
             .unwrap()
@@ -775,7 +917,7 @@ mod tests {
         insert(&db, vec![t.clone()]).await.unwrap();
         t.state = TransferState::Succeeded;
         t.bytes_transferred = t.size;
-        save(&db, vec![Snapshot::new(&t, 0)]).await.unwrap();
+        save(&db, vec![Snapshot::new(&t)]).await.unwrap();
         remove(&db, TransferDirection::Download, None)
             .await
             .unwrap();
@@ -822,7 +964,7 @@ mod tests {
         insert(&db, vec![t.clone()]).await.unwrap();
         t.attempts = 1;
         t.state = TransferState::InProgress;
-        save(&db, vec![Snapshot::new(&t, 0)]).await.unwrap();
+        save(&db, vec![Snapshot::new(&t)]).await.unwrap();
         drop(db);
 
         let db = Database::open(&path, MIGRATIONS).unwrap();
@@ -863,7 +1005,7 @@ mod tests {
         );
         done.state = TransferState::Succeeded;
         done.ended_at = Some(Utc::now());
-        save(&db, vec![Snapshot::new(&done, 0)]).await.unwrap();
+        save(&db, vec![Snapshot::new(&done)]).await.unwrap();
 
         let ids = |list: Vec<Transfer>| list.into_iter().map(|t| t.id).collect::<Vec<_>>();
         let list = |user: Option<&str>, recent: Option<u32>| {
@@ -913,6 +1055,103 @@ mod tests {
             ids(list(None, None).await.unwrap()),
             vec![live.id.clone(), again.id]
         );
+    }
+
+    #[test]
+    fn addresses_are_masked_and_ids_round_trip() {
+        assert_eq!(
+            mask_addresses("Failed to read 8 bytes from 83.21.240.32:50300: closed"),
+            "Failed to read 8 bytes from <address>: closed"
+        );
+        assert_eq!(mask_addresses("to peer (10.0.0.1)"), "to peer (<address>)");
+        assert_eq!(
+            mask_addresses("Inactivity timeout of 60000 ms"),
+            "Inactivity timeout of 60000 ms"
+        );
+
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE ids (id BLOB)").unwrap();
+        let uuid = Uuid::new_v4().hyphenated().to_string();
+        for (given, stored_type) in [
+            (uuid.as_str(), "blob"),
+            ("legacy-id", "text"),
+            // Not the canonical spelling, so kept as given.
+            (&*uuid.to_uppercase(), "text"),
+        ] {
+            db.execute("DELETE FROM ids", []).unwrap();
+            db.execute("INSERT INTO ids VALUES (?1)", [key(given)])
+                .unwrap();
+            let (read, kind): (String, String) = db
+                .query_row("SELECT id, typeof(id) FROM ids", [], |row| {
+                    Ok((id(row, 0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!((read.as_str(), kind.as_str()), (given, stored_type));
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_deletes_old_removed_rows_but_keeps_their_report_hours() {
+        let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
+        let rows = ["old-removed", "old-listed", "new-removed"].map(|file| {
+            new_transfer(
+                TransferDirection::Upload,
+                "peer",
+                format!("music\\{file}"),
+                10,
+                None,
+            )
+        });
+        insert(&db, rows.to_vec()).await.unwrap();
+        let ended = rows.clone().map(|mut t| {
+            let age_days = if t.filename.contains("old") { 40 } else { 1 };
+            t.state = TransferState::Errored;
+            t.error = Some("ConnectionException: refused by 1.2.3.4:5".into());
+            t.ended_at = Some(Utc::now() - chrono::TimeDelta::days(age_days));
+            t.removed = t.filename.contains("removed");
+            t
+        });
+        save(&db, ended.iter().map(Snapshot::new).collect())
+            .await
+            .unwrap();
+        let rollups = |db: &Database| {
+            db.call(|db| {
+                db.query_row(
+                    "SELECT (SELECT SUM(files) FROM transfer_user_hours),
+                        (SELECT SUM(files) FROM transfer_error_hours),
+                        (SELECT group_concat(DISTINCT error) FROM transfer_error_hours)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+            })
+        };
+        let before = rollups(&db).await.unwrap();
+        assert_eq!(before, (3, 3, "refused by <address>".into()));
+
+        assert_eq!(purge(&db).await.unwrap(), 1);
+        assert_eq!(rollups(&db).await.unwrap(), before);
+        assert!(
+            find(&db, TransferDirection::Upload, rows[0].id.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let kept = find(&db, TransferDirection::Upload, rows[1].id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.filename, "music\\old-listed");
+        assert_eq!(
+            kept.error.as_deref(),
+            Some("ConnectionException: refused by <address>")
+        );
+        assert_eq!(purge(&db).await.unwrap(), 0);
     }
 
     #[test]

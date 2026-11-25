@@ -69,6 +69,7 @@ impl Database {
         };
         connection.pragma_update(None, "foreign_keys", "ON")?;
         tune(&connection)?;
+        functions(&connection)?;
         if !in_memory {
             // Before the journal mode: on a new file this must precede the first write.
             enable_incremental_vacuum(&connection, path)?;
@@ -203,6 +204,22 @@ fn tune(connection: &Connection) -> rusqlite::Result<()> {
     connection.pragma_update(None, "temp_store", "MEMORY")?;
     connection.pragma_update(None, "cache_size", -CACHE_KIB)?;
     connection.pragma_update(None, "analysis_limit", ANALYSIS_LIMIT)
+}
+
+/// SQL functions that migrations use: `mask_addresses(text)` (see
+/// [`crate::transfers::mask_addresses`]).
+fn functions(connection: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    connection.create_scalar_function(
+        "mask_addresses",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            Ok(context
+                .get::<Option<String>>(0)?
+                .map(|text| crate::transfers::mask_addresses(&text).into_owned()))
+        },
+    )
 }
 
 /// Switches a file to `auto_vacuum = INCREMENTAL`. A new file only needs the setting; an

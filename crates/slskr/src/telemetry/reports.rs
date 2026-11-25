@@ -6,7 +6,7 @@ pub(crate) use cache::cache_response;
 use crate::http::{ApiError, ApiResult, Json, Path, Query, Routes};
 use crate::{app::AppState, auth::Authenticated, db::Database};
 // Transfer times are stored as nanoseconds since the epoch (see the transfer store).
-use crate::transfers::{stored_date as datetime, stored_time as timestamp};
+use crate::transfers::{stored_date as datetime, stored_id, stored_time as timestamp};
 use axum::extract::State;
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
@@ -133,12 +133,13 @@ impl Split {
 }
 
 /// The rows of a split window: `rollup` over whole hours, then `raw` (the same columns,
-/// computed per transfer) over the edges where `filter` holds. Binds `?1` to `?6`.
-fn windowed(rollup: &str, raw: &str, filter: &str) -> String {
+/// computed per transfer from `table`, `transfers` or `transfer_details` when it needs
+/// the texts) over the edges where `filter` holds. Binds `?1` to `?6`.
+fn windowed(rollup: &str, raw: &str, table: &str, filter: &str) -> String {
     format!(
         "{rollup} WHERE hour >= ?1 AND hour < ?2
-         UNION ALL {raw} FROM transfers WHERE ended_at BETWEEN ?3 AND ?4 AND {filter}
-         UNION ALL {raw} FROM transfers WHERE ended_at BETWEEN ?5 AND ?6 AND {filter}"
+         UNION ALL {raw} FROM {table} WHERE ended_at BETWEEN ?3 AND ?4 AND {filter}
+         UNION ALL {raw} FROM {table} WHERE ended_at BETWEEN ?5 AND ?6 AND {filter}"
     )
 }
 
@@ -150,6 +151,20 @@ fn user_rows() -> String {
         "SELECT direction, state, username, 1, size, average_speed,
             started_at - enqueued_at + 0.0, started_at - enqueued_at IS NOT NULL,
             ended_at - started_at + 0.0, ended_at - started_at IS NOT NULL",
+        "transfers",
+        concat!("state IN (", completed_states!(), ")"),
+    )
+}
+
+/// [`user_rows`] with the hour first.
+fn user_hour_rows() -> String {
+    windowed(
+        "SELECT hour, direction, state, username, files, bytes, wait, waits, duration, durations
+         FROM transfer_user_hours",
+        "SELECT ended_at / 3600000000000 * 3600, direction, state, username, 1, size,
+            started_at - enqueued_at + 0.0, started_at - enqueued_at IS NOT NULL,
+            ended_at - started_at + 0.0, ended_at - started_at IS NOT NULL",
+        "transfers",
         concat!("state IN (", completed_states!(), ")"),
     )
 }
@@ -162,10 +177,6 @@ const USER_AVERAGES: &str = "SUM(speed) / SUM(files),
 /// `transfer_error_hours` keeps it.
 const ERROR_TEXT: &str = "coalesce(CASE WHEN instr(exception, ':') > 0
     THEN substr(exception, instr(exception, ':') + 2) ELSE exception END, '')";
-
-/// A transfer's folder, as `transfer_directory_hours` keeps it.
-const DIRECTORY: &str =
-    r"rtrim(rtrim(filename, replace(replace(filename, '/', ''), '\', '')), '/\')";
 
 #[derive(Clone)]
 pub struct ReportsService {
@@ -184,9 +195,15 @@ impl ReportsService {
     async fn oldest_requested(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
         self.database
             .call(|db| {
-                db.query_row("SELECT MIN(requested_at) FROM transfers", [], |row| {
-                    datetime(row, 0)
-                })
+                // The first stored transfer, or the first rollup hour: removed rows
+                // are deleted after a while, but their hours stay.
+                db.query_row(
+                    "SELECT min(coalesce(first, hour), coalesce(hour, first)) FROM
+                        (SELECT (SELECT requested_at FROM transfers ORDER BY rowid LIMIT 1) AS first,
+                            (SELECT MIN(hour) * 1000000000 FROM transfer_chart_hours) AS hour)",
+                    [],
+                    |row| datetime(row, 0),
+                )
             })
             .await
     }
@@ -241,26 +258,41 @@ impl ReportsService {
             histogram_bucket_count(start, end, seconds) <= MAX_HISTOGRAM_BUCKETS,
             "Histogram would exceed {MAX_HISTOGRAM_BUCKETS} buckets"
         );
-        let (start_text, end_text) = (timestamp(start), timestamp(end));
+        let split = Split::new(start, end);
         let direction = direction.map(str::to_owned);
         let username = username.map(str::to_owned);
         let mut histogram = empty_histogram(start, end, seconds);
         self.database
             .call(move |db| {
-                let mut stmt = db.prepare_cached(concat!(
-                    "SELECT (ended_at / 1000000000 / ?1) * ?1, direction, state,
-                    SUM(size), COUNT(*), COUNT(DISTINCT username),
-                    CAST(SUM(size) AS REAL) / (NULLIF(SUM(ended_at - started_at), 0) / 1e9),
-                    AVG(started_at - enqueued_at) / 1e9,
-                    AVG(ended_at - started_at) / 1e9
-                 FROM transfers WHERE ended_at BETWEEN ?2 AND ?3
-                    AND state IN (",
-                    completed_states!(),
-                    ") AND (?4 IS NULL OR direction = ?4)
-                    AND (?5 IS NULL OR username = ?5) GROUP BY 1, 2, 3"
+                // Whole-hour buckets read the hourly rollups, like the chart; others the
+                // transfers, which only short windows use.
+                let (rows, bucket) = if seconds % Split::HOUR == 0 {
+                    (user_hour_rows(), "hour")
+                } else {
+                    (
+                        format!(
+                            "SELECT ended_at / 1000000000 AS second, direction, state, username, 1 AS files,
+                                size AS bytes, started_at - enqueued_at + 0.0 AS wait,
+                                started_at - enqueued_at IS NOT NULL AS waits,
+                                ended_at - started_at + 0.0 AS duration,
+                                ended_at - started_at IS NOT NULL AS durations
+                             FROM transfers WHERE ended_at BETWEEN ?3 AND ?6 AND state IN ({})",
+                            completed_states!()
+                        ),
+                        "second",
+                    )
+                };
+                let mut stmt = db.prepare_cached(&format!(
+                    "SELECT {bucket} / ?7 * ?7, direction, state, SUM(bytes), SUM(files),
+                        COUNT(DISTINCT username), CAST(SUM(bytes) AS REAL) / (NULLIF(SUM(duration), 0) / 1e9),
+                        SUM(wait) / NULLIF(SUM(waits), 0) / 1e9,
+                        SUM(duration) / NULLIF(SUM(durations), 0) / 1e9
+                     FROM ({rows}) WHERE (?8 IS NULL OR direction = ?8) AND (?9 IS NULL OR username = ?9)
+                     GROUP BY 1, 2, 3"
                 ))?;
+                let [a, b, c, d, e, f] = split.params();
                 let mut rows = stmt.query(rusqlite::params![
-                    seconds, start_text, end_text, direction, username
+                    a, b, c, d, e, f, seconds, direction, username
                 ])?;
                 while let Some(row) = rows.next()? {
                     let Some(summary) = DateTime::from_timestamp(row.get(0)?, 0)
@@ -306,6 +338,7 @@ impl ReportsService {
                     windowed(
                         "SELECT hour, direction, state, bytes, files FROM transfer_chart_hours",
                         "SELECT ended_at / 3600000000000 * 3600, direction, state, size, 1",
+                        "transfers",
                         concat!("state IN (", completed_states!(), ")"),
                     )
                 ))?;
@@ -405,13 +438,13 @@ impl ReportsService {
             username.map(str::to_owned),
         );
         self.database.call(move |db| {
-            let sql = format!("SELECT id, username, direction, filename, size, state, requested_at, enqueued_at, started_at, ended_at, bytes_transferred, average_speed, CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END FROM transfers WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) ORDER BY ended_at {} LIMIT ?5 OFFSET ?6", if order == SortOrder::Asc { "ASC" } else { "DESC" });
+            let sql = format!("SELECT id, username, direction, filename, size, state, requested_at, enqueued_at, started_at, ended_at, bytes_transferred, average_speed, CASE WHEN instr(exception, ':') > 0 THEN substr(exception, instr(exception, ':') + 2) ELSE exception END FROM transfer_details WHERE (state & ~48) != 0 AND direction=?1 AND ended_at IS NOT NULL AND ended_at >= ?2 AND ended_at <= ?3 AND (?4 IS NULL OR username=?4) ORDER BY ended_at {} LIMIT ?5 OFFSET ?6", if order == SortOrder::Asc { "ASC" } else { "DESC" });
             let mut stmt = db.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params![direction, start, end, username, limit, offset])?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
                 out.push(TransferErrorDetail {
-                    id: row.get(0)?, username: row.get(1)?, direction: api_direction(&row.get::<_, String>(2)?), filename: row.get(3)?,
+                    id: stored_id(row, 0)?, username: row.get(1)?, direction: api_direction(&row.get::<_, String>(2)?), filename: row.get(3)?,
                     size: row.get(4)?, state: summary_state(row.get(5)?),
                     requested_at: datetime(row, 6)?.ok_or(rusqlite::Error::InvalidQuery)?,
                     enqueued_at: datetime(row, 7)?, started_at: datetime(row, 8)?, ended_at: datetime(row, 9)?,
@@ -445,6 +478,7 @@ impl ReportsService {
                     windowed(
                         "SELECT direction, error, username, files FROM transfer_error_hours",
                         &format!("SELECT direction, {ERROR_TEXT}, username, 1"),
+                        "transfer_details",
                         "(state & ~48) != 0",
                     )
                 ))?;
@@ -530,7 +564,8 @@ impl ReportsService {
                  ORDER BY COUNT(DISTINCT username) DESC, SUM(files) DESC, directory LIMIT ?8 OFFSET ?9",
                 windowed(
                     "SELECT directory, username, files FROM transfer_directory_hours",
-                    &format!("SELECT {DIRECTORY}, username, 1"),
+                    "SELECT directory, username, 1",
+                    "transfer_details",
                     "direction = 'Upload' AND state = 48",
                 )
             ))?;
@@ -916,6 +951,36 @@ mod tests {
         timestamp(time.parse().unwrap())
     }
 
+    /// SQL storing `filename` in the interned path tables, for [`file`].
+    fn intern_file(filename: &str) -> String {
+        let split = filename.rfind(['/', '\\']).map_or(0, |i| i + 1);
+        let (path, name) = filename.split_at(split);
+        format!(
+            "INSERT INTO transfer_directories (path) VALUES ('{path}') ON CONFLICT DO NOTHING;
+             INSERT INTO transfer_files (directory_id, name)
+             SELECT directory_id, '{name}' FROM transfer_directories WHERE path = '{path}'
+             ON CONFLICT DO NOTHING;"
+        )
+    }
+
+    /// A SQL expression for the `file_id` of `filename` (stored by [`intern_file`]).
+    fn file(filename: &str) -> String {
+        format!(
+            "(SELECT file_id FROM transfer_files JOIN transfer_directories USING (directory_id)
+              WHERE path || name = '{filename}')"
+        )
+    }
+
+    /// SQL storing `error`, then a SQL expression for its `error_id`.
+    fn error(error: &str) -> (String, String) {
+        (
+            format!(
+                "INSERT INTO transfer_errors (exception) VALUES ('{error}') ON CONFLICT DO NOTHING;"
+            ),
+            format!("(SELECT error_id FROM transfer_errors WHERE exception = '{error}')"),
+        )
+    }
+
     #[tokio::test]
     async fn chart_keeps_exact_edges_and_tracks_transfer_changes() {
         let (reports, _directory) = fixture();
@@ -950,9 +1015,12 @@ mod tests {
             "DELETE FROM transfers WHERE id = 'd2';
              UPDATE transfers SET direction = 'Upload', size = 50 WHERE id = 'd1';
              UPDATE transfers SET state = 48, ended_at = {} WHERE id = 'd3';
-             INSERT INTO transfers (id, username, direction, filename, size, state, requested_at, ended_at)
-             VALUES ('d5', 'alice', 'Download', 'five.flac', 7, 48, 0, {});",
+             {}
+             INSERT INTO transfers (id, username, direction, file_id, size, state, requested_at, ended_at)
+             VALUES ('d5', 'alice', 'Download', {}, 7, 48, 0, {});",
             stored("2026-01-01T02:01:00.000000000Z"),
+            intern_file("five.flac"),
+            file("five.flac"),
             stored("2026-01-01T01:59:59.999999999Z"),
         );
         reports
@@ -1095,7 +1163,7 @@ mod tests {
 
     /// Each rollup table, sorted, and what the migration's backfill makes of `transfers`.
     fn rollups(db: &rusqlite::Connection) -> Vec<(Vec<String>, Vec<String>)> {
-        let backfill = include_str!("../transfers/migrations/report_hours.sql");
+        let backfill = include_str!("../transfers/migrations/compact.sql");
         let dump = |sql: &str| -> Vec<String> {
             let mut stmt = db.prepare(sql).unwrap();
             let columns = stmt.column_count();
@@ -1137,17 +1205,31 @@ mod tests {
     async fn report_hours_follow_transfer_changes() {
         let (reports, _directory) = fixture();
         let hour = |h: i64| stored("2026-01-01T00:00:00Z") + h * 3_600_000_000_000;
+        let files = [
+            r"music\other\a.flac",
+            r"music\other\b.flac",
+            "music/other/c.flac",
+            r"music\moved\two.flac",
+        ];
+        let (timed_out, timed_out_id) = error("X: timed out");
+        let (gone, gone_id) = error("Y: gone");
         let changes = format!(
-            "INSERT INTO transfers (id, username, direction, filename, size, state, requested_at,
-                 enqueued_at, started_at, ended_at, average_speed, exception) VALUES
-                 ('u3', 'carol', 'Upload', 'music\\other\\a.flac', 5, 48, 0, {e}, {s}, {a}, 3, NULL),
-                 ('u4', 'carol', 'Upload', 'music\\other\\b.flac', 6, 272, 0, NULL, NULL, {b}, 0, 'X: timed out'),
-                 ('u5', 'dave', 'Upload', 'music/other/c.flac', 7, 2, 0, NULL, NULL, NULL, 0, NULL);
+            "{interned} {timed_out} {gone}
+             INSERT INTO transfers (id, username, direction, file_id, size, state, requested_at,
+                 enqueued_at, started_at, ended_at, average_speed, error_id) VALUES
+                 ('u3', 'carol', 'Upload', {f0}, 5, 48, 0, {e}, {s}, {a}, 3, NULL),
+                 ('u4', 'carol', 'Upload', {f1}, 6, 272, 0, NULL, NULL, {b}, 0, {timed_out_id}),
+                 ('u5', 'dave', 'Upload', {f2}, 7, 2, 0, NULL, NULL, NULL, 0, NULL);
              UPDATE transfers SET state = 48, ended_at = {b}, started_at = {b} - 3000000000, average_speed = 2 WHERE id = 'u5';
-             UPDATE transfers SET state = 1040, exception = 'Y: gone' WHERE id = 'u1';
-             UPDATE transfers SET username = 'erin', filename = 'music\\moved\\two.flac' WHERE id = 'u2';
+             UPDATE transfers SET state = 1040, error_id = {gone_id} WHERE id = 'u1';
+             UPDATE transfers SET username = 'erin', file_id = {f3} WHERE id = 'u2';
              UPDATE transfers SET ended_at = NULL, state = 2 WHERE id = 'd3';
              DELETE FROM transfers WHERE id IN ('d2', 'u4');",
+            interned = files.map(intern_file).concat(),
+            f0 = file(files[0]),
+            f1 = file(files[1]),
+            f2 = file(files[2]),
+            f3 = file(files[3]),
             e = hour(1),
             s = hour(1) + 2_000_000_000,
             a = hour(1) + 5_000_000_000,

@@ -102,7 +102,7 @@ impl TransferService {
                             RETURNING id, removed",
                         )?
                         .query_map(params![name, DELETE_BATCH], |row| {
-                            Ok((row.get(0)?, row.get(1)?))
+                            Ok((super::store::id(row, 0)?, row.get(1)?))
                         })?
                         .collect()
                     })
@@ -170,7 +170,7 @@ mod tests {
             db.call(move |db| {
                 db.execute(
                     "UPDATE transfers SET state = ?1 WHERE id = ?2",
-                    params![bits, t.id],
+                    params![bits, store::key(&t.id)],
                 )
             })
             .await

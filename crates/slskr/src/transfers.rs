@@ -59,7 +59,9 @@ use store::Snapshot;
 
 #[cfg(test)]
 pub(crate) use store::MIGRATIONS as TRANSFER_MIGRATIONS;
-pub(crate) use store::{date as stored_date, state_from_bits, timestamp as stored_time};
+pub(crate) use store::{
+    date as stored_date, id as stored_id, mask_addresses, state_from_bits, timestamp as stored_time,
+};
 
 #[derive(Clone)]
 pub struct TransferService(Arc<Inner>);
@@ -270,8 +272,14 @@ impl TransferService {
                         }
                         let cfg = service.0.core.options.get();
                         let pruned = store::prune(service.database(), &cfg.retention).await;
+                        let purged = store::purge(service.database()).await;
+                        if let Err(error) = &purged {
+                            tracing::warn!(%error, "could not delete old removed transfers");
+                        }
                         // Most ticks remove nothing; keep idle lists cacheable then.
-                        if pruned.as_ref().map_or(true, |removed| !removed.is_empty()) {
+                        if pruned.as_ref().map_or(true, |removed| !removed.is_empty())
+                            || purged.as_ref().map_or(true, |deleted| *deleted > 0)
+                        {
                             service.wrote(TransferDirection::Download);
                             service.wrote(TransferDirection::Upload);
                         }
@@ -494,8 +502,8 @@ impl TransferService {
         let mut upload_jobs = Vec::with_capacity(uploads.len());
         {
             let mut runtime = self.runtime();
-            for transfer in history {
-                runtime.history.record(&transfer);
+            for started in history {
+                runtime.history.record_start(started);
             }
             for (transfer, _, cancel) in &jobs {
                 runtime.insert(transfer.clone(), cancel.clone(), None, true);
@@ -1276,7 +1284,7 @@ impl TransferService {
                     finished.push(transfer.id.clone());
                 }
                 directions[direction_index(transfer.direction)] = true;
-                updates.push(Snapshot::new(transfer, entry.offset));
+                updates.push(Snapshot::new(transfer));
             }
             if !changed.is_empty() {
                 // In list order, and under the runtime lock so that a snapshot taken
@@ -1658,7 +1666,8 @@ fn exception_text(error: &Error) -> String {
         Error::Io(_) => "IOException",
         _ => "TransferException",
     };
-    format!("{kind}: {error}")
+    // Masked as stored, so the live and stored error agree.
+    store::mask_addresses(&format!("{kind}: {error}")).into_owned()
 }
 
 #[cfg(test)]
