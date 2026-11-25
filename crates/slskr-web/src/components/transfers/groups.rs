@@ -186,14 +186,24 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
         })
     });
     let folded = RwSignal::new(false);
-    let folded_folders = RwSignal::new(HashSet::<String>::new());
+    // Folders the user toggled away from the page default (`page.collapse`); choosing a
+    // new default resets them.
+    let toggled_folders = RwSignal::new(HashSet::<String>::new());
+    Effect::new(move |previous: Option<bool>| {
+        let collapse = page.collapse.get();
+        if previous.is_some_and(|previous| previous != collapse) {
+            toggled_folders.update(HashSet::clear);
+        }
+        collapse
+    });
     let tree =
         Memo::new(move |_| user.with(|user| user.as_ref().map(folder_tree).unwrap_or_default()));
     let folders =
         Memo::new(move |_| user.with(|user| user.as_ref().map(folder_files).unwrap_or_default()));
     let visible = Memo::new(move |_| {
         tree.with(|tree| {
-            folded_folders.with(|folded| {
+            let collapse = page.collapse.get();
+            toggled_folders.with(|toggled| {
                 let mut pending = tree
                     .get("")
                     .into_iter()
@@ -203,7 +213,8 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
                     .collect::<Vec<_>>();
                 let mut visible = Vec::new();
                 while let Some((path, depth, label)) = pending.pop() {
-                    if !path.is_empty() && !folded.contains(path) {
+                    // Open unless folded: by default, or by the user's own toggle.
+                    if !path.is_empty() && collapse == toggled.contains(path) {
                         pending.extend(
                             tree.get(path)
                                 .into_iter()
@@ -304,7 +315,7 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
                     </tr></thead>
                     <For each=move || visible.get()
                         key=Clone::clone children=move |(directory, depth, label)| view! {
-                            <TransferDirectory directory depth label folded_folders folders page/>
+                            <TransferDirectory directory depth label toggled_folders folders page/>
                         }/>
                 </table>
             </div>
@@ -345,7 +356,7 @@ fn TransferDirectory(
     directory: String,
     depth: usize,
     label: String,
-    folded_folders: RwSignal<HashSet<String>>,
+    toggled_folders: RwSignal<HashSet<String>>,
     folders: Memo<HashMap<String, FolderFiles>>,
     page: Page,
 ) -> impl IntoView {
@@ -371,7 +382,8 @@ fn TransferDirectory(
         })
     });
     let folded = Signal::derive(move || {
-        dir.with_value(|dir| folded_folders.with(|folded| folded.contains(dir)))
+        page.collapse.get()
+            != dir.with_value(|dir| toggled_folders.with(|toggled| toggled.contains(dir)))
     });
     view! {
         <tbody class="transfer-dir" class:is-folded=folded style=indent(depth)>
@@ -382,8 +394,8 @@ fn TransferDirectory(
                 <td colspan="5">
                     <button type="button" class="transfer-dir__toggle"
                         aria-expanded=move || (!folded.get()).to_string()
-                        on:click=move |_| dir.with_value(|dir| folded_folders.update(|folded| {
-                            if !folded.remove(dir) { folded.insert(dir.clone()); }
+                        on:click=move |_| dir.with_value(|dir| toggled_folders.update(|toggled| {
+                            if !toggled.remove(dir) { toggled.insert(dir.clone()); }
                         }))>
                         <Icon name=Signal::derive(move || if folded.get() { "chevron-right".to_owned() } else { "chevron-down".to_owned() })/>
                         <Icon name=Signal::derive(move || if folded.get() { "folder".to_owned() } else { "folder-open".to_owned() }) class="transfer-dir__icon"/>

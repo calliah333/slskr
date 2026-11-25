@@ -371,3 +371,26 @@ mod tests {
         assert_eq!(encode_uri_component("a b/ü"), "a%20b%2F%C3%BC");
     }
 }
+
+/// A view preference kept in this browser's local storage under `key`, so it survives
+/// reloads. Starts `false` when nothing is stored or storage is unavailable.
+pub fn stored_flag(key: &'static str) -> leptos::prelude::RwSignal<bool> {
+    use leptos::prelude::{Effect, Get, RwSignal};
+    let storage = || web_sys::window()?.local_storage().ok().flatten();
+    let flag = RwSignal::new(
+        storage()
+            .and_then(|storage| storage.get_item(key).ok().flatten())
+            .is_some_and(|value| value == "1"),
+    );
+    Effect::new(move |_| {
+        let set = flag.get();
+        if let Some(storage) = storage() {
+            let _ = if set {
+                storage.set_item(key, "1")
+            } else {
+                storage.remove_item(key)
+            };
+        }
+    });
+    flag
+}

@@ -33,6 +33,9 @@ use crate::{
     ui::{Alert, Badge, Button, DropdownMenu, EmptyState, Icon, Loading, Modal, ModalAction},
 };
 
+/// Local storage key: whether transfer folders start collapsed (downloads and uploads).
+const COLLAPSED_KEY: &str = "slskr-transfer-folders-collapsed";
+
 /// Where a transfer is in its life, for counts and the state filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Category {
@@ -300,6 +303,8 @@ struct Page {
     details: RwSignal<Option<String>>,
     /// Refreshed every 30 s for relative times ("2h ago").
     now: RwSignal<DateTime<Utc>>,
+    /// Whether folders start collapsed (remembered; a folder's own toggle overrides it).
+    collapse: RwSignal<bool>,
 }
 
 impl Page {
@@ -578,6 +583,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         change,
         details,
         now,
+        collapse: util::stored_flag(COLLAPSED_KEY),
     };
 
     let clear_completed = move || {
@@ -724,6 +730,10 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                         <span class="switch__track" aria-hidden="true"></span>
                         <span class="switch__label">"Show removed"</span>
                     </label>
+                    <Button size="sm" variant="ghost"
+                        icon=Signal::derive(move || if page.collapse.get() { "chevron-down".to_owned() } else { "chevron-up".to_owned() })
+                        text=Signal::derive(move || if page.collapse.get() { "Expand folders".to_owned() } else { "Collapse folders".to_owned() })
+                        on_click=Callback::new(move |_| page.collapse.update(|value| *value = !*value))/>
                 </div>
             </div>
 

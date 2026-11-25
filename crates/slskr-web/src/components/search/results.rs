@@ -29,6 +29,8 @@ use super::LiveResponses;
 
 /// Folder cards shown per "Show more".
 const PAGE_SIZE: usize = 10;
+/// Local storage key: whether result folders start collapsed.
+const COLLAPSED_KEY: &str = "slskr-search-folders-collapsed";
 
 /// A result row: a file of a response, and whether it can not be downloaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,7 +313,8 @@ pub(super) fn SearchResults(
     let filter = Memo::new(move |_| text.with(|text| Filter::parse(text)));
     let hide_locked = RwSignal::new(true);
     let free_only = RwSignal::new(false);
-    let collapsed = RwSignal::new(false);
+    // Remembered: a new search starts with its folders collapsed or expanded as last chosen.
+    let collapsed = util::stored_flag(COLLAPSED_KEY);
     let sort_by_queue = RwSignal::new(false);
     let hidden = RwSignal::new(BTreeSet::<String>::new());
     let limit = RwSignal::new(PAGE_SIZE);
