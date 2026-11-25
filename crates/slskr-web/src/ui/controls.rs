@@ -1,4 +1,4 @@
-//! Stand-alone controls: `Checkbox`, `Switch`, `Tabs`, `DropdownMenu`.
+//! Stand-alone controls: `Switch`, `Tabs`, `DropdownMenu`.
 //!
 //! Form controls bound to a labelled field (settings, setup) are in [`super::form`]. Plain
 //! inputs need no component: `<input class="input">`, `<select class="select">`,
@@ -11,33 +11,6 @@ use wasm_bindgen::JsCast;
 
 use super::icon::Icon;
 use super::join_classes;
-
-/// A native checkbox with its label: `<label class="check"><input class="checkbox">…`.
-/// Without `label` give `aria_label`.
-#[component]
-pub fn Checkbox(
-    #[prop(into)] checked: Signal<bool>,
-    #[prop(into)] on_change: Callback<bool>,
-    #[prop(into, optional)] label: Option<Signal<String>>,
-    #[prop(into, optional)] aria_label: Option<String>,
-    #[prop(into, optional)] disabled: Signal<bool>,
-    #[prop(into, optional)] id: Option<String>,
-) -> impl IntoView {
-    view! {
-        <label class="check">
-            <input
-                type="checkbox"
-                class="checkbox"
-                id=id
-                aria-label=aria_label
-                disabled=move || disabled.get()
-                prop:checked=move || checked.get()
-                on:change=move |ev| on_change.run(event_target_checked(&ev))
-            />
-            {label.map(|l| view! { <span>{move || l.get()}</span> })}
-        </label>
-    }
-}
 
 /// An on/off switch with its label (`role="switch"`).
 #[component]

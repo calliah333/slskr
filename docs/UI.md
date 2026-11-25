@@ -378,15 +378,12 @@ All take an extra `class` where it makes sense. Optional props can be left out.
 | `Stat` | `label`, `value: Signal<String>`, `hint`, `large`, children | `.stat` |
 | `Badge` | `variant`, `icon`, `text` or children, `title` | `.badge` |
 | `Alert` | `variant` ("info", "success", "warning", "danger"; Semantic's "negative"/"positive" accepted), `title`, `icon` ("" hides), `role`, `on_dismiss`, children | `.alert` |
-| `Spinner` | `large`, `label` | `.spinner` |
 | `Loading` | `label`, `page` (half-screen), `show_label` | `.loading` |
 | `Progress` | `value: Option<Signal<f64>>` (None = indeterminate), `total` (100), `variant: Signal<&str>`, `large`, `label` | `.progress` |
 | `Toast` | `variant`, `icon`, `on_dismiss`, children | `.toast` (inside your `.toast-region`) |
 | `StatusDot` | `status: Signal<&'static str>` ("online", "away", "busy", "offline"), `label`, `pulse` | `.status-dot` |
 | `Avatar` | `name`, `src`, `size` | `.avatar` with initials |
-| `Tooltip` | `text`, children | `<span title>` |
-| `Checkbox` | `checked`, `on_change: Callback<bool>`, `label` or `aria_label`, `disabled`, `id` | `label.check` |
-| `Switch` | same as `Checkbox` | `label.switch` |
+| `Switch` | `checked`, `on_change: Callback<bool>`, `label` or `aria_label`, `disabled`, `id`, `class` | `label.switch` |
 | `Tabs` | `items: Vec<TabItem>` (`TabItem::new(value, label).icon("…")`), `value`, `on_change`, `underline`, `label` | button tablist with arrow-key focus |
 | `DropdownMenu` | `label` (accessible name), `text`, `icon`, `variant`, `size`, `align` ("end"), children (menu items) | `.dropdown` + `.menu`; closes on item click, outside click, Escape |
 | `Modal` | `open: Signal<bool>` or `trigger: ViewFn`, `on_close`, `title`, `description`, `size` ("sm", "lg", "xl"), `close_button` (true), `content` (text) or children, `actions: Vec<ModalAction>` or `footer: ViewFn`, `class` | portal dialog |
@@ -422,7 +419,6 @@ separated by hairlines inside a `Section`. Use `wide=true` to put a full-width c
 | `Section { id, title, description, actions, footer }` | a `card form-section` whose content is `form-rows` |
 | `RowHeading { title, description }` | a small heading between rows |
 | `Field { id, label, help, error, locked_reason, tag, tag_title, actions, row, wide }` | `field form-field` (+ `form-row`, `form-row--wide`, `field--error`, `field--locked`): label head (lock icon `.form-locked`, `badge--outline` tag, actions), control, help, error |
-| `FieldGrid` | stacked fields side by side (`form-grid`) |
 | `TextInput { mono }`, `PasswordInput`, `TextArea`, `Select` | `input`/`textarea`/`select` bound to the field |
 | `NumberInput { unit, zero_label, fallback }` | narrow number with a unit addon (`input-affix`) and an optional "Unlimited" checkbox (`form-zero`) |
 | `DurationInput { optional }` | number and a unit select with choices from seconds to weeks plus "Never". The select uses `<id>-unit` |
@@ -459,12 +455,12 @@ queue counts are the stat tiles at the top of Overview.
 | `<i class="search icon">` | `<Icon name="search"/>` (mapping table in `src/ui/icon.rs`) |
 | `ui input`, `ui action input`, `ui left icon input` | `.input`, `.input-group`, `.input-icon` |
 | `ui dropdown` (native select) | `.select` |
-| `ui toggle checkbox`, `ui checkbox` | `Switch`, `Checkbox` |
+| `ui toggle checkbox`, `ui checkbox` | `Switch`, `<label class="check"><input type="checkbox" class="checkbox">` |
 | `ui label`, `ui basic label`, coloured labels | `Badge` (`badge--…`), `badge--outline` |
 | `ui message` (`negative`/`positive`/`warning`/`info`) | `Alert variant="danger"/"success"/"warning"/"info"` |
 | `ui table`, `celled`, `compact`, `collapsing` | `.table-wrap > .table`, `table--compact`, `shrink` |
 | `ui menu` / `tabular` / `pointing secondary` | `Tabs` (`tabs`, `tabs-underline`), `nav-list` |
-| `ui loader` | `Loading`, `Spinner` |
+| `ui loader` | `Loading`, `<span class="spinner">` |
 | `ui progress` | `Progress` |
 | `ui statistic(s)` | `Stat` in `.stats` |
 | `ui modal` | `Modal` |

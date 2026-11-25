@@ -143,12 +143,6 @@ pub fn RowHeading(
     }
 }
 
-/// Lays out several stacked fields side by side where there is room.
-#[component]
-pub fn FieldGrid(children: Children) -> impl IntoView {
-    view! { <div class="form-grid">{children()}</div> }
-}
-
 /// A labelled control with optional help, lock reason and error.
 ///
 /// Renders `<div class="field form-field">` (+ `form-row` in the row layout) with

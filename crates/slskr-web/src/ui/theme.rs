@@ -61,8 +61,6 @@ impl ThemeChoice {
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub choice: RwSignal<ThemeChoice>,
-    /// Whether the dark palette is in effect (resolves `system`).
-    pub dark: RwSignal<bool>,
 }
 
 fn storage() -> Option<web_sys::Storage> {
@@ -106,19 +104,17 @@ pub fn install() -> Theme {
             });
         }
     }
-    let dark = RwSignal::new(false);
     Effect::new(move |_| {
         let is_dark = match choice.get() {
             ThemeChoice::Light => false,
             ThemeChoice::Dark => true,
             ThemeChoice::System => system_dark.get(),
         };
-        dark.set(is_dark);
         if let Some(root) = document().document_element() {
             let _ = root.class_list().toggle_with_force("dark", is_dark);
         }
     });
-    let theme = Theme { choice, dark };
+    let theme = Theme { choice };
     provide_context(theme);
     theme
 }
@@ -126,7 +122,7 @@ pub fn install() -> Theme {
 /// Square icon button cycling light -> dark -> system (sun, moon, monitor icons).
 #[component]
 pub fn ThemeToggle() -> impl IntoView {
-    let Theme { choice, .. } = expect_context::<Theme>();
+    let Theme { choice } = expect_context::<Theme>();
     let label = move || format!("Theme: {} (click to change)", choice.get().as_str());
     let cycle = move |_| {
         let next = choice.get_untracked().next();

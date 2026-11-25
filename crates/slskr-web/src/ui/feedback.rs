@@ -1,5 +1,5 @@
-//! Status and feedback: `Alert`, `Badge`, `Spinner`, `Loading`, `Progress`, `Toast`,
-//! `StatusDot`, `Avatar`, `Tooltip`.
+//! Status and feedback: `Alert`, `Badge`, `Loading`, `Progress`, `Toast`, `StatusDot`,
+//! `Avatar`.
 
 use leptos::prelude::*;
 
@@ -89,26 +89,6 @@ pub fn Badge(
             {move || text.map(|t| t.get())}
         </span>
     }
-}
-
-/// An inline spinning ring in the current text color.
-#[component]
-pub fn Spinner(
-    /// `true` for the 28px size.
-    #[prop(optional)]
-    large: bool,
-    /// Accessible name; without it the spinner is decorative.
-    #[prop(into, optional)]
-    label: Option<String>,
-) -> impl IntoView {
-    let class = if large {
-        "spinner spinner--lg"
-    } else {
-        "spinner"
-    };
-    let role = label.is_some().then_some("status");
-    let hidden = label.is_none().then_some("true");
-    view! { <span class=class role=role aria-label=label aria-hidden=hidden></span> }
 }
 
 /// A centered loading row (spinner + muted text) for a page or a card that is loading.
@@ -267,10 +247,4 @@ pub fn Avatar(
             }}
         </span>
     }
-}
-
-/// Tooltip using the browser's native, keyboard-compatible `title` behavior.
-#[component]
-pub fn Tooltip(#[prop(into)] text: String, children: Children) -> impl IntoView {
-    view! { <span title=text>{children()}</span> }
 }
