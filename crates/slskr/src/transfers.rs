@@ -1,6 +1,7 @@
 //! Persistent Soulseek transfers, upload scheduling, and live progress.
 
 mod api;
+mod backoff;
 mod destination;
 mod folder;
 mod queue;
@@ -87,6 +88,7 @@ struct Runtime {
     uploads: UploadQueue,
     history: UploadHistory,
     bandwidth: Bandwidth,
+    backoff: backoff::UploadBackoff,
     completed: [CompletedMetrics; 2],
 }
 
@@ -257,7 +259,11 @@ impl TransferService {
                     _ = service.0.core.shutdown.cancelled() => { service.flush_all().await; break; }
                     _ = progress.tick() => { service.flush().await; }
                     _ = retention.tick() => {
-                        service.runtime().history.prune();
+                        {
+                            let mut runtime = service.runtime();
+                            runtime.history.prune();
+                            runtime.backoff.prune();
+                        }
                         let cfg = service.0.core.options.get();
                         let pruned = store::prune(service.database(), &cfg.retention).await;
                         service.wrote(TransferDirection::Download);
@@ -588,8 +594,41 @@ impl TransferService {
         if let Some(entry) = self.runtime().active.get_mut(id) {
             entry.stored = true;
         }
+        self.hold_failing_upload(&transfer, &cancel).await;
         let result = self.upload(&transfer, source, cancel, slot).await;
         self.finish(id, result).await;
+    }
+
+    /// Keeps an upload queued while its file is backing off for this user after repeated
+    /// failures (see [`backoff`]). It does not take a slot meanwhile, and the peer sees it
+    /// queued, with the time of the next attempt.
+    async fn hold_failing_upload(&self, t: &Transfer, cancel: &CancellationToken) {
+        let delay = {
+            let mut runtime = self.runtime();
+            let Some(delay) = runtime.backoff.delay(&t.username, &t.filename) else {
+                return;
+            };
+            if let Some(entry) = runtime.active.get_mut(&t.id) {
+                entry.transfer.next_attempt_at = TimeDelta::from_std(delay)
+                    .ok()
+                    .and_then(|delay| Utc::now().checked_add_signed(delay));
+                entry.touch();
+            }
+            delay
+        };
+        crate::profiling::UPLOADS_HELD.add(1);
+        crate::profiling::UPLOADS_HOLDING.add(1);
+        tracing::debug!(username = %t.username, filename = %t.filename, delay_s = delay.as_secs(),
+            "holding an upload that keeps failing");
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = tokio::time::sleep(delay) => {}
+        }
+        crate::profiling::UPLOADS_HOLDING.add(-1);
+        if let Some(entry) = self.runtime().active.get_mut(&t.id) {
+            entry.transfer.next_attempt_at = None;
+            entry.touch();
+        }
     }
 
     async fn upload(
@@ -1013,9 +1052,12 @@ impl TransferService {
             t.refresh_derived(Utc::now());
             let transfer = t.clone();
             entry.touch();
+            let offset = entry.offset;
+            crate::profiling::transfer_ended(transfer.direction, disposition);
             if transfer.direction == TransferDirection::Upload {
                 runtime.uploads.release(id);
                 runtime.history.record(&transfer);
+                runtime.backoff.record(&transfer, offset);
                 runtime
                     .uploads
                     .dispatch(&self.0.users, &cfg, self.upload_slots(&cfg));

@@ -40,6 +40,13 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
     // every state change had to update it.
     "DROP INDEX ix_transfers_state;",
     include_str!("migrations/integer_times.sql"),
+    // The only lookup by file (superseding a listed, completed transfer when the file is
+    // requested again) wants listed rows only. The full index also held every removed
+    // row, so a peer that re-requested one file thousands of times made each request scan
+    // thousands of entries; it was also a fifth of a large database.
+    "DROP INDEX ix_transfers_file;
+     CREATE INDEX ix_transfers_listed_file ON transfers(direction, username, filename)
+         WHERE removed = 0 AND (state & 16) != 0;",
 ];
 
 // `transfers.state` keeps the Soulseek transfer state bits (Requested 1, Queued 2,
