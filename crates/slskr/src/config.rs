@@ -6,7 +6,7 @@
 //! file, the environment or the command line is *pinned*: the settings API refuses to change
 //! it. The file is strict (unknown keys and invalid values fail startup); the store is
 //! lenient (they are logged and ignored). Relative paths resolve against the data directory.
-//! The file is polled for changes; [`restart_required`] decides which changes only take
+//! The file is polled for changes; `restart_required` decides which changes only take
 //! effect after a restart.
 
 pub mod store;

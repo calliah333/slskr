@@ -151,18 +151,14 @@ pub(super) fn scan_roots(
             let cached = previous
                 .and_then(|snapshot| snapshot.shares.get(spec.alias))
                 .filter(|share| share.root == root);
-            let contents = scan_root(
-                &spec,
-                root,
-                &roots,
-                &excludes,
-                &filters,
-                cancel,
-                cached,
-                |count| {
-                    progress(completed.saturating_add(count));
-                },
-            )?;
+            let skip = Skip {
+                roots: &roots,
+                excludes: &excludes,
+                filters: &filters,
+            };
+            let contents = scan_root(&spec, root, &skip, cancel, cached, |count| {
+                progress(completed.saturating_add(count));
+            })?;
             completed = completed.saturating_add(contents.file_count);
             shares.insert(spec.alias.into(), contents);
         }
@@ -177,12 +173,20 @@ pub(super) fn scan_roots(
     })
 }
 
+/// What a share walk leaves out.
+struct Skip<'a> {
+    /// Other share roots: each is walked on its own.
+    roots: &'a HashSet<PathBuf>,
+    /// Excluded share directories.
+    excludes: &'a [PathBuf],
+    /// `shares.exclude` patterns.
+    filters: &'a RegexSet,
+}
+
 fn scan_root(
     spec: &ShareSpec<'_>,
     root: PathBuf,
-    roots: &HashSet<PathBuf>,
-    excludes: &[PathBuf],
-    filters: &RegexSet,
+    skip: &Skip<'_>,
     cancel: &CancellationToken,
     cached: Option<&ShareContents>,
     progress: impl Fn(u32),
@@ -224,9 +228,12 @@ fn scan_root(
         if depth > 0
             && (!valid_remote_component(name)
                 || name.starts_with('.')
-                || (is_dir && roots.contains(path))
-                || excludes.iter().any(|exclude| path.starts_with(exclude))
-                || is_filtered(path, &root, spec.local, filters))
+                || (is_dir && skip.roots.contains(path))
+                || skip
+                    .excludes
+                    .iter()
+                    .any(|exclude| path.starts_with(exclude))
+                || is_filtered(path, &root, spec.local, skip.filters))
         {
             if is_dir {
                 entries.skip_current_dir();

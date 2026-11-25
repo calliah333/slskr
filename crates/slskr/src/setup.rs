@@ -311,7 +311,7 @@ fn announce(url: &str, code: &str) {
 }
 
 /// Middleware answering `503 {"error": "setup required"}` for every API route but
-/// [`OPEN_DURING_SETUP`] until setup is done. Paths are relative to `web.url_base`.
+/// `OPEN_DURING_SETUP` until setup is done. Paths are relative to `web.url_base`.
 pub async fn gate(State(app): State<AppState>, request: Request, next: Next) -> Response {
     if required(&app) && !OPEN_DURING_SETUP.contains(&request.uri().path()) {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, SETUP_REQUIRED);

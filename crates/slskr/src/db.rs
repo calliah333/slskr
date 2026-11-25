@@ -53,7 +53,7 @@ impl Database {
     /// File databases use write-ahead logging with `synchronous = NORMAL`: every commit is
     /// atomic and consistent, but the last commits before a power loss may roll back. They
     /// also use incremental auto-vacuum, so pages that retention frees are returned to the
-    /// file system by [`maintain`] rather than kept forever.
+    /// file system by `maintain` rather than kept forever.
     pub fn open(path: &Path, migrations: &[&str]) -> anyhow::Result<Self> {
         let in_memory = path == Path::new(":memory:");
         let connection = if in_memory {
@@ -141,7 +141,7 @@ impl Database {
     }
 
     /// Run a synchronous SQLite operation away from the async executor. A writer
-    /// connection also runs [`maintain`] after it, at most every [`MAINTENANCE_INTERVAL`].
+    /// connection also runs `maintain` after it, at most every `MAINTENANCE_INTERVAL`.
     ///
     /// Each call is timed for [`crate::profiling`] under its caller's line.
     #[track_caller]

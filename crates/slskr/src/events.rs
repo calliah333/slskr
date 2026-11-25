@@ -1,7 +1,7 @@
 //! The persistent event history (`events.db`) and `GET /api/events/history`.
 //!
 //! Events are written in order by one task, several per transaction when they arrive
-//! together. The history keeps the newest [`MAX_EVENTS`] events of the last [`MAX_AGE`].
+//! together. The history keeps the newest `MAX_EVENTS` events of the last `MAX_AGE`.
 
 use std::{sync::Arc, time::Duration};
 

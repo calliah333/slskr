@@ -151,7 +151,7 @@ pub fn db_site(database: &Arc<str>, site: &'static Location<'static>) -> Arc<DbS
         .clone()
 }
 
-/// Logs a database call that ran for [`SLOW_DB_CALL`] or longer.
+/// Logs a database call that ran for `SLOW_DB_CALL` or longer.
 pub fn db_call_ended(database: &str, site: &Location<'_>, wait: Duration, run: Duration) {
     if run >= SLOW_DB_CALL {
         tracing::info!(
