@@ -248,6 +248,7 @@ pub(crate) fn router(app: &AppState) -> Router {
         .quality(CompressionLevel::Fastest);
     let api = rest_routes()
         .into_router()
+        .route_layer(axum::middleware::from_fn(crate::profiling::http_timing))
         .route("/api", any(not_found))
         .route("/api/{*unknown}", any(not_found))
         .layer(RequestDecompressionLayer::new())

@@ -1,12 +1,15 @@
 //! SQLite database wrapper with ordered, transactional migrations.
 
 use std::{
+    panic::Location,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use rusqlite::{Connection, OpenFlags};
+
+use crate::profiling;
 
 /// How long a statement waits for a lock held by another connection before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,6 +36,8 @@ struct Inner {
     /// The database file; `None` in memory, where a second connection would be another
     /// database.
     path: Option<PathBuf>,
+    /// Names the database in [`profiling`]: the file stem, `(read)` for a reader.
+    label: Arc<str>,
 }
 
 struct Slot {
@@ -105,6 +110,7 @@ impl Database {
                     maintained_at: Some(Instant::now()),
                 }),
                 path: (!in_memory).then(|| path.to_owned()),
+                label: label(path).into(),
             }),
         })
     }
@@ -128,37 +134,54 @@ impl Database {
                     maintained_at: None,
                 }),
                 path: Some(path.clone()),
+                label: format!("{} (read)", self.inner.label).into(),
             }),
         })
     }
 
     /// Run a synchronous SQLite operation away from the async executor. A writer
     /// connection also runs [`maintain`] after it, at most every [`MAINTENANCE_INTERVAL`].
-    pub async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
+    ///
+    /// Each call is timed for [`crate::profiling`] under its caller's line.
+    #[track_caller]
+    pub fn call<T, F>(&self, f: F) -> impl Future<Output = anyhow::Result<T>> + Send + use<T, F>
     where
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        let caller = Location::caller();
+        let site = profiling::db_site(&self.inner.label, caller);
         let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
-            let mut slot = inner
-                .connection
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let result = f(&mut slot.connection).map_err(anyhow::Error::from);
-            if slot
-                .maintained_at
-                .is_some_and(|at| at.elapsed() >= MAINTENANCE_INTERVAL)
-            {
-                slot.maintained_at = Some(Instant::now());
-                if let Err(error) = maintain(&slot.connection) {
-                    tracing::warn!(%error, "could not maintain database");
+        let called = Instant::now();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut slot = inner
+                    .connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let started = Instant::now();
+                let result = f(&mut slot.connection).map_err(anyhow::Error::from);
+                let (wait, run) = (started - called, started.elapsed());
+                site.wait.record(wait);
+                site.run.record(run);
+                profiling::db_call_ended(&inner.label, caller, wait, run);
+                if slot
+                    .maintained_at
+                    .is_some_and(|at| at.elapsed() >= MAINTENANCE_INTERVAL)
+                {
+                    slot.maintained_at = Some(Instant::now());
+                    let started = Instant::now();
+                    if let Err(error) = maintain(&slot.connection) {
+                        tracing::warn!(%error, "could not maintain database");
+                    }
+                    tracing::info!(database = %inner.label, ms = started.elapsed().as_millis() as u64,
+                        "maintained database");
                 }
-            }
-            result
-        })
-        .await
-        .map_err(anyhow::Error::from)?
+                result
+            })
+            .await
+            .map_err(anyhow::Error::from)?
+        }
     }
 
     /// Runs [`maintain`] now.
@@ -215,3 +238,11 @@ fn release_free_pages(connection: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;
+
+/// `transfers` for `…/transfers.db`.
+fn label(path: &Path) -> String {
+    path.file_stem().map_or_else(
+        || "database".into(),
+        |stem| stem.to_string_lossy().into_owned(),
+    )
+}

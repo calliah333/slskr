@@ -14,6 +14,7 @@ pub mod files;
 pub mod http;
 pub mod logging;
 pub mod messaging;
+pub mod profiling;
 pub mod realtime;
 pub mod resolvers;
 pub mod search;

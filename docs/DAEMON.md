@@ -27,6 +27,7 @@ src/users.rs          UserService (peer info/browse cache, group and blacklist p
 src/shares.rs         ShareService (atomic scan snapshots, persisted cache, search/browse/resolve) + /shares routes
 src/files.rs          FileService + /files routes (downloads/incomplete dirs)
 src/telemetry/        TelemetryService ("metrics" events, prometheus) + /metrics and /reports routes (reports from transfers.db)
+src/profiling.rs      always-on timings (database calls per call site, API routes, transfer ends, CPU/RSS/tasks): slskr_profile_* metrics and a log report every 15 min
 src/transfers/        TransferService (downloads, uploads, upload queue, governor) + /transfers and /batches routes, transfers.db
 src/search/           SearchService + /searches routes + "search_*" events, search.db
 src/messaging/        MessagingService (conversations, rooms) + /conversations, /rooms routes, messaging.db
@@ -113,13 +114,14 @@ pub fn subscribe(&self) -> tokio::sync::watch::Receiver<State>;
 ### `db::Database` (Clone)
 ```rust
 pub fn open(path: &Path, migrations: &[&str]) -> anyhow::Result<Self>; // path ":memory:" in tests
-pub async fn call<T, F>(&self, f: F) -> anyhow::Result<T>
-    where F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static, T: Send + 'static; // spawn_blocking
+#[track_caller] pub fn call<T, F>(&self, f: F) -> impl Future<Output = anyhow::Result<T>> + Send + use<T, F>
+    where F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static, T: Send + 'static; // spawn_blocking, timed per caller line
 pub fn reader(&self) -> anyhow::Result<Self>; // separate read-only connection (itself in memory)
 ```
 Each `Database` is one connection behind a mutex, so calls run one at a time. File
 databases use WAL, so a `reader()` connection runs long reads (transfer reports) without
-holding up the writer.
+holding up the writer. `call` records its wait and run time in `profiling` under the
+database name and the caller's line, and logs calls that run for a second or more.
 Migrations: ordered SQL strings; applied ones tracked via `PRAGMA user_version`.
 Timestamps are stored as TEXT RFC 3339 UTC, except transfer times (`transfers.*_at`),
 which are INTEGER nanoseconds since the Unix epoch so reports can subtract and bucket
@@ -320,12 +322,19 @@ CREATE TABLE transfers (
   root TEXT -- migration 2: the remote folder of a folder download
 );
 CREATE INDEX ix_transfers_username ON transfers(username);
-CREATE INDEX ix_transfers_state ON transfers(state);
+CREATE INDEX ix_transfers_listed_file ON transfers(direction, username, filename)
+  WHERE removed = 0 AND (state & 16) != 0; -- superseding a listed transfer of the same file
 ```
 `state` stores the `soulseek::TransferState` bit values (`state & 16` is "completed");
 `transfers::store::{state_from_bits, state_to_bits}` convert them to and from the API's
 `TransferState` enum, and `state_description` holds the enum name for humans.
 `exception` holds the failure as `Kind: message`; the API calls it `error`.
+
+Upload backoff (`transfers/backoff.rs`): after two failures in a row of one file to one
+user, the next upload of it waits queued (`next_attempt_at` set, no slot held) for 1 min,
+doubling to 1 h. Peers that re-queue on every `UploadFailed` otherwise loop every few
+seconds. A success, or a failure that resumed past the furthest byte reached, resets it;
+records are kept in memory and forgotten after 6 h without a failure.
 
 ### Folder downloads and the download layout
 A download's local folder is computed from its stored record each time it is attempted

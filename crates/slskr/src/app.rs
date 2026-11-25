@@ -222,6 +222,7 @@ impl AppState {
         self.services.files.start(self.clone());
         self.services.transfers.start(self.clone());
         self.services.telemetry.start(&self.core);
+        crate::profiling::start(self.shutdown.clone());
         self.services.search.start(self.clone());
         self.services.messaging.start(self.clone());
 

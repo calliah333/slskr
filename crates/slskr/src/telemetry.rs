@@ -232,7 +232,11 @@ async fn scrape(State(state): State<AppState>, headers: HeaderMap) -> Response {
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_metrics(&state.services.telemetry.metrics()),
+        {
+            let mut text = render_metrics(&state.services.telemetry.metrics());
+            crate::profiling::render(&mut text);
+            text
+        },
     )
         .into_response()
 }
