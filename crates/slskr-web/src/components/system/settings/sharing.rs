@@ -139,8 +139,7 @@ pub fn SharedFolders() -> impl IntoView {
                 help="Never scans only on start and when you ask."/>
             <Advanced>
                 <Field id="setting-shares-excluded" label="Excluded folders" row=true wide=true
-                    locked_reason=locked
-                    help="Folders inside a shared folder that are left out.">
+                    locked_reason=locked>
                     <ChipInput items=excluded on_change=set_excluded mono=true
                         placeholder="/path/inside/a/share, then Enter"/>
                 </Field>
@@ -179,11 +178,11 @@ pub fn UploadLimits() -> impl IntoView {
     view! {
         <Section id="settings-uploads" title="Upload limits">
             <Setting key="uploads.slots" label="Upload slots" restart=true
-                kind=Kind::at_least_one(Some("uploads")) help="Uploads that run at the same time."/>
+                kind=Kind::at_least_one(Some("uploads"))/>
             <Setting key="uploads.speed_limit" label="Speed limit" kind=Kind::unlimited(Some("KiB/s"), 1024)
                 help="For all uploads together."/>
             <Advanced label="Per-user limits" open=Signal::derive(move || form.has_errors_below("uploads.limits"))>
-                <p class="help">"How much each user may queue and take. A group's own limits take precedence."</p>
+                <p class="help">"A group's own limits take precedence."</p>
                 <Limits prefix="uploads.limits".to_owned() zero="Unlimited"/>
             </Advanced>
         </Section>
@@ -206,7 +205,7 @@ fn Group(name: String) -> impl IntoView {
             "Leechers".to_owned(),
             "Users who share less than the minimums below.",
         ),
-        _ => (name.clone(), "Members are listed below."),
+        _ => (name.clone(), ""),
     };
     let removing = name.clone();
     let group_key = prefix.clone();
@@ -220,7 +219,7 @@ fn Group(name: String) -> impl IntoView {
                         {title}
                         {(!custom).then(|| view! { <Badge text="Built-in"/> })}
                     </h3>
-                    <p class="help">{description}</p>
+                    {(!description.is_empty()).then(|| view! { <p class="help">{description}</p> })}
                 </div>
                 {custom.then(|| view! {
                     <button type="button" class="btn btn--action is-danger group-remove" disabled=locked
@@ -243,10 +242,8 @@ fn Group(name: String) -> impl IntoView {
                     help="No limit leaves only the global slots."/>
                 <Setting key=key("speed_limit") label="Speed limit" kind=Kind::unlimited(Some("KiB/s"), 1024)/>
                 {leechers.then(|| view! {
-                    <Setting key="groups.leechers.min_shared_files" label="Minimum shared files" kind=Kind::count(Some("files"))
-                        help="Users sharing fewer files are leechers."/>
-                    <Setting key="groups.leechers.min_shared_directories" label="Minimum shared folders" kind=Kind::count(Some("folders"))
-                        help="Users sharing fewer folders are leechers."/>
+                    <Setting key="groups.leechers.min_shared_files" label="Minimum shared files" kind=Kind::count(Some("files"))/>
+                    <Setting key="groups.leechers.min_shared_directories" label="Minimum shared folders" kind=Kind::count(Some("folders"))/>
                 })}
                 <Advanced label="Per-user limits" open=Signal::derive(move || form.has_errors_below(&open_limits))>
                     <p class="help">"Inherit uses the upload limits."</p>
@@ -295,7 +292,7 @@ pub fn Groups() -> impl IntoView {
     };
     view! {
         <Section id="settings-groups" title="Groups"
-            description="Upload queues for sets of users. Privileged users always go first, then lower priority numbers."
+            description="Privileged users always go first."
             actions=ViewFn::from(move || view! {
                 <button type="button" class="btn btn--sm group-add-open" on:click=open_add>
                     <Icon name="user-plus"/>"Add group"
@@ -310,8 +307,7 @@ pub fn Groups() -> impl IntoView {
                 <Show when=move || adding.get()>
                     <form class="settings-group settings-group--new" novalidate
                         on:submit=move |event| { event.prevent_default(); add(); }>
-                        <Field id="settings-new-group" label="New group" error=error
-                            help="Saved with the other changes.">
+                        <Field id="settings-new-group" label="New group" error=error>
                             <div class="input-group">
                                 <TextInput value=name on_input=move |t: String| name.set(t)
                                     placeholder="e.g. friends"/>
@@ -335,7 +331,7 @@ pub fn Groups() -> impl IntoView {
 pub fn Blacklist() -> impl IntoView {
     view! {
         <Section id="settings-blacklist" title="Blacklist"
-            description="Users who can not search, browse or download from you. Failed uploads to them are deleted from the history.">
+            description="Failed uploads to blacklisted users are deleted from the history.">
             <Setting key="blacklist.users" label="Users" kind=Kind::List("Username, then Enter")
                 help="Exact usernames, case-insensitive."/>
             <Setting key="blacklist.patterns" label="Username patterns" kind=Kind::MonoList("e.g. spam*, then Enter")
@@ -343,7 +339,7 @@ pub fn Blacklist() -> impl IntoView {
             <Setting key="blacklist.cidrs" label="IP ranges" kind=Kind::MonoList("e.g. 203.0.113.0/24, then Enter")
                 help="Search responses and downloads also check the peer's address."/>
             <Setting key="blacklist.ban_upload_loops" label="Ban looping peers" kind=Kind::Toggle
-                help="Add a user here when their client has been requesting files and dropping them before any data, over and over for a day, without one completing. Unreachable or slow users are never banned."/>
+                help="Blocks users whose client keeps requesting files and dropping them, for a day, without finishing one."/>
         </Section>
     }
 }

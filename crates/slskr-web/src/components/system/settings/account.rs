@@ -158,10 +158,8 @@ pub fn SoulseekAccount() -> impl IntoView {
                 help="If the username isn't registered yet, logging in creates it."/>
             <Setting key="soulseek.password" label="Password" kind=Kind::Secret { confirm: false }/>
             <Advanced open=Signal::derive(move || form.error("soulseek.server").is_some() || form.error("soulseek.connect").is_some())>
-                <Setting key="soulseek.server" label="Server" kind=Kind::Mono
-                    help="host:port of the Soulseek server."/>
-                <Setting key="soulseek.connect" label="Connect on start" kind=Kind::Toggle restart=true
-                    help="Log in to Soulseek when slskr starts."/>
+                <Setting key="soulseek.server" label="Server" kind=Kind::Mono/>
+                <Setting key="soulseek.connect" label="Connect on start" kind=Kind::Toggle restart=true/>
             </Advanced>
         </Section>
     }
@@ -171,13 +169,11 @@ pub fn SoulseekAccount() -> impl IntoView {
 pub fn Profile() -> impl IntoView {
     view! {
         <Section id="settings-profile" title="Profile">
-            <Setting key="soulseek.description" label="Description" kind=Kind::TextArea
-                help="Shown to peers viewing your user info."/>
+            <Setting key="soulseek.description" label="Description" kind=Kind::TextArea/>
             <Setting key="soulseek.picture" label="Picture" kind=Kind::Mono
                 placeholder="/path/to/picture.png"
-                help="An image file on the slskr machine; empty for none."/>
-            <Setting key="soulseek.rooms" label="Rooms to join" kind=Kind::List("Room name, then Enter")
-                help="Chat rooms joined after every login."/>
+                help="A path on the slskr machine."/>
+            <Setting key="soulseek.rooms" label="Rooms to join" kind=Kind::List("Room name, then Enter")/>
         </Section>
     }
 }
@@ -187,8 +183,7 @@ pub fn WebLogin() -> impl IntoView {
     let form = use_form();
     view! {
         <Section id="settings-web" title="Web sign-in">
-            <Setting key="web.username" label="Username" kind=Kind::Text
-                help="The name you sign in with."/>
+            <Setting key="web.username" label="Username" kind=Kind::Text/>
             <Setting key="web.password" label="Password" kind=Kind::Secret { confirm: true }
                 help="At least 8 characters."/>
             <Show when=move || form.changes_sign_in()>

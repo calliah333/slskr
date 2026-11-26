@@ -11,8 +11,7 @@ pub fn Search() -> impl IntoView {
         <Section id="settings-search" title="Search throttling">
             <Setting key="search.incoming_concurrency" label="Searches answered at once" restart=true
                 kind=Kind::at_least_one(Some("searches"))/>
-            <Setting key="search.incoming_circuit_breaker" label="Queue limit" kind=Kind::count(Some("searches"))
-                help="Searches queued beyond this are dropped."/>
+            <Setting key="search.incoming_circuit_breaker" label="Queue limit" kind=Kind::count(Some("searches"))/>
             <Setting key="search.response_file_limit" label="Files per response" kind=Kind::count(Some("files"))/>
             <Setting key="search.ignore_queries" label="Ignore searches" kind=Kind::MonoList("Regular expression, then Enter")
                 help="Case-insensitive regular expressions; matching searches are not answered."/>
@@ -68,8 +67,7 @@ pub fn Logging() -> impl IntoView {
                 kind=Kind::Select(vec![("trace", "Trace"), ("debug", "Debug"), ("info", "Info"), ("warn", "Warn"), ("error", "Error")])
                 help="RUST_LOG takes precedence."/>
             <Setting key="logging.file" label="Write log files" kind=Kind::Toggle restart=true/>
-            <Setting key="metrics.enabled" label="Prometheus metrics" kind=Kind::Toggle restart=true
-                help="Serve metrics for Prometheus to scrape."/>
+            <Setting key="metrics.enabled" label="Prometheus metrics" kind=Kind::Toggle restart=true/>
             <Advanced label="Metrics endpoint" open=Signal::derive(move || form.has_errors_below("metrics"))>
                 <Setting key="metrics.path" label="Path" kind=Kind::Mono restart=true placeholder="/metrics"/>
                 <Setting key="metrics.username" label="Username" kind=Kind::Text restart=true

@@ -73,7 +73,6 @@ pub fn ApiKeys() -> impl IntoView {
 
     view! {
         <Section id="settings-api-keys" title="API keys"
-            description="Let scripts use the API with the X-API-Key header. Changes apply at once."
             actions=ViewFn::from(move || view! {
                 <button type="button" class="btn btn--sm api-key-new" on:click=new_key>
                     <Icon name="plus"/>"Create key"
@@ -237,7 +236,6 @@ fn CreateKeyDialog(open: RwSignal<bool>) -> impl IntoView {
     view! {
         <Modal open=open on_close=Callback::new(move |()| close())
             title="Create API key" class="api-key-dialog"
-            description="Keys are shown once. Give each script its own key."
             footer=ViewFn::from(move || view! {
                 <Show when=move || created.with(Option::is_none)
                     fallback=move || view! {
@@ -282,8 +280,7 @@ fn CreateKeyDialog(open: RwSignal<bool>) -> impl IntoView {
                     <form id="api-key-form" class="stack api-key-create" novalidate
                         on:submit=move |event| { event.prevent_default(); create(); }>
                         {move || error.get().map(|message| view! { <FormMessage kind="danger"><p>{message}</p></FormMessage> })}
-                        <Field id="api-key-name" label="Name" error=name_error
-                            help="To recognise the key, e.g. the script using it.">
+                        <Field id="api-key-name" label="Name" error=name_error>
                             <TextInput value=name node_ref=name_ref on_input=move |t: String| name.set(t)
                                 placeholder="e.g. soularr"/>
                         </Field>

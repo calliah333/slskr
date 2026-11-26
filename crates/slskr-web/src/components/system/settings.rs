@@ -425,7 +425,6 @@ fn PendingRestart() -> impl IntoView {
                 <Icon name="rotate-cw"/>
                 <div class="alert__body">
                     <div class="alert__title">"Restart to apply changes"</div>
-                    <p>"Some saved settings take effect after slskr restarts."</p>
                     {move || error.get().map(|message| view! { <p class="text-danger" role="alert">{message}</p> })}
                 </div>
                 <button type="button" class="btn btn--sm pending-restart-button" disabled=restarting

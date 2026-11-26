@@ -12,8 +12,7 @@ pub fn DownloadFolders() -> impl IntoView {
         <Section id="settings-downloads" title="Download folders">
             <Setting key="downloads.directory" label="Completed downloads" kind=Kind::Mono
                 help="Relative paths are inside the data directory."/>
-            <Setting key="downloads.incomplete_directory" label="Incomplete downloads" kind=Kind::Mono
-                help="Files stay here until they are complete."/>
+            <Setting key="downloads.incomplete_directory" label="Incomplete downloads" kind=Kind::Mono/>
             <Setting key="downloads.on_conflict" label="When the file exists"
                 kind=Kind::Select(vec![("rename", "Rename the new file"), ("overwrite", "Overwrite it")])/>
             <Advanced open=Signal::derive(move || {
@@ -37,8 +36,7 @@ pub fn DownloadLimits() -> impl IntoView {
                 kind=Kind::unlimited(Some("files"), 10)/>
             <Setting key="downloads.speed_limit" label="Speed limit" kind=Kind::unlimited(Some("KiB/s"), 1024)
                 help="For all downloads together."/>
-            <Setting key="downloads.resume" label="Resume partial files" kind=Kind::Toggle
-                help="Continue where an interrupted download stopped."/>
+            <Setting key="downloads.resume" label="Resume partial files" kind=Kind::Toggle/>
             <Setting key="downloads.retry_attempts" label="Attempts per file" kind=Kind::count(Some("attempts"))/>
             <Setting key="downloads.retry_delay" label="First retry after" kind=Kind::Duration
                 help="The wait doubles after each failure, up to the longest delay."/>
