@@ -54,7 +54,7 @@ fn touched_parent<'a>(path: &'a str, touched: &HashSet<&str>) -> Option<&'a str>
         .find(|path| touched.contains(path))
 }
 
-/// Each row's child rows (`""` holds the top level), in first-seen order. Folders
+/// Each row's child rows (`""` holds the top level), alphabetically. Folders
 /// without files that lead to only one branch fold into their child's row.
 fn folder_tree<'a>(
     directories: impl IntoIterator<Item = &'a str> + Clone,
@@ -75,6 +75,9 @@ fn folder_tree<'a>(
             }
             path = parent;
         }
+    }
+    for rows in children.values_mut() {
+        rows.sort_by_cached_key(|path| (path.to_lowercase(), path.clone()));
     }
     children
 }
@@ -927,16 +930,16 @@ mod tests {
         assert_eq!(
             children(r"music\Beatles"),
             [
-                r"music\Beatles\White Album",
                 r"music\Beatles\Magical Mystery Tour",
-                r"music\Beatles\Revolver"
+                r"music\Beatles\Revolver",
+                r"music\Beatles\White Album"
             ]
         );
         assert_eq!(
             children(r"music\Beatles\White Album"),
             [
-                r"music\Beatles\White Album\CD02",
-                r"music\Beatles\White Album\CD01"
+                r"music\Beatles\White Album\CD01",
+                r"music\Beatles\White Album\CD02"
             ]
         );
         // Without a shared folder to leave out, `music` is where everything branches.
