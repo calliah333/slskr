@@ -84,8 +84,7 @@ pub fn ApiKeys() -> impl IntoView {
                 let keys = keys();
                 if keys.is_empty() {
                     return view! {
-                        <EmptyState icon="key" title="No API keys yet"
-                            description="Create a key for each script or tool that talks to slskr."/>
+                        <EmptyState icon="key" title="No API keys yet"/>
                     }.into_any();
                 }
                 view! {

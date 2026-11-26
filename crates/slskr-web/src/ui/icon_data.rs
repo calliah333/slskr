@@ -40,6 +40,14 @@ pub(super) const ICONS: &[(&str, &str)] = &[
     ("chevron-left", r#"<path d="m15 18-6-6 6-6"/>"#),
     ("chevron-right", r#"<path d="m9 18 6-6-6-6"/>"#),
     ("chevron-up", r#"<path d="m18 15-6-6-6 6"/>"#),
+    (
+        "chevrons-down-up",
+        r#"<path d="m7 20 5-5 5 5"/><path d="m7 4 5 5 5-5"/>"#,
+    ),
+    (
+        "chevrons-up-down",
+        r#"<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>"#,
+    ),
     ("circle", r#"<circle cx="12" cy="12" r="10"/>"#),
     (
         "circle-alert",
@@ -256,6 +264,10 @@ pub(super) const ICONS: &[(&str, &str)] = &[
     (
         "rotate-cw",
         r#"<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>"#,
+    ),
+    (
+        "rows-4",
+        r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M21 7.5H3"/><path d="M21 12H3"/><path d="M21 16.5H3"/>"#,
     ),
     (
         "save",

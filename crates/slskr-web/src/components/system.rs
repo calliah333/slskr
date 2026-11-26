@@ -44,8 +44,7 @@ pub fn System() -> impl IntoView {
     let base = base.trim_end_matches('/').to_owned();
     view! {
         <div class="system stack">
-            <PageHeader title="System"
-                description="Status of the daemon, its shares, files, logs and recorded events."/>
+            <PageHeader title="System"/>
             <nav class="tabs-underline system-tabs" aria-label="System">
                 {TABS.into_iter().map(|(path, title, icon)| {
                     let active = move || tab.get() == path;

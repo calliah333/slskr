@@ -2,9 +2,7 @@ use super::browse::group_digits;
 use crate::{
     config,
     services::{api, util},
-    ui::{
-        Alert, Avatar, Badge, Button, Card, EmptyState, Icon, Loading, PageHeader, Stat, StatusDot,
-    },
+    ui::{Alert, Avatar, Badge, Button, Card, Icon, Loading, PageHeader, Stat, StatusDot},
 };
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_url};
@@ -78,7 +76,7 @@ pub fn Users() -> impl IntoView {
     let has_user = Signal::derive(move || lookup.with(|l| !matches!(l, Lookup::Idle)));
     view! {
         <div class="users users-container stack">
-            <PageHeader title="Users" description="Look up a Soulseek user to see their status, shares and profile."/>
+            <PageHeader title="Users"/>
             <Card title="Look up a user" class="users-form">
                 <form class="input-group" on:submit=move |event| { event.prevent_default(); search.run(()); }>
                     <div class="input-icon grow">
@@ -95,12 +93,7 @@ pub fn Users() -> impl IntoView {
                 </form>
             </Card>
             {move || match lookup.get() {
-                Lookup::Idle => view! {
-                    <Card>
-                        <EmptyState icon="users" title="No user selected"
-                            description="Enter a username to see whether they are online, what they share and what they say about themselves."/>
-                    </Card>
-                }.into_any(),
+                Lookup::Idle => ().into_any(),
                 Lookup::Loading(name) => view! {
                     <Card><Loading label=format!("Looking up {name}…") show_label=true/></Card>
                 }.into_any(),

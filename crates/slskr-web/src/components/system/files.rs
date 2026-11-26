@@ -263,12 +263,7 @@ fn Directory(root: &'static str) -> impl IntoView {
                 None if error.with(Option::is_some) => ().into_any(),
                 None => view! { <div class="loading" role="status"><span class="spinner"></span>"Loading…"</div> }.into_any(),
                 Some(list) if list.is_empty() => view! {
-                    <EmptyState icon="folder-open" title="This folder is empty"
-                        description=if root == "downloads" {
-                            "Finished downloads are saved here."
-                        } else {
-                            "Partial files of downloads in progress are kept here."
-                        }/>
+                    <EmptyState icon="folder-open" title="This folder is empty"/>
                 }.into_any(),
                 Some(list) => view! {
                     <div class="table-wrap" aria-busy=move || loading.get().then_some("true")>

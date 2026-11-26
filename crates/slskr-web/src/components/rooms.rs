@@ -685,7 +685,6 @@ pub fn Rooms() -> impl IntoView {
                         class="messenger__back" on_click=Callback::new(move |_| show_buffer.set(false))/>
                     <Show when=move || has_room.get() fallback=|| view! {
                         <h2 class="topic__name">"Rooms"</h2>
-                        <span class="topic__text"><span class="truncate">"Public chat rooms \u{b7} type /join room"</span></span>
                     }>
                         <h2 class="topic__name">
                             <span class="topic__sigil" aria-hidden="true">
@@ -743,8 +742,7 @@ pub fn Rooms() -> impl IntoView {
                                 if !has_room.get() {
                                     view! {
                                         <div class="buffer__empty">
-                                            <EmptyState icon="messages-square" title="Join a room to start chatting"
-                                                description="Rooms are public group chats on the Soulseek network. Type /join room below or pick one from the list.">
+                                            <EmptyState icon="messages-square" title="Join a room to start chatting">
                                                 <Button variant="primary" size="sm" icon="plus" text="Join room"
                                                     on_click=Callback::new(move |_| join_open.set(true))/>
                                             </EmptyState>

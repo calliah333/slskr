@@ -148,8 +148,7 @@ pub fn FolderList(
         <div class="folder-list">
             <Show when=move || !shown.with(Vec::is_empty)
                 fallback=|| view! {
-                    <EmptyState icon="folder-open" title="No shared folders yet"
-                        description="Add the folders other users may browse and download from."/>
+                    <EmptyState icon="folder-open" title="No shared folders yet"/>
                 }>
                 <ul class="folder-list__rows" aria-label="Shared folders">
                     <For each=move || shown.get() key=|(index, entry)| (*index, entry.format()) let:row>
@@ -287,7 +286,6 @@ pub fn DirectoryPicker(open: RwSignal<bool>, on_pick: Callback<String>) -> impl 
     view! {
         <Modal open=open on_close=Callback::new(move |()| open.set(false))
             title="Choose a folder to share" class="directory-picker"
-            description="Open a folder, then share it with everything inside."
             footer=ViewFn::from(move || view! {
                 <span class="directory-picker-selected mono" title=current_path>
                     {current_path}

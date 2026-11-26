@@ -335,7 +335,6 @@ fn SearchBox(
                 <div class="input-icon search-box__field">
                     <Icon name="search" size="lg"/>
                     <input type="search" class="input" aria-label="Search phrase"
-                        aria-describedby=move || (!connected.get()).then_some("search-box-offline")
                         data-lpignore="true" autocomplete="off" autofocus
                         disabled=move || busy.get() || !connected.get()
                         placeholder=move || if connected.get() { "Artist, album, track…" } else { "Connect to the server to search" }
@@ -350,11 +349,6 @@ fn SearchBox(
                         loading=creating disabled=blocked/>
                 </div>
             </form>
-            <Show when=move || !connected.get()>
-                <p id="search-box-offline" class="help search-box__help text-warning">
-                    <Icon name="wifi-off" size="xs"/> " Not connected to the Soulseek server. Connect from the header to search."
-                </p>
-            </Show>
         </Card>
         <Modal open=help on_close=Callback::new(move |()| help.set(false)) title="Advanced search" size="sm">
             <div class="stack stack--sm">
@@ -420,8 +414,7 @@ fn SearchHistory(
                         }.into_any()
                     } else {
                         view! {
-                            <EmptyState icon="search" title="No searches yet"
-                                description="Searches you run appear here, newest first, with their results."/>
+                            <EmptyState icon="search" title="No searches yet"/>
                         }.into_any()
                     }
                 } else {

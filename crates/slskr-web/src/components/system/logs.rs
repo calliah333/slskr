@@ -246,7 +246,6 @@ fn LiveLog() -> impl IntoView {
 
     view! {
         <Card title="Live log" flush=true class="log-card"
-            description="Recent records from the daemon, newest at the bottom."
             actions=ViewFn::from(move || view! {
                 <span class=move || if paused.get() { "badge badge--warning" } else { "badge badge--success" }>
                     <span class=move || if paused.get() { "status-dot" } else { "status-dot status-dot--online status-dot--pulse" }></span>
@@ -393,7 +392,6 @@ fn LogFiles() -> impl IntoView {
 
     view! {
         <Card title="Log files" flush=true class="log-files"
-            description="One file per day in the data directory's logs folder."
             actions=ViewFn::from(move || view! {
                 <button type="button" class="btn btn--sm btn--icon" aria-label="Refresh log files" title="Refresh"
                     on:click=move |_| revision.update(|r| *r += 1)>

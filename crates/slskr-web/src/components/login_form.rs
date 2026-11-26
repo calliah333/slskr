@@ -48,7 +48,6 @@ pub(super) fn LoginForm(on_login: Callback<()>) -> impl IntoView {
                 <div class="card__header">
                     <div>
                         <h1 class="card__title">"Sign in"</h1>
-                        <p class="card__description">"Sign in to manage searches, transfers and shares"</p>
                     </div>
                 </div>
                 <form class="card__content stack" aria-busy=move || pending.get().to_string()

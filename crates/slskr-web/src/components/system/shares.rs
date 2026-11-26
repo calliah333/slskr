@@ -123,7 +123,6 @@ pub fn Shares() -> impl IntoView {
                 })}
             </div>
             <Card title="Shared folders" flush=true
-                description="Folders peers can browse and download from. Scans run at startup and after changes."
                 actions=ViewFn::from(move || {
                     let settings_href = settings_href.clone();
                     view! {
@@ -160,8 +159,7 @@ pub fn Shares() -> impl IntoView {
                     Some(list) if list.is_empty() => {
                         let href = settings_href_empty.clone();
                         view! {
-                            <EmptyState icon="folder-open" title="No shared folders"
-                                description="Share a folder so other Soulseek users can browse and download from you.">
+                            <EmptyState icon="folder-open" title="No shared folders">
                                 <a class="btn btn--primary" href=href><Icon name="plus"/>"Add shared folders"</a>
                             </EmptyState>
                         }.into_any()
@@ -183,7 +181,7 @@ pub fn Shares() -> impl IntoView {
                                         let name = share.alias.clone().unwrap_or_else(|| share.raw.clone());
                                         let local = share.local_path.clone().unwrap_or_else(|| share.raw.clone());
                                         let local_title = local.clone();
-                                        let remote = share.remote_path.clone();
+                                        let remote = share.remote_path.clone().filter(|remote| *remote != name);
                                         let count = |n: Option<u32>| n.map_or_else(|| "—".to_owned(), |n| n.to_string());
                                         let excluded = share.is_excluded;
                                         let scanned = share.files.is_some();

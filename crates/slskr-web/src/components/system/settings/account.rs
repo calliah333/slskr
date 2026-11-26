@@ -133,7 +133,6 @@ pub fn SoulseekAccount() -> impl IntoView {
     };
     view! {
         <Section id="settings-soulseek" title="Soulseek account"
-            description="The account slskr uses on the Soulseek network."
             actions=ViewFn::from(|| view! { <Connection/> })
             footer=ViewFn::from(move || view! {
                 <button type="button" class="btn btn--sm settings-test-login" disabled=testing
@@ -152,9 +151,7 @@ pub fn SoulseekAccount() -> impl IntoView {
                             <Icon name=if ok { "circle-check" } else { "circle-x" }/>{message}
                         </span>
                     }.into_any(),
-                    None => view! {
-                        <span class="help">"Checks the username and new password on a separate connection."</span>
-                    }.into_any(),
+                    None => ().into_any(),
                 }}
             })>
             <Setting key="soulseek.username" label="Username" kind=Kind::Text
@@ -173,8 +170,7 @@ pub fn SoulseekAccount() -> impl IntoView {
 #[component]
 pub fn Profile() -> impl IntoView {
     view! {
-        <Section id="settings-profile" title="Profile"
-            description="What other users see when they look you up.">
+        <Section id="settings-profile" title="Profile">
             <Setting key="soulseek.description" label="Description" kind=Kind::TextArea
                 help="Shown to peers viewing your user info."/>
             <Setting key="soulseek.picture" label="Picture" kind=Kind::Mono
@@ -190,8 +186,7 @@ pub fn Profile() -> impl IntoView {
 pub fn WebLogin() -> impl IntoView {
     let form = use_form();
     view! {
-        <Section id="settings-web" title="Web sign-in"
-            description="The username and password for this web UI.">
+        <Section id="settings-web" title="Web sign-in">
             <Setting key="web.username" label="Username" kind=Kind::Text
                 help="The name you sign in with."/>
             <Setting key="web.password" label="Password" kind=Kind::Secret { confirm: true }

@@ -167,7 +167,11 @@ fn pretty_bytes(bytes: u64) -> String {
     util::format_bytes(bytes as f64)
 }
 fn plural(count: u64, one: &str, many: &str) -> String {
-    format!("{count} {}", if count == 1 { one } else { many })
+    format!(
+        "{} {}",
+        util::group_digits(count),
+        if count == 1 { one } else { many }
+    )
 }
 
 /// "just now", "5m ago", "3h ago", "2d ago", or the date when older than a month.
@@ -284,9 +288,9 @@ pub fn Dashboard() -> impl IntoView {
 
     view! {
         <div class="dashboard stack">
-            <PageHeader title="Overview" description="Live transfers, history and reports."/>
+            <PageHeader title="Overview"/>
             <LiveStats/>
-            <Card title="History" description="Completed transfers in the selected period." title_id="history-heading"
+            <Card title="History" title_id="history-heading"
                 class="history" actions=ViewFn::from(move || view! {
                     <Tabs items=period_items.clone() value=period_value on_change=pick_period label="History range"/>
                 })>
@@ -397,7 +401,7 @@ fn SummaryStats(summary: Slot<TransferSummaryReport>) -> impl IntoView {
                 let down = bytes(report, TransferDirection::Download);
                 let up = bytes(report, TransferDirection::Upload);
                 let ratio = match (up, down) { (_, 0) => "—".to_owned(), (up, down) if up > 0 && (up as f64) < down as f64 * 0.01 => "< 0.01".to_owned(), (up, down) => format!("{:.2}", up as f64 / down as f64) };
-                (ratio, "Uploaded ÷ downloaded".into())
+                (ratio, String::new())
             })}
             {tile("Distinct peers", "users", "muted", |report| {
                 let peers = |direction| report.get(&direction)
@@ -405,7 +409,7 @@ fn SummaryStats(summary: Slot<TransferSummaryReport>) -> impl IntoView {
                     .map_or(0, |summary| summary.distinct_users);
                 let down = peers(TransferDirection::Download);
                 let up = peers(TransferDirection::Upload);
-                (format!("{down} down · {up} up"), "Successful transfers by direction".into())
+                (format!("{down} down · {up} up"), String::new())
             })}
         </div>
     }

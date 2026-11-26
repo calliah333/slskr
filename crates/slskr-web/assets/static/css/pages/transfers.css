@@ -5,7 +5,7 @@
 
 /* Toolbar: search grows, the state filter and the history switch wrap below it on phones. */
 .transfers-toolbar .toolbar { margin-bottom: 0; }
-.transfers-toolbar .input-icon { flex-basis: 16rem; }
+.transfers-toolbar .input-icon { flex-basis: 12rem; }
 .transfers-filter { max-width: 100%; }
 .transfers-tab-count {
   min-width: 1.25rem;
@@ -23,6 +23,7 @@
   color: hsl(var(--primary));
 }
 .transfers-history { margin-left: auto; padding-inline: var(--space-2) var(--space-3); white-space: nowrap; }
+.transfers-view { gap: 0; }
 @media (max-width: 639px) {
   .transfers-toolbar .input-icon { flex-basis: 100%; }
   .transfers-history { margin-left: 0; }
@@ -81,7 +82,7 @@
 .transfer-dir__row,
 .table tbody tr.transfer-dir__row:hover { background: hsl(var(--secondary) / 0.4); }
 .transfer-dir__row > td { padding-top: 0.375rem; padding-bottom: 0.375rem; }
-.transfer-dir__row > td[colspan] { padding-inline-start: calc(var(--space-3) + var(--transfer-indent)); }
+.transfer-dir__row > td[colspan] { padding-inline-start: var(--space-3); }
 .transfer-dir__toggle {
   display: flex;
   align-items: center;
@@ -98,6 +99,11 @@
   cursor: pointer;
 }
 .transfer-dir__toggle:hover .transfer-dir__path { text-decoration: underline; text-underline-offset: 2px; }
+/* The whole path on one line: the parent folders shrink (with an ellipsis) before the name. */
+.transfer-dir__path { display: flex; min-width: 0; white-space: nowrap; }
+.transfer-dir__parent { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: hsl(var(--muted-foreground)); font-weight: 400; }
+.transfer-dir__name { flex: 0 1 auto; min-width: 2rem; overflow: hidden; text-overflow: ellipsis; }
+.transfer-dir__parent:empty { display: none; }
 .transfer-dir__icon { color: hsl(var(--warning)); flex-shrink: 0; }
 .transfer-dir__count { margin-left: auto; flex-shrink: 0; font-weight: 400; }
 
@@ -106,7 +112,7 @@
 .transfer-table thead .check-col,
 .transfer-row .check-col,
 .transfer-dir__row .check-col { padding-left: var(--space-4); }
-.transfer-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; margin-inline-start: calc(var(--transfer-indent) + 2ch); }
+.transfer-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; margin-inline-start: 2ch; }
 .transfer-name__icon { flex-shrink: 0; color: hsl(var(--muted-foreground)); }
 .transfer-name > .truncate { flex: 0 1 auto; }
 .transfer-name > .badge { flex-shrink: 0; }
@@ -160,3 +166,14 @@
 .transfers:has(.transfers-selection) { padding-bottom: 4.5rem; }
 
 .transfer-details .dl { font-size: 0.8125rem; }
+
+/* ----- compact rows (the toolbar's rows toggle, remembered per browser) ----- */
+.transfers--compact .transfers-groups { gap: var(--space-2); }
+.transfers--compact .transfer-group__header { padding-block: var(--space-1); }
+.transfers--compact .transfer-group__title { flex-direction: row; align-items: baseline; gap: var(--space-2); }
+.transfers--compact .transfer-group__header .avatar { display: none; }
+.transfers--compact .transfer-table thead th { padding-block: 0.25rem; }
+.transfers--compact .transfer-dir__row > td,
+.transfers--compact .transfer-row > td { padding-block: 0.125rem; }
+.transfers--compact .transfer-progress { gap: 0.125rem; }
+.transfers--compact .transfer-actions .btn--action { width: 1.75rem; height: 1.75rem; }

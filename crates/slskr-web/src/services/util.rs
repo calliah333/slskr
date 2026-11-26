@@ -275,6 +275,55 @@ pub fn download_file(data: &[u8], filename: &str, mime: Option<&str>) -> Result<
     web_sys::Url::revoke_object_url(&blob_url)
 }
 
+/// Formats a count with thousands separators: `12,345`.
+pub fn group_digits(value: impl ToString) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// A count in at most four characters for tight spots (tab counts): `9,999`, `22.8k`,
+/// `555k`, `1.2M`.
+pub fn short_count(value: usize) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let n = value as f64;
+    match value {
+        0..10_000 => group_digits(value),
+        10_000..100_000 => format!("{:.1}k", n / 1e3),
+        100_000..1_000_000 => format!("{:.0}k", n / 1e3),
+        _ => format!("{:.1}M", n / 1e6),
+    }
+}
+
+/// A view preference kept in this browser's local storage under `key`, so it survives
+/// reloads. Starts `false` when nothing is stored or storage is unavailable.
+pub fn stored_flag(key: &'static str) -> leptos::prelude::RwSignal<bool> {
+    use leptos::prelude::{Effect, Get, RwSignal};
+    let storage = || web_sys::window()?.local_storage().ok().flatten();
+    let flag = RwSignal::new(
+        storage()
+            .and_then(|storage| storage.get_item(key).ok().flatten())
+            .is_some_and(|value| value == "1"),
+    );
+    Effect::new(move |_| {
+        let set = flag.get();
+        if let Some(storage) = storage() {
+            let _ = if set {
+                storage.set_item(key, "1")
+            } else {
+                storage.remove_item(key)
+            };
+        }
+    });
+    flag
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,30 +416,15 @@ mod tests {
     }
 
     #[test]
+    fn short_counts() {
+        assert_eq!(super::short_count(9_999), "9,999");
+        assert_eq!(super::short_count(22_811), "22.8k");
+        assert_eq!(super::short_count(555_133), "555k");
+        assert_eq!(super::short_count(1_234_567), "1.2M");
+    }
+
+    #[test]
     fn encodes_paths() {
         assert_eq!(encode_uri_component("a b/ü"), "a%20b%2F%C3%BC");
     }
-}
-
-/// A view preference kept in this browser's local storage under `key`, so it survives
-/// reloads. Starts `false` when nothing is stored or storage is unavailable.
-pub fn stored_flag(key: &'static str) -> leptos::prelude::RwSignal<bool> {
-    use leptos::prelude::{Effect, Get, RwSignal};
-    let storage = || web_sys::window()?.local_storage().ok().flatten();
-    let flag = RwSignal::new(
-        storage()
-            .and_then(|storage| storage.get_item(key).ok().flatten())
-            .is_some_and(|value| value == "1"),
-    );
-    Effect::new(move |_| {
-        let set = flag.get();
-        if let Some(storage) = storage() {
-            let _ = if set {
-                storage.set_item(key, "1")
-            } else {
-                storage.remove_item(key)
-            };
-        }
-    });
-    flag
 }

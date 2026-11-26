@@ -43,8 +43,7 @@ pub fn Maintenance() -> impl IntoView {
     };
     view! {
         <div class="system-maintenance stack">
-            <Card title="Transfer lists"
-                description="Remove completed transfers if the Downloads or Uploads pages become slow.">
+            <Card title="Transfer lists">
                 <div class="cluster">
                     {action("download", "Clear completed downloads")}
                     {action("upload", "Clear completed uploads")}

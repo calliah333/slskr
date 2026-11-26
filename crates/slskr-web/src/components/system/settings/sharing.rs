@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     components::{app::AppContext, directory_picker::FolderList},
-    services::api,
+    services::{api, util},
     ui::{
         Badge, Icon,
         form::{Advanced, ChipInput, Field, Section, TextInput},
@@ -40,7 +40,17 @@ fn ScanStatus() -> impl IntoView {
             } else {
                 (
                     "neutral",
-                    format!("{} folders, {} files", shares.directories, shares.files),
+                    format!(
+                        "{} {}, {} {}",
+                        util::group_digits(shares.directories),
+                        if shares.directories == 1 {
+                            "folder"
+                        } else {
+                            "folders"
+                        },
+                        util::group_digits(shares.files),
+                        if shares.files == 1 { "file" } else { "files" },
+                    ),
                 )
             }
         })
@@ -108,7 +118,6 @@ pub fn SharedFolders() -> impl IntoView {
     });
     view! {
         <Section id="settings-shares" title="Shared folders"
-            description="Folders other users can browse and download from."
             actions=ViewFn::from(move || view! {
                 <ScanStatus/>
                 <button type="button" class="btn btn--sm shares-rescan" disabled=scanning
@@ -121,7 +130,6 @@ pub fn SharedFolders() -> impl IntoView {
                     role=if ok { "status" } else { "alert" }>{text}</p>
             })}
             <Field id=field_id(DIRECTORIES) label="Folders" row=true wide=true
-                help="Peers see each folder under its name, or an alias you give it."
                 error=Signal::derive(move || form.error(DIRECTORIES))
                 locked_reason=locked
                 actions=row_actions(form, key, Callback::new(|()| {}))>
@@ -169,8 +177,7 @@ fn Limits(prefix: String, zero: &'static str) -> impl IntoView {
 pub fn UploadLimits() -> impl IntoView {
     let form = use_form();
     view! {
-        <Section id="settings-uploads" title="Upload limits"
-            description="How much slskr uploads at once, and how much each user may take.">
+        <Section id="settings-uploads" title="Upload limits">
             <Setting key="uploads.slots" label="Upload slots" restart=true
                 kind=Kind::at_least_one(Some("uploads")) help="Uploads that run at the same time."/>
             <Setting key="uploads.speed_limit" label="Speed limit" kind=Kind::unlimited(Some("KiB/s"), 1024)

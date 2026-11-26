@@ -474,10 +474,7 @@ pub fn Chat() -> impl IntoView {
                                 {move || if compose_to.with(Option::is_some) {
                                     "New conversation".to_owned()
                                 } else {
-                                    match presence.get() {
-                                        Some(p) => format!("{} \u{b7} private conversation", presence_dot(p).1),
-                                        None => "Private conversation".to_owned(),
-                                    }
+                                    presence.get().map(|p| presence_dot(p).1.to_owned()).unwrap_or_default()
                                 }}
                             </span>
                         </span>
@@ -504,8 +501,7 @@ pub fn Chat() -> impl IntoView {
                         if !has_target.get() {
                             view! {
                                 <div class="buffer__empty">
-                                    <EmptyState icon="message-square" title="No conversation open"
-                                        description="Pick a conversation, or type /query nick below to message any Soulseek user.">
+                                    <EmptyState icon="message-square" title="No conversation open">
                                         <Button variant="primary" size="sm" icon="plus" text="New message"
                                             on_click=Callback::new(move |_| new_open.set(true))/>
                                     </EmptyState>

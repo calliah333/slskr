@@ -165,8 +165,7 @@ pub fn HistoryChart(histogram: TransferHistogram, errors: bool) -> impl IntoView
         };
         return view! {
             <div class="chart chart--empty" aria-label=title>
-                <EmptyState icon="chart-column" title=message
-                    description="Pick a longer period to see more history."/>
+                <EmptyState icon="chart-column" title=message/>
             </div>
         }
         .into_any();

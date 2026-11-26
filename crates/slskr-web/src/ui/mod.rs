@@ -11,6 +11,7 @@ pub mod form;
 mod icon;
 mod icon_data;
 mod modal;
+mod pager;
 pub mod selection;
 pub mod theme;
 
@@ -23,6 +24,7 @@ pub use self::{
     feedback::*,
     icon::*,
     modal::*,
+    pager::Pager,
     selection::{ListAction, ListSelection},
     theme::ThemeToggle,
 };

@@ -31,18 +31,7 @@ struct BrowseInfo {
     locked_directories: usize,
 }
 
-/// Formats a count with thousands separators: `12,345`.
-pub(crate) fn group_digits(value: impl ToString) -> String {
-    let digits = value.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (position, digit) in digits.chars().enumerate() {
-        if position > 0 && (digits.len() - position).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
-}
+pub(crate) use crate::services::util::group_digits;
 
 fn count(value: usize, one: &str, many: &str) -> String {
     format!(
@@ -368,8 +357,7 @@ pub fn Browse() -> impl IntoView {
                             }.into_any(),
                             None => view! {
                                 <Card>
-                                    <EmptyState icon="folder-open" title="Select a folder"
-                                        description="Pick a folder on the left to see its files. Use the arrow keys to move through the tree."/>
+                                    <EmptyState icon="folder-open" title="Select a folder"/>
                                 </Card>
                             }.into_any(),
                         }}
@@ -381,8 +369,8 @@ pub fn Browse() -> impl IntoView {
 
     view! {
         <div class="browse stack">
-            <PageHeader title="Browse" description="Look through the folders a user shares and download what you want."/>
-            <Card class="browse-form" title="Browse a user's shares" description="Downloading a large share list can take a minute.">
+            <PageHeader title="Browse"/>
+            <Card class="browse-form" title="Browse a user's shares">
                 <form class="input-group" on:submit=move |event| { event.prevent_default(); submit(); }>
                     <div class="input-icon grow">
                         <Icon name="user"/>
@@ -402,15 +390,6 @@ pub fn Browse() -> impl IntoView {
                     </Alert>
                 })}
             </Card>
-            {move || {
-                let showing = results.with(Option::is_some);
-                (!showing && !loading.get() && error.with(Option::is_none)).then(|| view! {
-                    <Card>
-                        <EmptyState icon="folder-open" title="No user selected"
-                            description="Enter a username above to see the folders they share."/>
-                    </Card>
-                })
-            }}
             {result_view}
             <ContextMenu state=actions.menu/>
             <div class="toast-region" role="status" aria-live="polite">

@@ -126,7 +126,6 @@ pub fn Events() -> impl IntoView {
 
     view! {
         <Card title="Event history" flush=true class="events-card"
-            description="Completed transfers, messages and server connection changes, newest first."
             actions=ViewFn::from(move || view! {
                 <button type="button" class="btn btn--sm btn--icon" aria-label="Refresh events" title="Refresh"
                     disabled=move || loading.get() on:click=move |_| revision.update(|r| *r += 1)>
@@ -158,8 +157,7 @@ pub fn Events() -> impl IntoView {
                     ().into_any()
                 } else {
                     view! {
-                        <EmptyState icon="history" title="No events recorded"
-                            description="Finished downloads and uploads, received messages and server connection changes appear here."/>
+                        <EmptyState icon="history" title="No events recorded"/>
                     }.into_any()
                 },
                 Some(list) => view! {

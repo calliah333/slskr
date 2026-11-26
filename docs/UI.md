@@ -349,14 +349,15 @@ two-column key/value list (stacks on phones).
 `icon--spin`. Use the `Icon` component; names are lucide's:
 
 activity, arrow-down, arrow-left, arrow-right, arrow-up, arrow-up-down, ban, chart-column,
-check, chevron-down, chevron-left, chevron-right, chevron-up, circle, circle-alert,
+check, chevron-down, chevron-left, chevron-right, chevron-up, chevrons-down-up,
+chevrons-up-down, circle, circle-alert,
 circle-check, circle-help, circle-stop, circle-x, clock, cloud-upload, contrast, copy,
 corner-left-up, door-open, download, ellipsis, external-link, eye, eye-off, file,
 file-audio, file-text, filter, flask-conical, folder, folder-open, gauge, globe, hard-drive,
 hash, headphones, history, inbox, info, key, list, list-filter, loader-circle, lock,
 lock-open, log-in, log-out, megaphone, menu, message-square, messages-square, minus,
 monitor, moon, music, pause, pencil, play, plug, plug-zap, plus, power, refresh-cw,
-rotate-ccw, rotate-cw, save, search, send, server, settings, share-2, shield, square, star,
+rotate-ccw, rotate-cw, rows-4, save, search, send, server, settings, share-2, shield, square, star,
 sun, trash-2, triangle-alert, undo-2, unplug, upload, user, user-plus, user-x, users, wifi,
 wifi-off, x.
 
@@ -389,7 +390,8 @@ All take an extra `class` where it makes sense. Optional props can be left out.
 | `Modal` | `open: Signal<bool>` or `trigger: ViewFn`, `on_close`, `title`, `description`, `size` ("sm", "lg", "xl"), `close_button` (true), `content` (text) or children, `actions: Vec<ModalAction>` or `footer: ViewFn`, `class` | portal dialog |
 | `ModalAction` | `ModalAction::new("Cancel")`, `.primary()`, `.negative()`, `.on_click(..)`; clicking closes the modal | footer button |
 | `ThemeToggle` | — (needs `theme::install()` above it) | theme icon button |
-| `Brand` | `href` | logo mark + "slskr" + "Soulseek client" |
+| `Brand` | `href`, `version`, `title` | logo mark + "slskr", the running version below it (full build as tooltip) |
+| `Pager` | `page: RwSignal<u32>` (0-based), `pages`, `label` | `nav.pager`: previous, first, last and two pages either side of the current one, next; hidden for one page |
 
 ### Form components (`crate::ui::form`)
 

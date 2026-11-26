@@ -13,6 +13,9 @@ use slskr_types::transfers::{Transfer, TransferDirection};
 pub(super) struct LiveList {
     direction: TransferDirection,
     include_removed: bool,
+    /// Whether the newest completed transfers are shown: only then do transfers that
+    /// complete join the list (on later pages they belong to page one).
+    first_page: bool,
     /// In the order of the list route: downloads as requested; uploads active first, then
     /// completed ones newest first.
     list: Vec<Transfer>,
@@ -25,6 +28,7 @@ impl LiveList {
         Self {
             direction,
             include_removed: false,
+            first_page: true,
             list: Vec::new(),
             since_fetch: None,
         }
@@ -43,6 +47,11 @@ impl LiveList {
         self.include_removed = include_removed;
         self.list.clear();
         self.since_fetch = None;
+    }
+
+    /// Whether the page shown is the first one (see `first_page`).
+    pub(super) fn set_first_page(&mut self, first_page: bool) {
+        self.first_page = first_page;
     }
 
     /// A fetch starts; changes from now on are applied again on top of its result.
@@ -113,6 +122,9 @@ impl LiveList {
             return;
         }
         let position = self.list.iter().position(|row| row.id == file.id);
+        if position.is_none() && !self.first_page && file.state.is_complete() {
+            return;
+        }
         if self.direction == TransferDirection::Download {
             match position {
                 Some(position) => self.list[position] = file,

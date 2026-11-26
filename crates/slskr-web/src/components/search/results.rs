@@ -443,8 +443,7 @@ pub(super) fn SearchResults(
         <Show when=move || done.get() || results.with(|(count, _, _)| *count != 0)
             fallback=move || view! {
                 <div class="card">
-                    <EmptyState icon="loader-circle" title="Waiting for responses…"
-                        description="Results appear here as users answer. Searches run for about a minute."/>
+                    <EmptyState icon="loader-circle" title="Waiting for responses…"/>
                 </div>
             }>
             <section class="card card--compact results-toolbar" aria-label="Result options">

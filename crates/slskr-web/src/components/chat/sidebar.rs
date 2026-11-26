@@ -154,7 +154,7 @@ pub(crate) fn NewMessage(open: RwSignal<bool>, on_start: Callback<String>) -> im
     };
     view! {
         <Modal open=open on_close=Callback::new(move |()| open.set(false)) size="sm"
-            title="New message" description="Open a private conversation with a Soulseek user."
+            title="New message"
             footer=ViewFn::from(move || view! {
                 <button type="button" class="btn" on:click=move |_| open.set(false)>"Cancel"</button>
                 <button type="button" class="btn btn--primary chat-new-start" on:click=move |_| submit()>"Open conversation"</button>
@@ -167,7 +167,6 @@ pub(crate) fn NewMessage(open: RwSignal<bool>, on_start: Callback<String>) -> im
                     prop:value=move || username.get()
                     on:input=move |ev| { username.set(event_target_value(&ev)); problem.set(None); }/>
                 {move || problem.get().map(|p| view! { <p class="error" id="chat-new-username-error" role="alert">{p}</p> })}
-                <p class="help">"Tip: type "<code>"/query nick"</code>" in any input line."</p>
             </form>
         </Modal>
     }

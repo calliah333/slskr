@@ -57,13 +57,12 @@ pub fn Info() -> impl IntoView {
                 </Alert>
             })}
             <div class="grid grid--2 system-info__grid">
-                <VersionCard state/>
                 <ConnectionCard state config/>
                 <DaemonCard config/>
                 <NetworkCard state/>
             </div>
             <ApplicationCard/>
-            <Card title="Diagnostics" description="The raw application state, as the API reports it.">
+            <Card title="Diagnostics">
                 <details class="system-raw">
                     <summary>"Show application state (JSON)"</summary>
                     <pre class="code code--scroll">
@@ -72,27 +71,6 @@ pub fn Info() -> impl IntoView {
                 </details>
             </Card>
         </div>
-    }
-}
-
-#[component]
-fn VersionCard(state: RwSignal<State>) -> impl IntoView {
-    let version = Memo::new(move |_| state.with(|s| s.version.clone()));
-    view! {
-        <Card title="Version" description="The running build.">
-            <dl class="dl">
-                <dt>"Current"</dt>
-                <dd class="cluster">
-                    <span class="mono">{move || version.with(|v| v.current.clone())}</span>
-                    {move || version.with(|v| v.is_canary).then(|| view! { <Badge variant="purple" text="Canary"/> })}
-                    {move || version.with(|v| v.is_development).then(|| view! { <Badge variant="outline" text="Development"/> })}
-                </dd>
-                {move || version.with(|v| (v.full != v.current).then(|| v.full.clone())).map(|full| view! {
-                    <dt>"Build"</dt>
-                    <dd class="mono text-sm">{full}</dd>
-                })}
-            </dl>
-        </Card>
     }
 }
 
@@ -110,7 +88,7 @@ fn ConnectionCard(state: RwSignal<State>, config: RwSignal<Option<Config>>) -> i
         })
     };
     view! {
-        <Card title="Soulseek" description="The connection to the Soulseek server.">
+        <Card title="Soulseek">
             <dl class="dl">
                 <dt>"Status"</dt>
                 <dd class="cluster">
@@ -184,7 +162,7 @@ fn DaemonCard(config: RwSignal<Option<Config>>) -> impl IntoView {
         }
     };
     view! {
-        <Card title="Daemon" description="Where slskr listens and keeps its files.">
+        <Card title="Daemon">
             <dl class="dl">
                 {row("Web interface", |c| c.web.listen.to_string())}
                 {row("URL base", |c| if c.web.url_base.is_empty() { "/".to_owned() } else { c.web.url_base.clone() })}
@@ -201,7 +179,7 @@ fn DaemonCard(config: RwSignal<Option<Config>>) -> impl IntoView {
 fn NetworkCard(state: RwSignal<State>) -> impl IntoView {
     let network = Memo::new(move |_| state.with(|s| s.distributed_network.clone()));
     view! {
-        <Card title="Distributed network" description="Search requests reach you through a parent and you pass them on to children.">
+        <Card title="Distributed network">
             <dl class="dl">
                 <dt>"Parent"</dt>
                 <dd>{move || network.with(|n| {

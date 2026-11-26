@@ -475,6 +475,8 @@ fn NavLink(path: &'static str, icon: &'static str, label: &'static str) -> impl 
 fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
     let AppContext { state, .. } = expect_context();
     let canary = Memo::new(move |_| state.with(|state| state.version.is_canary));
+    let running = Signal::derive(move || state.with(|state| format!("v{}", state.version.current)));
+    let build = Signal::derive(move || state.with(|state| state.version.full.clone()));
     let pending = Memo::new(move |_| {
         state.with(|state| {
             state.pending_reconnect || state.pending_restart || state.shares.scan_pending
@@ -505,7 +507,7 @@ fn Navigation(passthrough: bool, logout: Callback<()>) -> impl IntoView {
     view! {
         <header class="container app-header">
             <div class="app-header__bar">
-                <Brand href=format!("{base}/overview")/>
+                <Brand href=format!("{base}/overview") version=running title=build/>
                 <div class="app-header__actions">
                     <Show when=move || canary.get()>
                         <span class="badge badge--amber hide-sm"><Icon name="flask-conical"/>"Canary"</span>

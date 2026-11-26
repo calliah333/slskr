@@ -103,7 +103,7 @@ pub fn RoomJoin(
 
     view! {
         <Modal open=open on_close=Callback::new(move |()| open.set(false)) class="room-join"
-            title="Join a room" description="Pick a room on the server or enter any name to create or join it.">
+            title="Join a room">
             <div class="room-join__body">
                 {move || error.get().map(|e| view! {
                     <Alert variant="danger" on_dismiss=Callback::new(move |()| error.set(None))><p>{e}</p></Alert>

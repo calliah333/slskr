@@ -17,9 +17,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use gloo_net::http::Method;
 use leptos::{prelude::*, task::spawn_local_scoped_with_cancellation};
+use slskr_types::shares::Share;
 use slskr_types::transfers::{
-    DownloadFile, EnqueueDownloads, EnqueueDownloadsRequest, EnqueuedDownloads, Transfer,
-    TransferDirection, TransferState as State,
+    CompletedFilter, DownloadFile, EnqueueDownloads, EnqueueDownloadsRequest, EnqueuedDownloads,
+    Transfer, TransferDirection, TransferListSummary, TransferState as State,
 };
 
 use crate::{
@@ -30,11 +31,15 @@ use crate::{
         events::{Event, Status as EventsStatus, Topic, use_events},
         util,
     },
-    ui::{Alert, Badge, Button, DropdownMenu, EmptyState, Icon, Loading, Modal, ModalAction},
+    ui::{
+        Alert, Badge, Button, DropdownMenu, EmptyState, Icon, Loading, Modal, ModalAction, Pager,
+    },
 };
 
 /// Local storage key: whether transfer folders start collapsed (downloads and uploads).
 const COLLAPSED_KEY: &str = "slskr-transfer-folders-collapsed";
+/// Local storage key: whether transfer lists use compact rows (downloads and uploads).
+const COMPACT_KEY: &str = "slskr-transfers-compact";
 
 /// Where a transfer is in its life, for counts and the state filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +102,16 @@ impl Filter {
         }
     }
 
+    /// Which completed transfers the daemon pages through for this filter.
+    fn completed(self) -> CompletedFilter {
+        match self {
+            Self::All => CompletedFilter::All,
+            Self::Active | Self::Queued => CompletedFilter::None,
+            Self::Completed => CompletedFilter::Succeeded,
+            Self::Failed => CompletedFilter::Failed,
+        }
+    }
+
     fn matches(self, category: Category) -> bool {
         match self {
             Self::All => true,
@@ -150,6 +165,33 @@ impl Entry {
             && self.state == file.state
             && self.removed == file.removed
     }
+}
+
+/// The page's counts: active transfers from the loaded rows (every one is loaded, and kept
+/// current by events), completed ones from the daemon's summary of the whole list. Before
+/// the summary arrives, the loaded rows alone.
+fn count(index: &[Entry], summary: Option<&TransferListSummary>) -> Counts {
+    let mut counts = Counts::default();
+    for entry in index
+        .iter()
+        .filter(|entry| summary.is_none() || !entry.state.is_complete())
+    {
+        counts.add(entry);
+    }
+    for state in summary.into_iter().flat_map(|summary| &summary.states) {
+        if !state.state.is_complete() {
+            continue;
+        }
+        let files = usize::try_from(state.files).unwrap_or(usize::MAX);
+        counts.files = counts.files.saturating_add(files);
+        counts.bytes = counts.bytes.saturating_add(state.bytes);
+        match Category::of(state.state) {
+            Category::Succeeded => counts.succeeded += files,
+            Category::Cancelled => counts.cancelled += files,
+            _ => counts.failed += files,
+        }
+    }
+    counts
 }
 
 /// Transfer counts by category (removed transfers excluded).
@@ -305,6 +347,9 @@ struct Page {
     now: RwSignal<DateTime<Utc>>,
     /// Whether folders start collapsed (remembered; a folder's own toggle overrides it).
     collapse: RwSignal<bool>,
+    /// Uploads: the name peers see for the one shared folder, when there is only one.
+    /// Folder rows leave it out, since every upload is in it.
+    share_root: RwSignal<Option<String>>,
 }
 
 impl Page {
@@ -375,17 +420,29 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     let is_download = direction == TransferDirection::Download;
     let noun = if is_download { "download" } else { "upload" };
 
+    // The text filter applies to the loaded rows at once, and to the daemon's list (so
+    // that pages hold only matches) once typing pauses.
+    let server_query = RwSignal::new(String::new());
+    let query_edits = StoredValue::new(0_u64);
+    Effect::new(move |_| {
+        let text = query.get().trim().to_lowercase();
+        let edit = query_edits.get_value().wrapping_add(1);
+        query_edits.set_value(edit);
+        spawn_local_scoped_with_cancellation(async move {
+            util::sleep(300).await;
+            if query_edits.try_get_value() == Some(edit) && server_query.get_untracked() != text {
+                server_query.set(text);
+            }
+        });
+    });
+    // The daemon's counts of the whole list; the loaded rows are one page of it.
+    let summary = RwSignal::new(None::<TransferListSummary>);
+
     let layout = Memo::new(move |_| {
         index.with(|index| query.with(|query| build_layout(index, filter.get(), query)))
     });
     let counts = Memo::new(move |_| {
-        index.with(|index| {
-            let mut counts = Counts::default();
-            for entry in index {
-                counts.add(entry);
-            }
-            counts
-        })
+        index.with(|index| summary.with(|summary| count(index, summary.as_ref())))
     });
 
     // Selection follows what is visible: rows hidden by a filter (or gone) drop out.
@@ -406,12 +463,32 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         });
     });
 
-    // Every active transfer is listed, but only this many of the newest finished ones,
-    // more on request: retention keeps finished transfers forever by default.
-    const PAGE: u32 = 500;
-    let limit = RwSignal::new(PAGE);
-    let more = RwSignal::new(false);
+    // Every active transfer is listed, and one page of the completed ones (newest first):
+    // retention keeps completed transfers forever by default.
+    const PAGE: u32 = 200;
+    let page_index = RwSignal::new(0_u32);
+    let pages = Signal::derive(move || {
+        let completed = counts.with(|c| match filter.get() {
+            Filter::All => c.succeeded + c.failed + c.cancelled,
+            Filter::Completed => c.succeeded,
+            Filter::Failed => c.failed + c.cancelled,
+            Filter::Active | Filter::Queued => 0,
+        });
+        u32::try_from(completed)
+            .unwrap_or(u32::MAX)
+            .div_ceil(PAGE)
+            .max(1)
+    });
     let history_revision = RwSignal::new(0_u64);
+    // Another view starts at its first page.
+    Effect::new(move |previous: Option<()>| {
+        filter.track();
+        server_query.track();
+        history_revision.track();
+        if previous.is_some() {
+            page_index.set(0);
+        }
+    });
 
     // Actions run in the page's owner, not the clicked control's: a menu, the selection
     // bar or a row can unmount while the requests are still running.
@@ -430,6 +507,39 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             live.with_value(|live| apply_snapshot(live.list(), rows, index, speed));
         }
     };
+    let text_param = move || {
+        let text = server_query.get_untracked();
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!("&query={}", util::encode_uri_component(&text))
+        }
+    };
+    // The summary follows the list: with each fetch, and soon after transfers complete.
+    let summaries = StoredValue::new(0_u64);
+    let summary_due = StoredValue::new(false);
+    let fetch_summary = move || {
+        summary_due.set_value(false);
+        let ticket = summaries.get_value().wrapping_add(1);
+        summaries.set_value(ticket);
+        let url = format!(
+            "{}/summary?include_removed={}{}",
+            collection(direction),
+            history.get_untracked(),
+            text_param()
+        );
+        in_page(Box::new(move || {
+            spawn_local_scoped_with_cancellation(async move {
+                let result = api::get::<TransferListSummary>(&url).await;
+                if summaries.try_get_value() == Some(ticket)
+                    && let Ok(result) = result
+                    && summary.with_untracked(|current| current.as_ref() != Some(&result))
+                {
+                    summary.set(Some(result));
+                }
+            });
+        }));
+    };
     let validator = StoredValue::new(None::<(String, u64, String)>);
     let fetches = StoredValue::new(0_u64);
     let fetch = move || {
@@ -437,10 +547,13 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         fetches.set_value(ticket);
         let include_removed = history.get_untracked();
         let revision = history_revision.get_untracked();
-        let limit = limit.get_untracked();
+        let page = page_index.get_untracked();
         let url = format!(
-            "{}?include_removed={include_removed}&recent_completed={limit}",
-            collection(direction)
+            "{}?include_removed={include_removed}&recent_completed={PAGE}&completed_offset={}&completed={}{}",
+            collection(direction),
+            page.saturating_mul(PAGE),
+            filter.get_untracked().completed().as_str(),
+            text_param()
         );
         let etag = validator.with_value(|validator| {
             validator
@@ -448,7 +561,11 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                 .filter(|(path, version, _)| *path == url && *version == revision)
                 .map(|(_, _, etag)| etag.clone())
         });
-        live.update_value(live::LiveList::begin_fetch);
+        live.update_value(|live| {
+            live.set_first_page(page == 0);
+            live.begin_fetch();
+        });
+        fetch_summary();
         in_page(Box::new(move || {
             spawn_local_scoped_with_cancellation(async move {
                 let snapshot = api::get_if_changed::<Vec<Transfer>>(&url, etag.as_deref()).await;
@@ -458,10 +575,6 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                 }
                 match snapshot {
                     Ok(Some((list, etag))) => {
-                        more.set(
-                            list.iter().filter(|file| file.state.is_complete()).count()
-                                >= limit as usize,
-                        );
                         live.update_value(|live| live.finish_fetch(list));
                         render();
                         validator.set_value(etag.map(|etag| (url, revision, etag)));
@@ -490,10 +603,20 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             });
         }));
     };
+    // A new page starts at the top.
+    Effect::new(move |previous: Option<u32>| {
+        let page = page_index.get();
+        if previous.is_some_and(|previous| previous != page) {
+            window().scroll_to_with_x_and_y(0.0, 0.0);
+        }
+        page
+    });
     // The first load, and again when the view changes.
     Effect::new(move |_| {
         history_revision.track();
-        limit.track();
+        page_index.track();
+        filter.track();
+        server_query.track();
         fetch();
     });
     let events = use_events();
@@ -509,10 +632,17 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         Event::TransferUpdated(files) => {
             live.update_value(|live| live.update(files));
             render();
+            // A transfer of this list completed (or was added): its counts changed.
+            if files.iter().any(|file| {
+                file.direction == direction && (file.state.is_complete() || file.removed)
+            }) {
+                summary_due.set_value(true);
+            }
         }
         Event::TransferRemoved { ids } => {
             live.update_value(|live| live.remove(ids));
             render();
+            summary_due.set_value(true);
         }
         _ => {}
     });
@@ -532,6 +662,10 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             }
             if stale.get_value() {
                 render();
+            }
+            // Completions come in bursts; count them at most every 3 s.
+            if summary_due.get_value() && ticks.is_multiple_of(3) {
+                fetch_summary();
             }
             // Without live updates, poll every second as a fallback.
             if since_fetch >= 30 || socket.get_untracked() != EventsStatus::Open {
@@ -584,7 +718,15 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         details,
         now,
         collapse: util::stored_flag(COLLAPSED_KEY),
+        share_root: RwSignal::new(None),
     };
+    if !is_download {
+        spawn_local_scoped_with_cancellation(async move {
+            if let Ok(shares) = api::get::<Vec<Share>>("/shares").await {
+                page.share_root.set(single_share_root(&shares));
+            }
+        });
+    }
 
     let clear_completed = move || {
         if working.with_untracked(Option::is_some) {
@@ -603,6 +745,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         }));
     };
 
+    let compact = util::stored_flag(COMPACT_KEY);
     let busy = Signal::derive(move || working.with(Option::is_some));
     let has_failed = Signal::derive(move || counts.with(|counts| counts.failed > 0));
     let has_open = Signal::derive(move || counts.with(|c| c.active + c.queued > 0));
@@ -645,19 +788,13 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     };
 
     let title = if is_download { "Downloads" } else { "Uploads" };
-    let description = if is_download {
-        "Files you are downloading from other users, grouped by user and folder."
-    } else {
-        "Files other users are downloading from your shares."
-    };
     let filter_value = Signal::derive(move || filter.get().value().to_owned());
     let empty = Signal::derive(move || index.with(Vec::is_empty));
     let no_matches = Signal::derive(move || layout.with(Vec::is_empty));
     let base = page.base();
-    let (empty_title, empty_description, empty_href, empty_icon, empty_action) = if is_download {
+    let (empty_title, empty_href, empty_icon, empty_action) = if is_download {
         (
             "No downloads yet",
-            "Find something on the Search page and download it; it shows up here.",
             format!("{base}/searches"),
             "search",
             "Go to Search",
@@ -665,7 +802,6 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     } else {
         (
             "No uploads yet",
-            "When other users download files from your shares, they show up here.",
             format!("{base}/system/shares"),
             "share-2",
             "Manage shares",
@@ -673,13 +809,10 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     };
 
     view! {
-        <div class="transfers stack" class:transfers--busy=busy>
+        <div class="transfers stack" class:transfers--busy=busy class:transfers--compact=compact>
             <div class="page-header transfers-header">
                 <div class="stack stack--sm">
-                    <div>
-                        <h1 class="page-header__title">{title}</h1>
-                        <p class="page-header__description">{description}</p>
-                    </div>
+                    <h1 class="page-header__title">{title}</h1>
                     <div class="cluster transfers-summary" aria-live="polite">
                         {move || counts.with(|c| summary_badges(*c, speed.get(), is_download))}
                     </div>
@@ -688,7 +821,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             </div>
 
             <div class="card card--compact transfers-toolbar">
-                <div class="toolbar">
+                <div class="card__content toolbar">
                     <div class="input-icon grow">
                         <Icon name="search"/>
                         <input class="input" type="search" aria-label=format!("Filter {noun}s")
@@ -708,10 +841,11 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                             view! {
                                 <button type="button" class="tabs__tab" class:is-active=selected
                                     data-filter=option.value()
+                                    title=move || format!("{} {}", util::group_digits(count()), option.label().to_lowercase())
                                     aria-pressed=move || selected.get().to_string()
                                     on:click=move |_| filter.set(option)>
                                     {option.label()}
-                                    <span class="transfers-tab-count tabular">{count}</span>
+                                    <span class="transfers-tab-count tabular">{move || util::short_count(count())}</span>
                                 </button>
                             }
                         }).collect_view()}
@@ -724,16 +858,20 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                             history_revision.update(|revision| *revision = revision.wrapping_add(1));
                             loading.set(true);
                             apply_snapshot(&[], rows, index, speed);
-                            more.set(false);
+                            summary.set(None);
                             load_error.set(None);
                         }/>
                         <span class="switch__track" aria-hidden="true"></span>
                         <span class="switch__label">"Show removed"</span>
                     </label>
-                    <Button size="sm" variant="ghost"
-                        icon=Signal::derive(move || if page.collapse.get() { "chevron-down".to_owned() } else { "chevron-up".to_owned() })
-                        text=Signal::derive(move || if page.collapse.get() { "Expand folders".to_owned() } else { "Collapse folders".to_owned() })
-                        on_click=Callback::new(move |_| page.collapse.update(|value| *value = !*value))/>
+                    <div class="btn-group transfers-view">
+                        <Button variant="ghost"
+                            icon=Signal::derive(move || if page.collapse.get() { "chevrons-up-down".to_owned() } else { "chevrons-down-up".to_owned() })
+                            label=Signal::derive(move || if page.collapse.get() { "Expand folders".to_owned() } else { "Collapse folders".to_owned() })
+                            on_click=Callback::new(move |_| page.collapse.update(|value| *value = !*value))/>
+                        <Button variant="ghost" icon="rows-4" label="Compact rows" pressed=compact
+                            on_click=Callback::new(move |_| compact.update(|value| *value = !*value))/>
+                    </div>
                 </div>
             </div>
 
@@ -752,7 +890,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                 view! {
                     <div class="card transfers-empty">
                         <EmptyState icon=if is_download { "download" } else { "upload" }
-                            title=empty_title description=empty_description>
+                            title=empty_title>
                             <Button variant="primary" icon=empty_icon text=empty_action href=href/>
                         </EmptyState>
                     </div>
@@ -760,8 +898,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             } else if no_matches.get() && !empty.get() {
                 view! {
                     <div class="card transfers-empty">
-                        <EmptyState icon="list-filter" title=format!("No {noun}s match")
-                            description="Try another filter or clear the search.">
+                        <EmptyState icon="list-filter" title=format!("No {noun}s match")>
                             <Button text="Clear filters" icon="x" on_click=Callback::new(move |_| {
                                 query.set(String::new());
                                 filter.set(Filter::All);
@@ -780,14 +917,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     }/>
             </div>
 
-            <Show when=move || more.get()>
-                <div class="row">
-                    <Button text=format!("Load older {noun}s") on_click=Callback::new(move |_| {
-                        limit.update(|limit| *limit = limit.saturating_add(PAGE));
-                    })/>
-                    <span class="muted text-sm">{format!("Filters and actions apply to the {noun}s loaded here.")}</span>
-                </div>
-            </Show>
+            <Pager page=page_index pages label=format!("{} pages", title)/>
             <SelectionBar page/>
             <groups::DetailsDialog page/>
             <Modal open=confirm_cancel size="sm"
@@ -802,6 +932,16 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                 ]/>
         </div>
     }
+}
+
+/// The name peers see for the one shared folder, or `None` with several (or none).
+fn single_share_root(shares: &[Share]) -> Option<String> {
+    let mut roots = shares
+        .iter()
+        .filter(|share| !share.is_excluded)
+        .filter_map(|share| share.remote_path.clone());
+    let root = roots.next()?;
+    roots.next().is_none().then_some(root)
 }
 
 /// Writes a fresh snapshot into the per-row signals and the index, touching only what
@@ -855,7 +995,7 @@ fn summary_badges(counts: Counts, speed: f64, is_download: bool) -> impl IntoVie
     let plural = |n: usize| if n == 1 { "file" } else { "files" };
     let total = format!(
         "{} {} · {}",
-        counts.files,
+        util::group_digits(counts.files),
         plural(counts.files),
         util::format_bytes(counts.bytes as f64)
     );
@@ -866,7 +1006,7 @@ fn summary_badges(counts: Counts, speed: f64, is_download: bool) -> impl IntoVie
     let mut push = |count: usize, variant: &'static str, icon: &'static str, label: &str| {
         if count > 0 {
             badges.push(
-                view! { <Badge variant=variant icon=icon text=format!("{count} {label}")/> }
+                view! { <Badge variant=variant icon=icon text=format!("{} {label}", util::group_digits(count))/> }
                     .into_any(),
             );
         }

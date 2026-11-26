@@ -8,8 +8,7 @@ use crate::ui::form::{Advanced, RowHeading, Section};
 #[component]
 pub fn Search() -> impl IntoView {
     view! {
-        <Section id="settings-search" title="Search throttling"
-            description="How slskr answers other users' searches.">
+        <Section id="settings-search" title="Search throttling">
             <Setting key="search.incoming_concurrency" label="Searches answered at once" restart=true
                 kind=Kind::at_least_one(Some("searches"))/>
             <Setting key="search.incoming_circuit_breaker" label="Queue limit" kind=Kind::count(Some("searches"))
@@ -41,8 +40,7 @@ pub fn Retention() -> impl IntoView {
         .any(|key| form.error(&format!("retention.{key}")).is_some())
     });
     view! {
-        <Section id="settings-retention" title="Retention"
-            description="How long finished records are kept before they are removed.">
+        <Section id="settings-retention" title="Retention">
             {retention_row("searches", "Searches")}
             {retention_row("downloads_succeeded", "Completed downloads")}
             {retention_row("uploads_succeeded", "Completed uploads")}
@@ -65,8 +63,7 @@ pub fn Retention() -> impl IntoView {
 pub fn Logging() -> impl IntoView {
     let form = use_form();
     view! {
-        <Section id="settings-logging" title="Logging and metrics"
-            description="Usually set by the deployment.">
+        <Section id="settings-logging" title="Logging and metrics">
             <Setting key="logging.level" label="Log level" restart=true
                 kind=Kind::Select(vec![("trace", "Trace"), ("debug", "Debug"), ("info", "Info"), ("warn", "Warn"), ("error", "Error")])
                 help="RUST_LOG takes precedence."/>

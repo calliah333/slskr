@@ -10,8 +10,7 @@ pub fn Connection() -> impl IntoView {
     let form = use_form();
     let proxy_secret = move || form.secret_set("soulseek.proxy");
     view! {
-        <Section id="settings-connection" title="Incoming connections"
-            description="Where other Soulseek users connect to you.">
+        <Section id="settings-connection" title="Incoming connections">
             <Setting key="soulseek.listen_address" label="Listen address" kind=Kind::Mono
                 help="0.0.0.0 listens on every network interface."/>
             <Setting key="soulseek.listen_port" label="Listen port"
@@ -35,8 +34,7 @@ pub fn Connection() -> impl IntoView {
 #[component]
 pub fn Distributed() -> impl IntoView {
     view! {
-        <Section id="settings-distributed" title="Distributed network"
-            description="Soulseek passes searches from user to user; this is how slskr takes part.">
+        <Section id="settings-distributed" title="Distributed network">
             <Setting key="soulseek.distributed_network" label="Take part" kind=Kind::Toggle
                 help="Receive searches from a parent and answer them."/>
             <Setting key="soulseek.distributed_children" label="Children" kind=Kind::count(Some("users"))
@@ -48,8 +46,7 @@ pub fn Distributed() -> impl IntoView {
 #[component]
 pub fn WebServer() -> impl IntoView {
     view! {
-        <Section id="settings-web-server" title="Web server"
-            description="Where this web UI and the API are served.">
+        <Section id="settings-web-server" title="Web server">
             <Setting key="web.listen" label="Listen address" kind=Kind::Mono restart=true
                 help="address:port of the web UI and API."/>
             <Setting key="web.url_base" label="URL base" kind=Kind::Mono restart=true placeholder="/"

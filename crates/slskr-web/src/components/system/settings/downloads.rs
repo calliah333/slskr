@@ -9,8 +9,7 @@ use crate::ui::form::{Advanced, Section};
 pub fn DownloadFolders() -> impl IntoView {
     let form = use_form();
     view! {
-        <Section id="settings-downloads" title="Download folders"
-            description="Where finished and unfinished downloads are kept.">
+        <Section id="settings-downloads" title="Download folders">
             <Setting key="downloads.directory" label="Completed downloads" kind=Kind::Mono
                 help="Relative paths are inside the data directory."/>
             <Setting key="downloads.incomplete_directory" label="Incomplete downloads" kind=Kind::Mono
@@ -33,8 +32,7 @@ pub fn DownloadFolders() -> impl IntoView {
 #[component]
 pub fn DownloadLimits() -> impl IntoView {
     view! {
-        <Section id="settings-download-limits" title="Speed and retries"
-            description="How many files download at once, and what happens when one fails.">
+        <Section id="settings-download-limits" title="Speed and retries">
             <Setting key="downloads.slots" label="Concurrent downloads" restart=true
                 kind=Kind::unlimited(Some("files"), 10)/>
             <Setting key="downloads.speed_limit" label="Speed limit" kind=Kind::unlimited(Some("KiB/s"), 1024)
