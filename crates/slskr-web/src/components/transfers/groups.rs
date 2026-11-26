@@ -16,7 +16,7 @@ use crate::{
     ui::{Avatar, Badge, Button, DropdownMenu, Icon, Modal},
 };
 
-use super::{Category, Entry, FileRef, Operation, Page, UserLayout, directory_of, transfer_url};
+use super::{Category, Counts, Entry, FileRef, Operation, Page, UserLayout, directory_of, transfer_url};
 
 static NEXT_GROUP: AtomicUsize = AtomicUsize::new(0);
 
@@ -87,6 +87,8 @@ struct FolderFiles {
     selectable: Vec<String>,
     /// All files in the folder and the rows below it.
     count: usize,
+    /// States of the listed files in the folder and the rows below it.
+    counts: Counts,
 }
 
 fn folder_files(user: &UserLayout, root: Option<&str>) -> HashMap<String, FolderFiles> {
@@ -104,6 +106,7 @@ fn folder_files(user: &UserLayout, root: Option<&str>) -> HashMap<String, Folder
         for path in std::iter::successors(Some(path), |path| touched_parent(path, &touched)) {
             let folder = folders.entry(path.to_owned()).or_default();
             folder.count += directory.files.len();
+            folder.counts.merge(&directory.counts);
             folder.selectable.extend(selectable.iter().cloned());
         }
     }
@@ -360,6 +363,32 @@ fn totals(user: &UserLayout) -> String {
     )
 }
 
+/// A folder row's status: one badge when every file is in the same state, otherwise
+/// a count per unfinished, failed or cancelled state (succeeded files are then left out).
+fn folder_status(counts: Counts) -> impl IntoView + use<> {
+    let states = [
+        (counts.active, "primary", "activity", "Active", "active"),
+        (counts.queued, "warning", "clock", "Queued", "queued"),
+        (counts.failed, "danger", "circle-alert", "Failed", "failed"),
+        (counts.cancelled, "outline", "ban", "Cancelled", "cancelled"),
+        (counts.succeeded, "success", "circle-check", "Succeeded", "succeeded"),
+    ];
+    let present = states.iter().filter(|(count, ..)| *count > 0).count();
+    let badges = states
+        .into_iter()
+        .filter(|&(count, .., label)| count > 0 && (present == 1 || label != "succeeded"))
+        .map(|(count, variant, icon, title, label)| {
+            let text = if present == 1 {
+                title.to_owned()
+            } else {
+                format!("{} {label}", util::group_digits(count))
+            };
+            view! { <Badge variant=variant icon=icon text=text/> }
+        })
+        .collect_view();
+    view! { <div class="cluster transfer-dir__status">{badges}</div> }
+}
+
 fn group_badges(user: &UserLayout) -> impl IntoView + use<> {
     let counts = user.counts;
     let mut badges = Vec::new();
@@ -420,7 +449,7 @@ fn TransferDirectory(
                 <td class="check-col">
                     <SelectAll ids selected=page.selected label=format!("Select all transfers in {short}")/>
                 </td>
-                <td colspan="5">
+                <td colspan="3">
                     <button type="button" class="transfer-dir__toggle"
                         aria-expanded=move || (!folded.get()).to_string()
                         on:click=move |_| dir.with_value(|dir| toggled_folders.update(|toggled| {
@@ -434,12 +463,18 @@ fn TransferDirectory(
                         </span>
                         <span class="transfer-dir__count muted text-xs tabular">
                             {move || dir.with_value(|dir| folders.with(|folders| {
-                                let n = folders.get(dir).map_or(0, |folder| folder.count);
-                                format!("{n} {}", if n == 1 { "file" } else { "files" })
+                                let (n, bytes) = folders.get(dir).map_or((0, 0), |folder| (folder.count, folder.counts.bytes));
+                                format!("{n} {} · {}", if n == 1 { "file" } else { "files" }, util::format_bytes(bytes as f64))
                             }))}
                         </span>
                     </button>
                 </td>
+                <td class="transfer-table__status">
+                    {move || dir.with_value(|dir| folders.with(|folders| {
+                        folders.get(dir).map(|folder| folder_status(folder.counts))
+                    }))}
+                </td>
+                <td class="actions"></td>
             </tr>
             <Show when=move || !folded.get()>
                 <For each=move || dir.with_value(|dir| folders.with(|folders| folders.get(dir).into_iter().flat_map(|folder| &folder.direct).map(|file| file.id.clone()).collect::<Vec<_>>()))

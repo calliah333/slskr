@@ -106,6 +106,7 @@
 .transfer-dir__parent:empty { display: none; }
 .transfer-dir__icon { color: hsl(var(--warning)); flex-shrink: 0; }
 .transfer-dir__count { margin-left: auto; flex-shrink: 0; font-weight: 400; }
+.transfer-dir__status { gap: var(--space-1); }
 
 /* File rows. */
 .transfer-row > td { padding-top: 0.5rem; padding-bottom: 0.5rem; }

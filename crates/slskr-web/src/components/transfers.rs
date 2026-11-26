@@ -207,6 +207,16 @@ struct Counts {
 }
 
 impl Counts {
+    fn merge(&mut self, other: &Self) {
+        self.files += other.files;
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.active += other.active;
+        self.queued += other.queued;
+        self.succeeded += other.succeeded;
+        self.failed += other.failed;
+        self.cancelled += other.cancelled;
+    }
+
     fn add(&mut self, entry: &Entry) {
         if entry.removed {
             return;
@@ -234,6 +244,7 @@ struct FileRef {
 struct DirLayout {
     directory: String,
     files: Vec<FileRef>,
+    counts: Counts,
 }
 
 /// One user's visible transfers, grouped by remote directory.
@@ -281,9 +292,11 @@ fn build_layout(index: &[Entry], filter: Filter, query: &str) -> Vec<UserLayout>
             layout.directories.push(DirLayout {
                 directory: directory.to_owned(),
                 files: Vec::new(),
+                counts: Counts::default(),
             });
             layout.directories.len() - 1
         });
+        layout.directories[position].counts.add(entry);
         names.insert(&entry.id, util::get_file_name(&entry.filename));
         layout.directories[position].files.push(FileRef {
             id: entry.id.clone(),
@@ -1003,19 +1016,7 @@ fn summary_badges(counts: Counts, speed: f64, is_download: bool) -> impl IntoVie
     if counts.files > 0 {
         badges.push(view! { <Badge variant="outline" text=total/> }.into_any());
     }
-    let mut push = |count: usize, variant: &'static str, icon: &'static str, label: &str| {
-        if count > 0 {
-            badges.push(
-                view! { <Badge variant=variant icon=icon text=format!("{} {label}", util::group_digits(count))/> }
-                    .into_any(),
-            );
-        }
-    };
-    push(counts.active, "primary", "activity", "active");
-    push(counts.queued, "warning", "clock", "queued");
-    push(counts.succeeded, "success", "circle-check", "succeeded");
-    push(counts.failed, "danger", "circle-alert", "failed");
-    push(counts.cancelled, "neutral", "ban", "cancelled");
+    // The tabs below count each state.
     if speed > 0.0 {
         let icon = if is_download {
             "arrow-down"
