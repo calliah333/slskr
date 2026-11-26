@@ -223,7 +223,9 @@ pub(crate) struct ClientInner {
     pub(crate) resolvers: Arc<dyn Resolvers>,
     pub(crate) events: broadcast::Sender<Event>,
     pub(crate) session: RwLock<Session>,
-    pub(crate) next_token: AtomicU32,
+    /// Sequential token counter; `None` for random tokens (see
+    /// [`ClientOptions::starting_token`]).
+    pub(crate) next_token: Option<AtomicU32>,
     pub(crate) waiter: Waiter,
     pub(crate) server: server::ServerConnection,
     pub(crate) peers: peers::PeerManager,
@@ -325,7 +327,7 @@ impl SoulseekClient {
     /// Creates a disconnected client. Nothing is started until [`Self::connect`].
     pub fn new(options: ClientOptions, resolvers: Arc<dyn Resolvers>) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let next_token = AtomicU32::new(options.starting_token);
+        let next_token = options.starting_token.map(AtomicU32::new);
         let upload_limiter = RateLimiter::new(u64::from(options.maximum_upload_speed) * 1024);
         let download_limiter = RateLimiter::new(u64::from(options.maximum_download_speed) * 1024);
         Self {
@@ -451,10 +453,14 @@ impl SoulseekClient {
             .collect()
     }
 
-    /// Next token for client operations, starting at
+    /// Next token for client operations: random in `0..=i32::MAX`, or counting up from
     /// [`ClientOptions::starting_token`] and wrapping to 0 after `i32::MAX`.
     pub fn get_next_token(&self) -> u32 {
-        let counter = &self.inner.next_token;
+        let Some(counter) = &self.inner.next_token else {
+            let mut bytes = [0; 4];
+            getrandom::fill(&mut bytes).expect("the operating system's random number generator");
+            return u32::from_le_bytes(bytes) & i32::MAX as u32;
+        };
         let mut current = counter.load(Ordering::Relaxed);
         loop {
             let next = if current >= i32::MAX as u32 {
@@ -548,7 +554,7 @@ mod tests {
 
     fn client(starting_token: u32) -> SoulseekClient {
         let options = ClientOptions {
-            starting_token,
+            starting_token: Some(starting_token),
             ..Default::default()
         };
         SoulseekClient::new(options, Arc::new(DefaultResolvers))
@@ -571,6 +577,20 @@ mod tests {
         let c = client(i32::MAX as u32);
         assert_eq!(c.get_next_token(), i32::MAX as u32);
         assert_eq!(c.get_next_token(), 0);
+    }
+
+    #[test]
+    fn tokens_are_random_by_default() {
+        let c = SoulseekClient::new(ClientOptions::default(), Arc::new(DefaultResolvers));
+        let tokens: std::collections::HashSet<u32> = (0..64).map(|_| c.get_next_token()).collect();
+        assert!(tokens.len() > 60, "tokens repeat: {tokens:?}");
+        assert!(tokens.iter().all(|&token| token <= i32::MAX as u32));
+        let mut sorted: Vec<_> = tokens.into_iter().collect();
+        sorted.sort_unstable();
+        assert!(
+            sorted.windows(2).any(|pair| pair[1] - pair[0] > 1),
+            "tokens count up"
+        );
     }
 
     #[tokio::test]

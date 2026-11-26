@@ -203,8 +203,12 @@ pub struct ClientOptions {
     pub accept_private_room_invitations: bool,
     /// Most verbose diagnostic level emitted as [`crate::Event::DiagnosticGenerated`].
     pub minimum_diagnostic_level: DiagnosticLevel,
-    /// First token produced by [`crate::SoulseekClient::get_next_token`].
-    pub starting_token: u32,
+    /// `None` (the default): [`crate::SoulseekClient::get_next_token`] returns random
+    /// tokens. `Some(n)`: tokens count up from `n` (deterministic tests only). Tokens
+    /// authenticate connections a peer makes back to us (`PierceFirewall`), and search
+    /// tokens are visible to the whole distributed network, so counting up would let
+    /// anyone predict the next solicitation and connect in the real peer's place.
+    pub starting_token: Option<u32>,
     /// Server connection (inactivity timeout is always disabled).
     pub server_connection_options: ConnectionOptions,
     /// Outgoing peer message connections.
@@ -240,7 +244,7 @@ impl Default for ClientOptions {
             auto_acknowledge_privilege_notifications: true,
             accept_private_room_invitations: false,
             minimum_diagnostic_level: DiagnosticLevel::Info,
-            starting_token: 0,
+            starting_token: None,
             server_connection_options: ConnectionOptions::default().without_inactivity_timeout(),
             peer_connection_options: ConnectionOptions::default(),
             transfer_connection_options: ConnectionOptions::default(),
