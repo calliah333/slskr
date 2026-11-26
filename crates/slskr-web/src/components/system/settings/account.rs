@@ -155,7 +155,7 @@ pub fn SoulseekAccount() -> impl IntoView {
                 }}
             })>
             <Setting key="soulseek.username" label="Username" kind=Kind::Text
-                help="If the username isn't registered yet, logging in creates it."/>
+                help="Create an account with the official client from slsknet.org first."/>
             <Setting key="soulseek.password" label="Password" kind=Kind::Secret { confirm: false }/>
             <Advanced open=Signal::derive(move || form.error("soulseek.server").is_some() || form.error("soulseek.connect").is_some())>
                 <Setting key="soulseek.server" label="Server" kind=Kind::Mono/>

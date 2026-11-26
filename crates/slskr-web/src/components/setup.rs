@@ -495,7 +495,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
             Step::Soulseek => view! {
                 <div class="form-grid">
                     <Field id="setup-soulseek-username" label="Soulseek username" error=error_of("soulseek.username")
-                        help="If the username isn't registered yet, logging in creates it.">
+                        help="Create an account with the official client from slsknet.org first.">
                         <TextInput value=soulseek_username name="soulseek-username" autocomplete="off"
                             on_input=move |t: String| { soulseek_username.set(t); clear_error("soulseek.username"); test_result.set(None); }/>
                     </Field>
