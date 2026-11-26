@@ -647,8 +647,10 @@ pub(super) async fn purge(db: &Database) -> anyhow::Result<usize> {
         let tx = db.transaction()?;
         tx.prepare_cached("UPDATE transfers SET removed = 2 WHERE removed AND ended_at < ?1")?
             .execute([timestamp(cutoff)])?;
+        // `removed AND` lets the planner use `ix_transfers_removed` (it does not infer
+        // `removed` from `removed = 2`); without it, every minute scans the whole table.
         let deleted = tx
-            .prepare_cached("DELETE FROM transfers WHERE removed = 2")?
+            .prepare_cached("DELETE FROM transfers WHERE removed AND removed = 2")?
             .execute([])?;
         tx.commit()?;
         Ok(deleted)
