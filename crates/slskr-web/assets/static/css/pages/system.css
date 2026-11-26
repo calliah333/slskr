@@ -48,7 +48,7 @@
 .table-wrap.is-loading { opacity: 0.6; transition: opacity var(--duration); }
 
 /* Logs */
-.log-toolbar { margin: 0; padding: 0 var(--space-6) var(--space-4); }
+.log-toolbar { margin: 0; padding: var(--space-4) var(--space-6); }
 .log-view {
   height: min(60vh, 36rem);
   overflow: auto;
@@ -84,7 +84,7 @@
 .log-file-name { margin-bottom: var(--space-3); overflow-wrap: anywhere; }
 .log-file-content { max-height: 65vh; }
 @media (max-width: 639px) {
-  .log-toolbar { padding: 0 var(--space-4) var(--space-3); }
+  .log-toolbar { padding: var(--space-3) var(--space-4); }
   .log-footer { padding: var(--space-2) var(--space-4); }
   .log-line {
     grid-template-columns: max-content 3.25rem minmax(0, 1fr);

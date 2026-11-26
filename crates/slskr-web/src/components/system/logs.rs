@@ -245,18 +245,7 @@ fn LiveLog() -> impl IntoView {
     };
 
     view! {
-        <Card title="Live log" flush=true class="log-card"
-            actions=ViewFn::from(move || view! {
-                <span class=move || if paused.get() { "badge badge--warning" } else { "badge badge--success" }>
-                    <span class=move || if paused.get() { "status-dot" } else { "status-dot status-dot--online status-dot--pulse" }></span>
-                    {move || if paused.get() {
-                        let n = waiting.get();
-                        if n > 0 { format!("Paused, {n} new") } else { "Paused".to_owned() }
-                    } else {
-                        "Live".to_owned()
-                    }}
-                </span>
-            })>
+        <Card flush=true class="log-card">
             <div class="toolbar log-toolbar">
                 <label class="sr-only" for="log-level">"Minimum level"</label>
                 <select id="log-level" class="select select--sm select--auto log-level"
@@ -278,7 +267,9 @@ fn LiveLog() -> impl IntoView {
                     <button type="button" class="btn btn--sm log-pause" aria-pressed=move || paused.get().to_string()
                         on:click=toggle_pause>
                         {move || if paused.get() {
-                            view! { <Icon name="play"/>"Resume"}.into_any()
+                            let n = waiting.get();
+                            let label = if n > 0 { format!("Resume ({n} new)") } else { "Resume".to_owned() };
+                            view! { <Icon name="play"/>{label}}.into_any()
                         } else {
                             view! { <Icon name="pause"/>"Pause"}.into_any()
                         }}

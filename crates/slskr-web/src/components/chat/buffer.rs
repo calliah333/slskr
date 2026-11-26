@@ -417,12 +417,7 @@ pub(crate) fn InputLine(
                     Some(reason) => view! {
                         <span class="inputline__offline"><Icon name="wifi-off" size="xs"/>{reason}</span>
                     }.into_any(),
-                    None => view! {
-                        <span class="hide-sm"><kbd class="kbd">"Enter"</kbd>" send \u{b7} "
-                        <kbd class="kbd">"Shift+Enter"</kbd>" new line \u{b7} "
-                        <kbd class="kbd">"\u{2191}"</kbd>" last message \u{b7} "
-                        <code>"/help"</code>" commands"</span>
-                    }.into_any(),
+                    None => ().into_any(),
                 }}
             </p>
         </form>

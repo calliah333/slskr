@@ -77,7 +77,7 @@ pub fn Users() -> impl IntoView {
     view! {
         <div class="users users-container stack">
             <PageHeader title="Users"/>
-            <Card title="Look up a user" class="users-form">
+            <Card class="users-form">
                 <form class="input-group" on:submit=move |event| { event.prevent_default(); search.run(()); }>
                     <div class="input-icon grow">
                         <Icon name="search"/>

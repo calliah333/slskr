@@ -370,7 +370,7 @@ pub fn Browse() -> impl IntoView {
     view! {
         <div class="browse stack">
             <PageHeader title="Browse"/>
-            <Card class="browse-form" title="Browse a user's shares">
+            <Card class="browse-form">
                 <form class="input-group" on:submit=move |event| { event.prevent_default(); submit(); }>
                     <div class="input-icon grow">
                         <Icon name="user"/>

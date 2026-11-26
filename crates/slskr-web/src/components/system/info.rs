@@ -60,8 +60,8 @@ pub fn Info() -> impl IntoView {
                 <ConnectionCard state config/>
                 <DaemonCard config/>
                 <NetworkCard state/>
+                <ApplicationCard/>
             </div>
-            <ApplicationCard/>
             <Card title="Diagnostics">
                 <details class="system-raw">
                     <summary>"Show application state (JSON)"</summary>
@@ -225,8 +225,7 @@ fn ApplicationCard() -> impl IntoView {
         });
     };
     view! {
-        <Card title="Application"
-            description="Restart to apply changed settings, or stop the daemon. Both end every transfer in progress; needs an administrator session.">
+        <Card title="Application">
             <div class="cluster">
                 <Modal size="sm" title="Restart slskr?"
                     trigger=move || view! {

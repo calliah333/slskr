@@ -573,6 +573,7 @@ input[type="radio"].radio {
   border-radius: var(--radius-md);
   background: hsl(var(--secondary));
   overflow-x: auto;
+  overflow-y: hidden;
   scrollbar-width: none;
 }
 .tabs::-webkit-scrollbar { display: none; }
@@ -611,6 +612,8 @@ input[type="radio"].radio {
   gap: var(--space-4);
   border-bottom: 1px solid hsl(var(--border));
   overflow-x: auto;
+  /* overflow-x alone makes y scroll too, and each tab's -1px margin overflows it. */
+  overflow-y: hidden;
   scrollbar-width: none;
 }
 .tabs-underline::-webkit-scrollbar { display: none; }

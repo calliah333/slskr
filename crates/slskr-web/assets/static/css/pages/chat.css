@@ -314,8 +314,7 @@
   font-size: 0.6875rem;
   color: hsl(var(--muted-foreground));
 }
-.inputline__hint .kbd { font-size: 0.625rem; line-height: 0.875rem; }
-.inputline__hint code { font-size: 0.625rem; }
+.inputline__hint:empty { display: none; }
 .inputline__offline { display: inline-flex; align-items: center; gap: var(--space-1); color: hsl(var(--warning)); }
 
 /* ---------- nick list ---------- */
