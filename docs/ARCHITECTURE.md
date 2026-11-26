@@ -183,7 +183,7 @@ to the requested page afterwards.
 
 `trunk build --release` in `crates/slskr-web` writes the UI to the workspace `dist/`:
 `index.html`, the hashed wasm/JS, the hashed stylesheet under `static/css/`, a favicon, and
-`LICENSE`/`NOTICE`/`licenses/`. Building the
+`LICENSE`. Building the
 daemon with `SLSKR_EMBED_UI=<dist>` and `--features embed-ui` compiles those files into the binary (see
 [daemon internals](DAEMON.md#web-ui-webrs-buildrs)), so a release is one executable.
 `nix build .#slskr` builds the UI as its own derivation (`.#slskr-web`) and passes it in;

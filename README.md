@@ -89,4 +89,4 @@ every route.
 
 slskr was based on [slskd](https://github.com/slskd/slskd) and
 [Soulseek.NET](https://github.com/jpdillingham/Soulseek.NET) and has since been completely rewritten. It is
-not affiliated with either project and is not compatible with their APIs. AGPL-3.0-or-later; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+not affiliated with either project and is not compatible with their APIs. AGPL-3.0-or-later; see [LICENSE](LICENSE).

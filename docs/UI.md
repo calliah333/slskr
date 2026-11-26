@@ -363,7 +363,7 @@ wifi-off, x.
 
 Aliases: alert-circle, alert-triangle, warning, bar-chart, help, loader, messages,
 more-horizontal, sort, stop, trash, unlock. To add an icon, copy the inner markup of
-`lucide-static@0.460.0/icons/<name>.svg` into `src/ui/icon_data.rs` (sorted by name).
+`lucide-static@0.460.0/icons/<name>.svg` into `src/ui/icon_data.rs` (sorted by name) and keep the Lucide license header at its top.
 
 ## Components (Rust, `crate::ui`)
 

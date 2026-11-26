@@ -51,8 +51,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=daemon /out/slskr /usr/local/bin/slskr
 COPY --from=daemon --chown=10001:10001 /out/data /data
-COPY LICENSE NOTICE /usr/share/doc/slskr/
-COPY licenses /usr/share/doc/slskr/licenses
+COPY LICENSE /usr/share/doc/slskr/
 USER 10001:10001
 # The container's network namespace is the boundary, so listen on every interface.
 ENV SLSKR_WEB_LISTEN=0.0.0.0:5030

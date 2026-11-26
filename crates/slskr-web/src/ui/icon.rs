@@ -1,5 +1,5 @@
 //! `Icon`: inline SVG line icons from a curated set of [lucide](https://lucide.dev) icons
-//! (ISC license, `licenses/lucide-LICENSE`). The markup lives in `icon_data.rs`.
+//! (ISC license, reproduced in `icon_data.rs`). The markup lives in `icon_data.rs`.
 //!
 //! Names are lucide's (`"folder-open"`, `"trash-2"`); a few common aliases are accepted
 //! (see [`ALIASES`]). An unknown name renders `circle-help` and logs a warning in debug

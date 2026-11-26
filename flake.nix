@@ -118,8 +118,7 @@
               pkgs.sqlite
             ];
             postInstall = ''
-              install -Dm644 -t $out/share/doc/slskr LICENSE NOTICE README.md
-              cp -r licenses $out/share/doc/slskr/
+              install -Dm644 -t $out/share/doc/slskr LICENSE README.md
             '';
             meta = {
               description = "Soulseek client daemon with a web UI";

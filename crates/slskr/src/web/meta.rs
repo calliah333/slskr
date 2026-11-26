@@ -1,7 +1,7 @@
 //! How web UI files are served. Shared by `build.rs`, which embeds the UI, and the
 //! directory mode of [`crate::web`], so both send the same headers.
 
-/// `Content-Type` for a UI file. Extensionless files (`LICENSE`, `NOTICE`) are text.
+/// `Content-Type` for a UI file. Extensionless files (`LICENSE`) are text.
 pub fn content_type(path: &str) -> &'static str {
     let name = path.rsplit('/').next().unwrap_or(path);
     let Some((_, extension)) = name.rsplit_once('.') else {

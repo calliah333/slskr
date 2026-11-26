@@ -176,7 +176,7 @@ fn hashed_names_are_detected() {
     for plain in [
         "index.html",
         "LICENSE",
-        "licenses/slskd-NOTICE",
+        "docs/readme.txt",
         "a-cafe.css",
     ] {
         assert!(!meta::is_hashed(plain), "{plain}");
