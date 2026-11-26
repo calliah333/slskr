@@ -82,7 +82,7 @@
 .transfer-dir__row,
 .table tbody tr.transfer-dir__row:hover { background: hsl(var(--secondary) / 0.4); }
 .transfer-dir__row > td { padding-top: 0.375rem; padding-bottom: 0.375rem; }
-.transfer-dir__row > td[colspan] { padding-inline-start: var(--space-3); }
+.transfer-dir__row > td[colspan] { padding-inline-start: calc(var(--space-3) + var(--transfer-indent, 0ch)); }
 .transfer-dir__toggle {
   display: flex;
   align-items: center;
@@ -112,7 +112,7 @@
 .transfer-table thead .check-col,
 .transfer-row .check-col,
 .transfer-dir__row .check-col { padding-left: var(--space-4); }
-.transfer-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; margin-inline-start: 2ch; }
+.transfer-name { display: flex; align-items: center; gap: var(--space-2); min-width: 0; margin-inline-start: calc(var(--transfer-indent, 0ch) + 2ch); }
 .transfer-name__icon { flex-shrink: 0; color: hsl(var(--muted-foreground)); }
 .transfer-name > .truncate { flex: 0 1 auto; }
 .transfer-name > .badge { flex-shrink: 0; }

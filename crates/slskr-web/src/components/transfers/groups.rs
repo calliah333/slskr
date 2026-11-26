@@ -16,38 +16,114 @@ use crate::{
     ui::{Avatar, Badge, Button, DropdownMenu, Icon, Modal},
 };
 
-use super::{Category, Entry, FileRef, Operation, Page, UserLayout, transfer_url};
+use super::{Category, Entry, FileRef, Operation, Page, UserLayout, directory_of, transfer_url};
 
 static NEXT_GROUP: AtomicUsize = AtomicUsize::new(0);
 
+/// The folders that get a row: each one with files, and each one where paths branch,
+/// except `root` (the one shared folder every upload is in), which is implied.
+fn touched_folders<'a>(
+    directories: impl IntoIterator<Item = &'a str>,
+    root: Option<&str>,
+) -> HashSet<&'a str> {
+    let mut touched = HashSet::new();
+    let mut first_child = HashMap::new();
+    for directory in directories {
+        let mut child = directory;
+        touched.insert(child);
+        let mut parent = directory_of(child);
+        while !parent.is_empty() {
+            if let Some(previous) = first_child.insert(parent, child) {
+                if previous != child && Some(parent) != root {
+                    touched.insert(parent);
+                }
+                // Ancestors of this parent were already visited.
+                break;
+            }
+            child = parent;
+            parent = directory_of(child);
+        }
+    }
+    touched
+}
+
+/// The nearest ancestor of `path` that has a row.
+fn touched_parent<'a>(path: &'a str, touched: &HashSet<&str>) -> Option<&'a str> {
+    std::iter::successors(Some(directory_of(path)), |path| Some(directory_of(path)))
+        .take_while(|path| !path.is_empty())
+        .find(|path| touched.contains(path))
+}
+
+/// Each row's child rows (`""` holds the top level), in first-seen order. Folders
+/// without files that lead to only one branch fold into their child's row.
+fn folder_tree<'a>(
+    directories: impl IntoIterator<Item = &'a str> + Clone,
+    root: Option<&str>,
+) -> HashMap<String, Vec<String>> {
+    let touched = touched_folders(directories.clone(), root);
+    let mut children = HashMap::<String, Vec<String>>::new();
+    let mut seen = HashSet::new();
+    for mut path in directories {
+        while seen.insert(path) {
+            let parent = touched_parent(path, &touched).unwrap_or_default();
+            children
+                .entry(parent.to_owned())
+                .or_default()
+                .push(path.to_owned());
+            if parent.is_empty() {
+                break;
+            }
+            path = parent;
+        }
+    }
+    children
+}
+
 #[derive(Default, PartialEq)]
 struct FolderFiles {
+    /// Files directly in the folder.
     direct: Vec<FileRef>,
+    /// Selectable files in the folder and the rows below it.
     selectable: Vec<String>,
+    /// All files in the folder and the rows below it.
+    count: usize,
 }
 
-fn folder_files(user: &UserLayout) -> HashMap<String, FolderFiles> {
-    user.directories
-        .iter()
-        .map(|directory| {
-            let folder = FolderFiles {
-                direct: directory.files.clone(),
-                selectable: selectable(&directory.files),
-            };
-            (directory.directory.clone(), folder)
-        })
-        .collect()
+fn folder_files(user: &UserLayout, root: Option<&str>) -> HashMap<String, FolderFiles> {
+    let paths = user.directories.iter().map(|dir| dir.directory.as_str());
+    let touched = touched_folders(paths, root);
+    let mut folders = HashMap::<String, FolderFiles>::new();
+    for directory in &user.directories {
+        let path = directory.directory.as_str();
+        folders
+            .entry(path.to_owned())
+            .or_default()
+            .direct
+            .clone_from(&directory.files);
+        let selectable = selectable(&directory.files);
+        for path in std::iter::successors(Some(path), |path| touched_parent(path, &touched)) {
+            let folder = folders.entry(path.to_owned()).or_default();
+            folder.count += directory.files.len();
+            folder.selectable.extend(selectable.iter().cloned());
+        }
+    }
+    folders
 }
 
-/// A folder row's label: its whole path, without `root` (the one shared folder every
-/// upload is in) unless that is all there is.
-fn folder_label(path: &str, root: Option<&str>) -> String {
-    let relative = root
-        .and_then(|root| path.strip_prefix(root))
+/// A folder row's label: its path below the row it is nested under, or at the top
+/// level its whole path without `root` (unless that is all there is).
+fn folder_label(parent: &str, path: &str, root: Option<&str>) -> String {
+    let base = if parent.is_empty() { root } else { Some(parent) };
+    let relative = base
+        .and_then(|base| path.strip_prefix(base))
         .and_then(|rest| rest.strip_prefix(['\\', '/']))
         .filter(|rest| !rest.is_empty())
         .unwrap_or(path);
     relative.split(['\\', '/']).collect::<Vec<_>>().join(" / ")
+}
+
+fn indent(depth: usize) -> String {
+    format!("--transfer-indent: {}ch", depth.min(8) * 2)
 }
 
 /// Selectable (not removed) ids of a set of files.
@@ -128,21 +204,53 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
         }
         collapse
     });
-    let folders =
-        Memo::new(move |_| user.with(|user| user.as_ref().map(folder_files).unwrap_or_default()));
-    // One row per folder, with its whole path: nothing nests.
-    let visible = Memo::new(move |_| {
+    let tree = Memo::new(move |_| {
         let root = page.share_root.get();
         user.with(|user| {
-            user.iter()
-                .flat_map(|user| &user.directories)
-                .map(|dir| {
-                    (
-                        dir.directory.clone(),
-                        folder_label(&dir.directory, root.as_deref()),
-                    )
+            user.as_ref()
+                .map(|user| {
+                    let paths = user.directories.iter().map(|dir| dir.directory.as_str());
+                    folder_tree(paths, root.as_deref())
                 })
-                .collect::<Vec<_>>()
+                .unwrap_or_default()
+        })
+    });
+    let folders = Memo::new(move |_| {
+        let root = page.share_root.get();
+        user.with(|user| {
+            user.as_ref()
+                .map(|user| folder_files(user, root.as_deref()))
+                .unwrap_or_default()
+        })
+    });
+    // Rows of open folders, depth first.
+    let visible = Memo::new(move |_| {
+        let root = page.share_root.get();
+        let collapse = page.collapse.get();
+        tree.with(|tree| {
+            toggled_folders.with(|toggled| {
+                let rows = |parent: &str, depth: usize| {
+                    tree.get(parent)
+                        .into_iter()
+                        .flatten()
+                        .rev()
+                        .map(|path| {
+                            let label = folder_label(parent, path, root.as_deref());
+                            (path.clone(), depth, label)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut pending = rows("", 0);
+                let mut visible = Vec::new();
+                while let Some((path, depth, label)) = pending.pop() {
+                    // Open unless folded: by default, or by the user's own toggle.
+                    if !path.is_empty() && collapse == toggled.contains(&path) {
+                        pending.extend(rows(&path, depth + 1));
+                    }
+                    visible.push((path, depth, label));
+                }
+                visible
+            })
         })
     });
     let content_id = format!(
@@ -230,8 +338,8 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
                         <th class="actions"><span class="sr-only">"Actions"</span></th>
                     </tr></thead>
                     <For each=move || visible.get()
-                        key=Clone::clone children=move |(directory, label)| view! {
-                            <TransferDirectory directory label toggled_folders folders page/>
+                        key=Clone::clone children=move |(directory, depth, label)| view! {
+                            <TransferDirectory directory depth label toggled_folders folders page/>
                         }/>
                 </table>
             </div>
@@ -270,6 +378,7 @@ fn group_badges(user: &UserLayout) -> impl IntoView + use<> {
 #[component]
 fn TransferDirectory(
     directory: String,
+    depth: usize,
     label: String,
     toggled_folders: RwSignal<HashSet<String>>,
     folders: Memo<HashMap<String, FolderFiles>>,
@@ -306,7 +415,7 @@ fn TransferDirectory(
             != dir.with_value(|dir| toggled_folders.with(|toggled| toggled.contains(dir)))
     });
     view! {
-        <tbody class="transfer-dir" class:is-folded=folded>
+        <tbody class="transfer-dir" class:is-folded=folded style=indent(depth)>
             <tr class="transfer-dir__row">
                 <td class="check-col">
                     <SelectAll ids selected=page.selected label=format!("Select all transfers in {short}")/>
@@ -325,7 +434,7 @@ fn TransferDirectory(
                         </span>
                         <span class="transfer-dir__count muted text-xs tabular">
                             {move || dir.with_value(|dir| folders.with(|folders| {
-                                let n = folders.get(dir).map_or(0, |folder| folder.direct.len());
+                                let n = folders.get(dir).map_or(0, |folder| folder.count);
                                 format!("{n} {}", if n == 1 { "file" } else { "files" })
                             }))}
                         </span>
@@ -755,10 +864,47 @@ mod tests {
     fn folder_rows_show_the_whole_path_without_the_one_shared_folder() {
         for separator in ["/", "\\"] {
             let album = ["music", "artist", "album1"].join(separator);
-            assert_eq!(folder_label(&album, None), "music / artist / album1");
-            assert_eq!(folder_label(&album, Some("music")), "artist / album1");
-            assert_eq!(folder_label("music", Some("music")), "music");
-            assert_eq!(folder_label(&album, Some("mus")), "music / artist / album1");
+            assert_eq!(folder_label("", &album, None), "music / artist / album1");
+            assert_eq!(folder_label("", &album, Some("music")), "artist / album1");
+            assert_eq!(folder_label("", "music", Some("music")), "music");
+            assert_eq!(folder_label("", &album, Some("mus")), "music / artist / album1");
+            let artist = ["music", "artist"].join(separator);
+            assert_eq!(folder_label(&artist, &album, Some("music")), "album1");
         }
+    }
+
+    #[test]
+    fn folders_nest_where_paths_branch_but_not_under_the_shared_folder() {
+        let dirs = [
+            r"music\Beatles\White Album\CD02",
+            r"music\Beatles\White Album\CD01",
+            r"music\Beatles\Magical Mystery Tour",
+            r"music\Beatles\Revolver",
+            r"music\Other\Album",
+        ];
+        let tree = folder_tree(dirs, Some("music"));
+        let children = |path: &str| tree.get(path).cloned().unwrap_or_default();
+        assert_eq!(
+            children(""),
+            [r"music\Beatles", r"music\Other\Album"],
+            "the shared folder has no row, and a one-branch chain shares its child's row"
+        );
+        assert_eq!(
+            children(r"music\Beatles"),
+            [
+                r"music\Beatles\White Album",
+                r"music\Beatles\Magical Mystery Tour",
+                r"music\Beatles\Revolver"
+            ]
+        );
+        assert_eq!(
+            children(r"music\Beatles\White Album"),
+            [
+                r"music\Beatles\White Album\CD02",
+                r"music\Beatles\White Album\CD01"
+            ]
+        );
+        // Without a shared folder to leave out, `music` is where everything branches.
+        assert_eq!(folder_tree(dirs, None)[""], ["music"]);
     }
 }
