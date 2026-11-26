@@ -21,6 +21,10 @@ use crate::resolvers::Resolvers;
 
 /// Requests answered concurrently per connection; further requests wait for a slot.
 const MAX_CONCURRENT_ANSWERS: usize = 4;
+/// Compressed responses inflated at once across all connections, bounding the memory a
+/// crowd of peers can make the client hold (each may inflate to tens of MiB).
+const MAX_CONCURRENT_INFLATES: usize = 8;
+static INFLATE_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_INFLATES);
 /// Frames larger than this (compressed) are decoded off the async workers.
 pub(super) const BLOCKING_DECODE_LEN: u64 = 256 * 1024;
 
@@ -119,9 +123,31 @@ pub(super) fn spawn(
             let size = frame.len() as u64;
             let code = frame.first_chunk::<4>().copied().map(u32::from_le_bytes);
             let code = code.and_then(|code| PeerCode::try_from(code).ok());
-            if code == Some(PeerCode::BrowseResponse) {
-                lock(&tracking).frames.pop_front();
+            // Compressed responses can inflate a thousandfold, so ones nobody asked for are
+            // dropped before inflating them.
+            let wanted = match code {
+                Some(PeerCode::BrowseResponse) => lock(&tracking).frames.pop_front() == Some(true),
+                Some(PeerCode::SearchResponse) => weak
+                    .upgrade()
+                    .is_some_and(|inner| inner.searches.any_active()),
+                _ => true,
+            };
+            if !wanted {
+                tracing::debug!(%username, %remote, ?code, "Dropping an unrequested response");
+                continue;
             }
+            let inflating = match code {
+                Some(
+                    PeerCode::BrowseResponse
+                    | PeerCode::SearchResponse
+                    | PeerCode::FolderContentsResponse,
+                ) => tokio::select! {
+                    biased;
+                    _ = session.cancelled() => break,
+                    slot = INFLATE_SLOTS.acquire() => slot.ok(),
+                },
+                _ => None,
+            };
             let decoded = if size > BLOCKING_DECODE_LEN {
                 // Inflating and parsing a large share listing would stall this worker.
                 tokio::task::spawn_blocking(move || PeerIncoming::decode(frame))
@@ -132,6 +158,7 @@ pub(super) fn spawn(
             } else {
                 PeerIncoming::decode(frame)
             };
+            drop(inflating);
             let Some(inner) = weak.upgrade() else { break };
             let client = SoulseekClient::from_inner(inner);
             let inner = client.inner();

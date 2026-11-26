@@ -339,7 +339,8 @@ impl MessageReader {
         self.decompress_with_limit(MAX_INFLATED_PAYLOAD_LEN)
     }
 
-    fn decompress_with_limit(&mut self, limit: usize) -> Result<(), ProtocolError> {
+    /// Zlib-inflates the unread remainder in place, rejecting payloads over `limit` bytes.
+    pub fn decompress_with_limit(&mut self, limit: usize) -> Result<(), ProtocolError> {
         self.buf = Bytes::from(inflate(&self.buf, limit)?);
         Ok(())
     }

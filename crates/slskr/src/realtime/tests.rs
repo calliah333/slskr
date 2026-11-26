@@ -88,7 +88,10 @@ impl Server {
             },
             SessionStore::memory(Duration::from_secs(3600)),
         );
-        let (token, _) = auth.login("admin", "secret").await.unwrap();
+        let (token, _) = auth
+            .login("admin", "secret", std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
         let bus = EventBus::new();
         let state = StateStore::new();
         let shutdown = CancellationToken::new();

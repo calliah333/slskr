@@ -7,13 +7,14 @@
 //! are not ambient credentials and skip that check.
 
 pub mod ip;
+pub mod limit;
 pub mod session;
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, FromRef, FromRequestParts, Request, State};
 use axum::http::request::Parts;
@@ -34,6 +35,15 @@ pub const API_KEY_HEADER: &str = "X-API-Key";
 pub const ALLOW_ALL_CIDR: &str = "0.0.0.0/0,::/0";
 /// Delay before answering a failed sign-in.
 pub const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(500);
+/// Failed sign-ins allowed per address within [`LOGIN_FAILURE_WINDOW`]; after that the
+/// address is refused, even with the right password, until the window ends.
+pub const LOGIN_MAX_FAILURES: u32 = 10;
+pub const LOGIN_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Addresses whose failed sign-ins are tracked at once.
+const LOGIN_TRACKED_ADDRESSES: usize = 4096;
+/// Password checks running at once; argon2 is slow on purpose, so a flood of sign-ins
+/// would otherwise occupy every blocking thread.
+const CONCURRENT_PASSWORD_CHECKS: usize = 4;
 
 /// User roles; numeric values match slskd's `Role` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -358,6 +368,9 @@ pub enum LoginError {
     Unauthorized,
     #[error("forbidden")]
     CrossSite,
+    /// Too many failed sign-ins from this address; retry after the duration.
+    #[error("Too many failed sign-ins; try again in {} s", limit::retry_seconds(*.0))]
+    Limited(Duration),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -372,6 +385,9 @@ impl From<LoginError> for crate::http::ApiError {
             }
             LoginError::Unauthorized => ApiError::Unauthorized,
             LoginError::CrossSite => ApiError::Forbidden("Cross-site request refused".into()),
+            LoginError::Limited(_) => {
+                ApiError::Status(StatusCode::TOO_MANY_REQUESTS, error.to_string())
+            }
             LoginError::Internal(error) => ApiError::Internal(error),
         }
     }
@@ -442,6 +458,8 @@ struct Inner {
     sessions: SessionStore,
     /// Cookie `Path`: `web.url_base`, `/` at the root.
     cookie_path: String,
+    login_failures: limit::FailureLimiter,
+    password_checks: tokio::sync::Semaphore,
 }
 
 /// Authentication service; cheap to clone.
@@ -468,6 +486,17 @@ pub fn remote_addr(parts: &Parts) -> SocketAddr {
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map_or(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), |info| info.0)
+}
+
+/// Extractor for the caller address (see [`remote_addr`]); never rejects.
+pub struct RemoteAddr(pub SocketAddr);
+
+impl<S: Send + Sync> FromRequestParts<S> for RemoteAddr {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(remote_addr(parts)))
+    }
 }
 
 /// Values of the session cookie in the request's `Cookie` headers.
@@ -509,6 +538,50 @@ pub fn needs_origin_check(method: &Method, headers: &HeaderMap) -> bool {
         || is_websocket_upgrade(headers)
 }
 
+/// The request's `Host` header, or the authority of an absolute URI (HTTP/2).
+pub fn request_host<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| uri.authority().map(|authority| authority.as_str()))
+}
+
+/// The name in a `Host` value, without the port or IPv6 brackets.
+fn host_name(host: &str) -> Option<&str> {
+    let host = host.trim();
+    match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map(|(name, _)| name),
+        None => Some(host.rsplit_once(':').map_or(host, |(name, _)| name)),
+    }
+}
+
+fn localhost(name: &str) -> bool {
+    let name = name.trim_end_matches('.');
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .len()
+            .checked_sub(".localhost".len())
+            .and_then(|start| name.get(start..))
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".localhost"))
+}
+
+/// True for `localhost` and loopback IP literals, with or without a port.
+pub fn loopback_host(host: &str) -> bool {
+    host_name(host).is_some_and(|name| {
+        localhost(name)
+            || name
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.to_canonical().is_loopback())
+    })
+}
+
+/// True for a `Host` that a DNS-rebinding page cannot send: `localhost` or an IP literal.
+/// Any other name could resolve to this daemon from an attacker's page, which the browser
+/// then treats as same-origin.
+pub fn unrebindable_host(host: &str) -> bool {
+    host_name(host).is_some_and(|name| localhost(name) || name.parse::<IpAddr>().is_ok())
+}
+
 /// True when the request has no `Origin` header or its host and port equal the request
 /// `Host` (forwarded host headers are not trusted).
 pub fn same_origin(headers: &HeaderMap, uri: &Uri) -> bool {
@@ -526,11 +599,7 @@ pub fn same_origin(headers: &HeaderMap, uri: &Uri) -> bool {
     } else {
         return false;
     };
-    let Some(host) = headers
-        .get(header::HOST)
-        .and_then(|host| host.to_str().ok())
-        .or_else(|| uri.authority().map(|authority| authority.as_str()))
-    else {
+    let Some(host) = request_host(headers, uri) else {
         return false;
     };
     let normalize = |value: &str| {
@@ -556,6 +625,12 @@ impl Auth {
                 credentials: RwLock::new(Credentials::from_config(&config)),
                 sessions,
                 cookie_path: "/".into(),
+                login_failures: limit::FailureLimiter::new(
+                    LOGIN_MAX_FAILURES,
+                    LOGIN_FAILURE_WINDOW,
+                    LOGIN_TRACKED_ADDRESSES,
+                ),
+                password_checks: tokio::sync::Semaphore::new(CONCURRENT_PASSWORD_CHECKS),
             }),
         }
     }
@@ -689,8 +764,12 @@ impl Auth {
             .flatten();
 
         if self.inner.disabled {
-            // Nothing to steal, but a page on another site must not drive the daemon.
-            return if cross_site && api_key.is_none() {
+            // Without credentials, only the Host keeps another site out: a page on a name
+            // the attacker rebinds to this address is same-origin to the browser, so only
+            // `localhost` and IP literals are served.
+            let rebindable =
+                !request_host(&parts.headers, &parts.uri).is_some_and(unrebindable_host);
+            return if (cross_site || rebindable) && api_key.is_none() {
                 Err(AuthError::Forbidden)
             } else {
                 Ok(Principal::passthrough())
@@ -760,13 +839,18 @@ impl Auth {
         username_matches & password_matches
     }
 
-    /// Signs in with the web credentials: returns the new session's token and principal.
-    /// Failures are answered after [`LOGIN_FAILURE_DELAY`].
+    /// Signs in with the web credentials for a caller at `remote`: returns the new session's
+    /// token and principal. Failures are answered after [`LOGIN_FAILURE_DELAY`] and counted
+    /// against the address, which is refused for a while after [`LOGIN_MAX_FAILURES`].
     pub async fn login(
         &self,
         username: &str,
         password: &str,
+        remote: IpAddr,
     ) -> Result<(String, Principal), LoginError> {
+        if let Some(wait) = self.inner.login_failures.limited(remote, Instant::now()) {
+            return Err(LoginError::Limited(wait));
+        }
         if username.trim().is_empty() || password.trim().is_empty() {
             return Err(LoginError::BadRequest(
                 "Username and/or Password missing or invalid",
@@ -787,6 +871,12 @@ impl Auth {
         }
 
         let matches = {
+            let _permit = self
+                .inner
+                .password_checks
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("checking credentials: {e}"))?;
             let (auth, username, password) =
                 (self.clone(), username.to_owned(), password.to_owned());
             tokio::task::spawn_blocking(move || auth.check_credentials(&username, &password))
@@ -794,9 +884,14 @@ impl Auth {
                 .map_err(|e| anyhow::anyhow!("checking credentials: {e}"))?
         };
         if !matches {
+            if let Err(wait) = self.inner.login_failures.fail(remote, Instant::now()) {
+                return Err(LoginError::Limited(wait));
+            }
+            warn!(%remote, "failed web sign-in");
             tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
             return Err(LoginError::Unauthorized);
         }
+        self.inner.login_failures.clear(remote);
         let token = self
             .inner
             .sessions

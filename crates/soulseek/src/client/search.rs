@@ -138,6 +138,14 @@ impl SearchManager {
         }
     }
 
+    /// True while any search is collecting responses.
+    pub(crate) fn any_active(&self) -> bool {
+        self.session()
+            .searches
+            .values()
+            .any(|search| search.responses.is_some())
+    }
+
     pub(super) fn explicitly_searches_self(&self, token: u32) -> bool {
         self.session()
             .searches

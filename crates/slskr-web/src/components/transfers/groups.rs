@@ -16,7 +16,9 @@ use crate::{
     ui::{Avatar, Badge, Button, DropdownMenu, Icon, Modal},
 };
 
-use super::{Category, Counts, Entry, FileRef, Operation, Page, UserLayout, directory_of, transfer_url};
+use super::{
+    Category, Counts, Entry, FileRef, Operation, Page, UserLayout, directory_of, transfer_url,
+};
 
 static NEXT_GROUP: AtomicUsize = AtomicUsize::new(0);
 
@@ -119,7 +121,11 @@ fn folder_files(user: &UserLayout, root: Option<&str>) -> HashMap<String, Folder
 /// A folder row's label: its path below the row it is nested under, or at the top
 /// level its whole path without `root` (unless that is all there is).
 fn folder_label(parent: &str, path: &str, root: Option<&str>) -> String {
-    let base = if parent.is_empty() { root } else { Some(parent) };
+    let base = if parent.is_empty() {
+        root
+    } else {
+        Some(parent)
+    };
     let relative = base
         .and_then(|base| path.strip_prefix(base))
         .and_then(|rest| rest.strip_prefix(['\\', '/']))
@@ -374,7 +380,13 @@ fn folder_status(counts: Counts) -> impl IntoView + use<> {
         (counts.queued, "warning", "clock", "Queued", "queued"),
         (counts.failed, "danger", "circle-alert", "Failed", "failed"),
         (counts.cancelled, "outline", "ban", "Cancelled", "cancelled"),
-        (counts.succeeded, "success", "circle-check", "Succeeded", "succeeded"),
+        (
+            counts.succeeded,
+            "success",
+            "circle-check",
+            "Succeeded",
+            "succeeded",
+        ),
     ];
     let present = states.iter().filter(|(count, ..)| *count > 0).count();
     let badges = states
@@ -905,7 +917,10 @@ mod tests {
             assert_eq!(folder_label("", &album, None), "music / artist / album1");
             assert_eq!(folder_label("", &album, Some("music")), "artist / album1");
             assert_eq!(folder_label("", "music", Some("music")), "music");
-            assert_eq!(folder_label("", &album, Some("mus")), "music / artist / album1");
+            assert_eq!(
+                folder_label("", &album, Some("mus")),
+                "music / artist / album1"
+            );
             let artist = ["music", "artist"].join(separator);
             assert_eq!(folder_label(&artist, &album, Some("music")), "album1");
         }

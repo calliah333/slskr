@@ -760,7 +760,7 @@ fn hosts_and_codes() {
         "[::1]:5030",
         "[::ffff:127.0.0.1]",
     ] {
-        assert!(loopback_host(host), "{host}");
+        assert!(auth::loopback_host(host), "{host}");
     }
     for host in [
         "example.com",
@@ -770,7 +770,7 @@ fn hosts_and_codes() {
         "::1",
         "",
     ] {
-        assert!(!loopback_host(host), "{host}");
+        assert!(!auth::loopback_host(host), "{host}");
     }
     assert_eq!(normalize_code(" abcd-efgh jkmn\n"), "ABCDEFGHJKMN");
     assert_eq!(format_code("ABCDEFGHJKMN"), "ABCD-EFGH-JKMN");

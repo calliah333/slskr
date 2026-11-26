@@ -78,6 +78,7 @@ async fn check_session(caller: Authenticated) -> Json<Session> {
 /// nothing to sign in to and the passthrough principal is returned (200).
 async fn login(
     State(app): State<AppState>,
+    auth::RemoteAddr(remote): auth::RemoteAddr,
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -91,7 +92,21 @@ async fn login(
     }
     let request = optional_json::<LoginRequest>(&headers, &body)?
         .ok_or_else(|| ApiError::BadRequest("No credentials provided".into()))?;
-    let (token, principal) = app.auth.login(&request.username, &request.password).await?;
+    let (token, principal) = match app
+        .auth
+        .login(&request.username, &request.password, remote.ip())
+        .await
+    {
+        Ok(signed_in) => signed_in,
+        Err(LoginError::Limited(wait)) => {
+            let mut response = ApiError::from(LoginError::Limited(wait)).into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, auth::limit::retry_seconds(wait).into());
+            return Ok(response);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let cookie = app
         .auth
         .session_cookie(&token, auth::forwarded_https(&headers));

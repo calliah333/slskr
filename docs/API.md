@@ -31,7 +31,7 @@ keeps it in step with the router.
   in to Soulseek, a pinned setting); `413` body too large; `415` missing JSON content type
   or unsupported request encoding;
   `422` well-formed JSON of the wrong shape; `429` another enqueue request or login test is
-  running, or too many wrong setup codes (with `Retry-After`); `500` an unexpected failure;
+  running, or too many failed sign-ins or wrong setup codes (with `Retry-After`); `500` an unexpected failure;
   `503` first-run setup is required (`{"error": "setup required"}`, see
   [below](#first-run-setup)), or the server connection dropped while a room request was
   pending; `504` a peer or the server did not answer in time.
@@ -42,11 +42,16 @@ A request is authenticated by one of:
 
 - the `slskr_session` cookie, set by `POST /api/session` (browsers). Requests other than
   `GET`/`HEAD`/`OPTIONS` that carry the cookie must be same-origin: an `Origin` header
-  naming another host is refused with `403`.
+  naming another host is refused with `403`. After 10 failed sign-ins within 15 minutes
+  from one address (IPv6: one /64), `POST /api/session` answers `429` for that address,
+  even with the right password, until 15 minutes after its first failure.
 - an API key in the `X-API-Key` header (scripts). Keys are created in the web UI (System →
   Settings) or with `POST /api/api-keys`, or configured in `slskr.toml`
   (`[[web.api_keys]]`); see [configuration](CONFIGURATION.md#web).
-- nothing, when `web.auth = false`: every request acts as an administrator.
+- nothing, when `web.auth = false`: every request acts as an administrator, as long as
+  its `Host` is `localhost` (or a `*.localhost` name) or an IP address. Other names get
+  `403`, because a web page on a name its owner points at this address (DNS rebinding)
+  would count as same-origin.
 
 Roles, lowest first: `readonly` (read everything except logs and settings), `readwrite`
 (also act: search, download, chat, connect), `admin` (also logs). Routes marked

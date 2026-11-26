@@ -52,6 +52,12 @@ pub fn read_file(r: &mut MessageReader) -> Result<File, ProtocolError> {
     })
 }
 
+/// Largest inflated search response. Any peer can send one unasked, and real responses
+/// are capped by the sender's result limit (a few hundred KiB for thousands of files).
+pub const MAX_SEARCH_RESPONSE_LEN: usize = 16 * 1024 * 1024;
+/// Largest inflated folder contents response: one folder, possibly with its subfolders.
+pub const MAX_FOLDER_CONTENTS_LEN: usize = 64 * 1024 * 1024;
+
 /// Maximum file entries parsed from one message (all directories and lists combined).
 pub const MAX_PARSED_FILES: usize = 5_000_000;
 /// Maximum directory entries parsed from one message (all lists combined).
@@ -250,7 +256,7 @@ impl SearchResponse {
 
     /// Decodes; the trailing unknown `u32` and locked files are optional.
     pub fn decode(r: &mut MessageReader) -> Result<Self, ProtocolError> {
-        r.decompress()?;
+        r.decompress_with_limit(MAX_SEARCH_RESPONSE_LEN)?;
         let username = r.string()?;
         let token = r.u32()?;
         let count = r.u32()?;
@@ -380,7 +386,7 @@ impl FolderContentsResponse {
     }
 
     pub fn decode(r: &mut MessageReader) -> Result<Self, ProtocolError> {
-        r.decompress()?;
+        r.decompress_with_limit(MAX_FOLDER_CONTENTS_LEN)?;
         let token = r.u32()?;
         let directory_name = r.string()?;
         let count = r.u32()?;
@@ -975,5 +981,29 @@ mod tests {
         assert!(matches!(decode(f), PeerIncoming::Unknown { code: 1, .. }));
         let f = MessageBuilder::new().code_u32(44).string("f").build();
         assert!(PeerIncoming::decode(f.slice(4..)).is_err());
+    }
+
+    #[test]
+    fn unsolicitable_responses_have_small_inflate_limits() {
+        let padding = vec![0u8; MAX_SEARCH_RESPONSE_LEN + 1];
+        let search = builder(PeerCode::SearchResponse)
+            .bytes(&padding)
+            .compress()
+            .build();
+        assert!(search.len() < 64 * 1024, "zeros compress well");
+        assert!(matches!(
+            PeerIncoming::decode(search.slice(4..)),
+            Err(ProtocolError::Invalid(message)) if message.contains("exceeds")
+        ));
+
+        let padding = vec![0u8; MAX_FOLDER_CONTENTS_LEN + 1];
+        let folder = builder(PeerCode::FolderContentsResponse)
+            .bytes(&padding)
+            .compress()
+            .build();
+        assert!(matches!(
+            PeerIncoming::decode(folder.slice(4..)),
+            Err(ProtocolError::Invalid(message)) if message.contains("exceeds")
+        ));
     }
 }

@@ -173,12 +173,7 @@ fn hashed_names_are_detected() {
     ] {
         assert!(meta::is_hashed(hashed), "{hashed}");
     }
-    for plain in [
-        "index.html",
-        "LICENSE",
-        "docs/readme.txt",
-        "a-cafe.css",
-    ] {
+    for plain in ["index.html", "LICENSE", "docs/readme.txt", "a-cafe.css"] {
         assert!(!meta::is_hashed(plain), "{plain}");
     }
 }

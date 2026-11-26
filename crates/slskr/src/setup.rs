@@ -18,9 +18,9 @@
 //! required, and to administrators afterwards.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     convert::Infallible,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
@@ -46,7 +46,7 @@ use soulseek::{ClientOptions, ClientState, DiagnosticLevel, SoulseekClient};
 
 use crate::{
     app::AppState,
-    auth::{self, AuthMethod, Policy, Principal, Role},
+    auth::{self, AuthMethod, Policy, Principal, Role, limit::FailureLimiter},
     config::{self, store},
     core_api::settings_error,
     http::{ApiError, ApiResult, Json, Query, Routes, error_response, optional_json},
@@ -97,28 +97,28 @@ pub fn routes() -> Routes {
 }
 
 /// The setup code and its attempt limits; cheap to clone.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Setup(Arc<Inner>);
 
-#[derive(Default)]
+impl Default for Setup {
+    fn default() -> Self {
+        Self(Arc::new(Inner {
+            code: Mutex::default(),
+            failures: FailureLimiter::new(MAX_FAILURES, FAILURE_WINDOW, TRACKED_ADDRESSES),
+            completing: tokio::sync::Mutex::default(),
+            login_test: tokio::sync::Mutex::default(),
+        }))
+    }
+}
+
 struct Inner {
-    codes: Mutex<CodeState>,
+    /// The normalized code (no separators) while setup is required.
+    code: Mutex<Option<String>>,
+    failures: FailureLimiter,
     /// Serializes `POST /api/setup`.
     completing: tokio::sync::Mutex<()>,
     /// One Soulseek login test at a time.
     login_test: tokio::sync::Mutex<()>,
-}
-
-#[derive(Default)]
-struct CodeState {
-    /// The normalized code (no separators) while setup is required.
-    code: Option<String>,
-    failures: HashMap<IpAddr, Failures>,
-}
-
-struct Failures {
-    count: u32,
-    since: Instant,
 }
 
 /// A refused setup code.
@@ -135,30 +135,30 @@ impl Setup {
         Self::default()
     }
 
-    fn codes(&self) -> std::sync::MutexGuard<'_, CodeState> {
-        self.0.codes.lock().unwrap_or_else(PoisonError::into_inner)
+    fn stored(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.0.code.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Creates a code when `required` and none exists, returning it (formatted) to announce;
     /// forgets the code and the failure counts when setup is not required.
     pub fn refresh(&self, required: bool) -> Option<String> {
-        let mut codes = self.codes();
+        let mut stored = self.stored();
         if !required {
-            codes.code = None;
-            codes.failures.clear();
+            *stored = None;
+            self.0.failures.reset();
             return None;
         }
-        if codes.code.is_some() {
+        if stored.is_some() {
             return None;
         }
         let code = generate_code();
-        codes.code = Some(normalize_code(&code));
+        *stored = Some(normalize_code(&code));
         Some(code)
     }
 
     /// The current setup code, formatted as announced.
     pub fn code(&self) -> Option<String> {
-        self.codes().code.as_deref().map(format_code)
+        self.stored().as_deref().map(format_code)
     }
 
     /// Checks `candidate` for a caller at `ip`: refused while the address is over its limit,
@@ -169,48 +169,20 @@ impl Setup {
         candidate: Option<&str>,
         now: Instant,
     ) -> Result<(), CodeError> {
-        let key = address_bucket(ip);
-        let mut guard = self.codes();
-        let codes = &mut *guard;
-        if codes
-            .failures
-            .get(&key)
-            .is_some_and(|f| now.saturating_duration_since(f.since) >= FAILURE_WINDOW)
-        {
-            codes.failures.remove(&key);
-        }
-        if let Some(failures) = codes.failures.get(&key)
-            && failures.count >= MAX_FAILURES
-        {
-            let elapsed = now.saturating_duration_since(failures.since);
-            return Err(CodeError::Limited(FAILURE_WINDOW.saturating_sub(elapsed)));
+        if let Some(wait) = self.0.failures.limited(ip, now) {
+            return Err(CodeError::Limited(wait));
         }
         let Some(candidate) = candidate.map(normalize_code).filter(|c| !c.is_empty()) else {
             return Err(CodeError::Missing);
         };
-        let matches = codes
-            .code
+        let matches = self
+            .stored()
             .as_deref()
             .is_some_and(|code| auth::constant_time_eq(code.as_bytes(), candidate.as_bytes()));
         if matches {
             return Ok(());
         }
-        if !codes.failures.contains_key(&key) && codes.failures.len() >= TRACKED_ADDRESSES {
-            codes
-                .failures
-                .retain(|_, f| now.saturating_duration_since(f.since) < FAILURE_WINDOW);
-            if codes.failures.len() >= TRACKED_ADDRESSES {
-                return Err(CodeError::Limited(FAILURE_WINDOW));
-            }
-        }
-        codes
-            .failures
-            .entry(key)
-            .or_insert(Failures {
-                count: 0,
-                since: now,
-            })
-            .count += 1;
+        self.0.failures.fail(ip, now).map_err(CodeError::Limited)?;
         Err(CodeError::Wrong)
     }
 }
@@ -247,18 +219,6 @@ fn normalize_code(code: &str) -> String {
         .filter(|c| !c.is_whitespace() && *c != '-')
         .map(|c| c.to_ascii_uppercase())
         .collect()
-}
-
-/// The address failures are counted against: IPv4 addresses alone, IPv6 per /64.
-fn address_bucket(ip: IpAddr) -> IpAddr {
-    match ip.to_canonical() {
-        IpAddr::V6(v6) => {
-            let mut segments = v6.segments();
-            segments[4..].fill(0);
-            IpAddr::V6(Ipv6Addr::from(segments))
-        }
-        v4 => v4,
-    }
 }
 
 /// True when setup is required: authentication is enabled and no web password is set.
@@ -340,16 +300,12 @@ impl Caller {
     /// True when the request comes from the daemon's own machine: a loopback peer, a
     /// loopback `Host` (so a DNS-rebound name does not count) and no reverse proxy headers.
     pub fn local(&self) -> bool {
-        let host = self
-            .headers
-            .get(header::HOST)
-            .and_then(|host| host.to_str().ok())
-            .or_else(|| self.uri.authority().map(|authority| authority.as_str()));
+        let host = auth::request_host(&self.headers, &self.uri);
         self.remote.ip().to_canonical().is_loopback()
             && !FORWARDING_HEADERS
                 .iter()
                 .any(|name| self.headers.contains_key(*name))
-            && host.is_some_and(loopback_host)
+            && host.is_some_and(auth::loopback_host)
     }
 
     fn cross_site(&self) -> bool {
@@ -370,22 +326,6 @@ impl<S: Send + Sync> FromRequestParts<S> for Caller {
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         Ok(Self::from_parts(parts))
     }
-}
-
-/// True for `localhost` and loopback IP literals, with or without a port.
-fn loopback_host(host: &str) -> bool {
-    let host = host.trim();
-    let name = match host.strip_prefix('[') {
-        Some(rest) => match rest.split_once(']') {
-            Some((name, _)) => name,
-            None => return false,
-        },
-        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
-    };
-    name.eq_ignore_ascii_case("localhost")
-        || name
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// A refused setup request; boxed because responses are large.
@@ -438,7 +378,7 @@ async fn authorize_code(
             Err(ApiError::Forbidden("Invalid setup code".into()).into())
         }
         Err(CodeError::Limited(retry)) => {
-            let seconds = retry.as_secs() + u64::from(retry.subsec_nanos() > 0);
+            let seconds = auth::limit::retry_seconds(retry);
             let mut response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("Too many wrong setup codes; try again in {seconds} s"),

@@ -136,7 +136,9 @@ async fn build(
 }
 
 async fn create_dirs(paths: &Paths, startup: &Config) -> Result<()> {
-    tokio::fs::create_dir_all(&paths.db_dir).await?;
+    for dir in [&paths.db_dir, &paths.logs_dir] {
+        crate::create_private_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     tokio::fs::create_dir_all(&startup.downloads.directory).await?;
     tokio::fs::create_dir_all(&startup.downloads.incomplete_directory).await?;
     Ok(())

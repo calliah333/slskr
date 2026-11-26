@@ -1853,7 +1853,10 @@ mod tests {
             auth_config(&store.get()),
             SessionStore::memory(Duration::from_secs(3_600)),
         );
-        let (token, _) = auth.login("admin", "first").await.unwrap();
+        let (token, _) = auth
+            .login("admin", "first", std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
@@ -1875,8 +1878,16 @@ mod tests {
             .unwrap();
         auth.update(&auth_config(&store.get()));
         assert!(auth.session_principal(&headers).is_none());
-        assert!(auth.login("admin", "first").await.is_err());
-        assert!(auth.login("admin", "second").await.is_ok());
+        assert!(
+            auth.login("admin", "first", std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+                .is_err()
+        );
+        assert!(
+            auth.login("admin", "second", std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

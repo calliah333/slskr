@@ -64,7 +64,7 @@ prevent startup. Do not edit `settings.json` by hand; it is replaced on every ch
 | `web.url_base` | `"/"` | `SLSKR_WEB_URL_BASE` | yes | Path prefix behind a reverse proxy, e.g. `"/slskr"`. |
 | `web.username` | `"admin"` | `SLSKR_WEB_USERNAME` | | Web sign-in name. Changing it signs out every browser. |
 | `web.password` | `""` | `SLSKR_WEB_PASSWORD` | | Web sign-in password; while no password is set anywhere, the daemon waits for first-run setup (see below). Changing it signs out every browser. |
-| `web.auth` | `true` | `SLSKR_WEB_AUTH` | yes | `false` disables authentication: loopback or development only. |
+| `web.auth` | `true` | `SLSKR_WEB_AUTH` | yes | `false` disables authentication: loopback or development only. The UI then answers only on `localhost` or an IP address, not on a host name. |
 | `web.session_ttl` | `"30d"` | `SLSKR_WEB_SESSION_TTL` | | How long a browser stays signed in; each use extends it (5m–365d). |
 | `web.log_requests` | `false` | `SLSKR_WEB_LOG_REQUESTS` | yes | Log every HTTP request at info level. |
 | `web.api_keys` | `[]` | file only | | API keys for the `X-API-Key` header, see below. |

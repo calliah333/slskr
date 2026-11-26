@@ -41,12 +41,16 @@ fn parts(uri: &str, headers: &[(&str, &str)]) -> Parts {
     request(Method::GET, uri, headers)
 }
 
+fn local() -> IpAddr {
+    Ipv4Addr::LOCALHOST.into()
+}
+
 fn addr(s: &str) -> SocketAddr {
     SocketAddr::new(s.parse().unwrap(), 1234)
 }
 
 async fn signed_in(auth: &Auth) -> String {
-    let (token, principal) = auth.login("admin", "hunter2").await.unwrap();
+    let (token, principal) = auth.login("admin", "hunter2", local()).await.unwrap();
     assert_eq!(principal.method, AuthMethod::Session);
     format!("{COOKIE_NAME}={token}")
 }
@@ -265,7 +269,7 @@ fn passthrough_when_disabled() {
         SessionStore::memory(session::DEFAULT_TTL),
     );
     assert!(!auth.enabled());
-    let p = parts("/api/transfers", &[]);
+    let p = parts("/api/transfers", &[("host", "127.0.0.1:5030")]);
     let principal = auth
         .authorize(
             &p,
@@ -304,15 +308,15 @@ async fn login_semantics() {
     assert!(!auth.check_credentials("admin", "hunter3"));
     assert!(!auth.check_credentials("Admin", "hunter2"));
 
-    let (token, principal) = auth.login("admin", "hunter2").await.unwrap();
+    let (token, principal) = auth.login("admin", "hunter2", local()).await.unwrap();
     assert_eq!(principal.role, Role::Administrator);
     assert!(auth.sessions().lookup(&token).is_some());
     assert!(matches!(
-        auth.login("admin", "wrong").await,
+        auth.login("admin", "wrong", local()).await,
         Err(LoginError::Unauthorized)
     ));
     assert!(matches!(
-        auth.login("", "x").await,
+        auth.login("", "x", local()).await,
         Err(LoginError::BadRequest(_))
     ));
 
@@ -324,7 +328,7 @@ async fn login_semantics() {
         SessionStore::memory(session::DEFAULT_TTL),
     );
     assert!(matches!(
-        misconfigured.login("admin", "x").await,
+        misconfigured.login("admin", "x", local()).await,
         Err(LoginError::Misconfigured)
     ));
 
@@ -354,7 +358,7 @@ async fn credential_changes_invalidate_sessions() {
         ..config()
     });
     assert!(auth.session_principal(&headers).is_none());
-    assert!(auth.login("admin", "changed").await.is_ok());
+    assert!(auth.login("admin", "changed", local()).await.is_ok());
 
     let cookie = signed_in_as(&auth, "admin", "changed").await;
     let headers = parts("/", &[("cookie", cookie.as_str())]).headers;
@@ -367,7 +371,7 @@ async fn credential_changes_invalidate_sessions() {
 }
 
 async fn signed_in_as(auth: &Auth, username: &str, password: &str) -> String {
-    let (token, _) = auth.login(username, password).await.unwrap();
+    let (token, _) = auth.login(username, password, local()).await.unwrap();
     format!("{COOKIE_NAME}={token}")
 }
 
@@ -470,7 +474,7 @@ async fn used_sessions_resend_the_cookie() {
     use tower::ServiceExt as _;
 
     let auth = auth().with_url_base("/client");
-    let (token, _) = auth.login("admin", "hunter2").await.unwrap();
+    let (token, _) = auth.login("admin", "hunter2", local()).await.unwrap();
     let router = Router::new().route("/x", get(|| async { "ok" })).layer(
         axum::middleware::from_fn_with_state(auth.clone(), refresh_session_cookie),
     );
@@ -527,13 +531,13 @@ async fn hashed_password_login_and_invalidation() {
         },
         SessionStore::memory(session::DEFAULT_TTL),
     );
-    assert!(auth.login("admin", "from-the-ui").await.is_ok());
+    assert!(auth.login("admin", "from-the-ui", local()).await.is_ok());
     assert!(matches!(
-        auth.login("admin", "hunter2").await,
+        auth.login("admin", "hunter2", local()).await,
         Err(LoginError::Unauthorized)
     ));
     assert!(matches!(
-        auth.login("root", "from-the-ui").await,
+        auth.login("root", "from-the-ui", local()).await,
         Err(LoginError::Unauthorized)
     ));
 
@@ -547,7 +551,7 @@ async fn hashed_password_login_and_invalidation() {
         ..config()
     });
     assert!(auth.session_principal(&headers).is_none());
-    assert!(auth.login("admin", "next").await.is_ok());
+    assert!(auth.login("admin", "next", local()).await.is_ok());
 
     // A plaintext password from the file takes precedence over the hash.
     let both = Auth::new(
@@ -557,8 +561,8 @@ async fn hashed_password_login_and_invalidation() {
         },
         SessionStore::memory(session::DEFAULT_TTL),
     );
-    assert!(both.login("admin", "hunter2").await.is_ok());
-    assert!(both.login("admin", "from-the-ui").await.is_err());
+    assert!(both.login("admin", "hunter2", local()).await.is_ok());
+    assert!(both.login("admin", "from-the-ui", local()).await.is_err());
 }
 
 #[test]
@@ -588,4 +592,97 @@ fn hashed_api_keys() {
         auth.authenticate_api_key(&sha256_hex(key.as_bytes()), "10.0.0.1".parse().unwrap()),
         Err(ApiKeyError::Unknown)
     ));
+}
+
+#[test]
+fn passthrough_refuses_rebindable_hosts() {
+    let auth = Auth::new(
+        AuthConfig {
+            disabled: true,
+            ..config()
+        },
+        SessionStore::memory(session::DEFAULT_TTL),
+    );
+    let check = |method: Method, host: &str, origin: Option<&str>| {
+        let mut headers = vec![("host", host)];
+        headers.extend(origin.map(|origin| ("origin", origin)));
+        auth.authenticate(
+            &request(method, "/api/settings", &headers),
+            addr("127.0.0.1"),
+        )
+    };
+    for host in [
+        "localhost:5030",
+        "127.0.0.1:5030",
+        "[::1]:5030",
+        "192.168.1.20",
+        "app.localhost",
+    ] {
+        assert_eq!(
+            check(Method::GET, host, None),
+            Ok(Principal::passthrough()),
+            "{host}"
+        );
+    }
+    // A page on a name rebound to this address is same-origin to the browser, so reads and
+    // writes are both refused.
+    for method in [Method::GET, Method::PATCH] {
+        assert_eq!(
+            check(
+                method,
+                "evil.example:5030",
+                Some("http://evil.example:5030")
+            ),
+            Err(AuthError::Forbidden)
+        );
+    }
+    assert_eq!(
+        check(Method::GET, "nas.lan", None),
+        Err(AuthError::Forbidden)
+    );
+    // An API key is not something a rebinding page can have.
+    let p = request(
+        Method::GET,
+        "/api/settings",
+        &[
+            ("host", "nas.lan"),
+            (API_KEY_HEADER, "anywhere-key-0123456789"),
+        ],
+    );
+    assert_eq!(
+        auth.authenticate(&p, addr("10.0.0.1")),
+        Ok(Principal::passthrough())
+    );
+}
+
+#[test]
+fn host_parsing() {
+    assert!(loopback_host("localhost"));
+    assert!(loopback_host("LOCALHOST:5030"));
+    assert!(loopback_host("[::1]:5030"));
+    assert!(loopback_host("127.0.0.2"));
+    assert!(!loopback_host("localhost.evil.example"));
+    assert!(!loopback_host("[::1"));
+    assert!(unrebindable_host("10.0.0.1:5030"));
+    assert!(!unrebindable_host("::1"), "bare IPv6 is not a valid Host");
+    assert!(!unrebindable_host("127.0.0.1.nip.io"));
+}
+
+#[tokio::test]
+async fn repeated_failed_logins_lock_out_the_address() {
+    let auth = auth();
+    let attacker: IpAddr = "192.0.2.9".parse().unwrap();
+    for _ in 0..LOGIN_MAX_FAILURES {
+        assert!(matches!(
+            auth.login("admin", "guess", attacker).await,
+            Err(LoginError::Unauthorized)
+        ));
+    }
+    // Even the right password is refused while locked out, so guessing stops working.
+    assert!(matches!(
+        auth.login("admin", "hunter2", attacker).await,
+        Err(LoginError::Limited(wait)) if wait <= LOGIN_FAILURE_WINDOW
+    ));
+    // Other addresses are unaffected, and a success clears the count.
+    assert!(auth.login("admin", "hunter2", local()).await.is_ok());
 }
