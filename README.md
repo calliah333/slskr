@@ -5,6 +5,29 @@ connected to the Soulseek network, shares your files, and lets you search, downl
 chat from a web UI. It is a single binary with the UI built in, written in Rust, and
 started as a port of [slskd](https://github.com/slskd/slskd).
 
+![Overview page: live speeds and queue, 30-day upload history](docs/screenshots/overview.png)
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/uploads.png" alt="Uploads grouped by user and folder, dark theme"></td>
+    <td><img src="docs/screenshots/settings.png" alt="Settings page with the Soulseek account section"></td>
+  </tr>
+</table>
+
+## Performance
+
+Numbers from one real instance (i7-8700K, NixOS) sharing 29,978 files (0.57 TiB), taken from
+the profile report slskr writes to its log every 15 minutes. Over 16.5 hours on
+2026-11-26 it finished 4,280 uploads (100.6 GiB):
+
+| | |
+| --- | --- |
+| CPU | 3.4% of one core (median), 6.6% at peak |
+| Memory (RSS) | 72–138 MiB |
+| All-time Overview reports over 1.2 M transfer rows | about 70–300 ms each |
+| Binary with the UI embedded | 30 MB |
+| Web UI (WASM) | 3.5 MB, 1.4 MB gzipped |
+
 ## Quick start
 
 ### Docker Compose
