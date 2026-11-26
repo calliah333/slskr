@@ -36,7 +36,7 @@ use slskr_types::{
     telemetry::{CompletedMetrics, CurrentMetrics},
     transfers::{
         Batch, DownloadFile, EnqueueFailure, EnqueuedDownloads, Transfer, TransferDirection,
-        TransferState,
+        TransferState, TransferStateCount,
     },
 };
 use soulseek::{
@@ -1405,24 +1405,25 @@ impl TransferService {
     async fn list(
         &self,
         direction: TransferDirection,
-        user: Option<String>,
-        include_removed: bool,
-        recent_completed: Option<u32>,
+        filter: store::ListFilter,
     ) -> anyhow::Result<Vec<Transfer>> {
         self.ready().await?;
-        let mut transfers = store::list(
-            self.database(),
-            direction,
-            user,
-            include_removed,
-            recent_completed,
-        )
-        .await?;
+        let include_removed = filter.include_removed;
+        let mut transfers = store::list(self.database(), direction, filter).await?;
         self.overlay(&mut transfers);
         if !include_removed {
             transfers.retain(|t| !t.removed);
         }
         Ok(transfers)
+    }
+
+    async fn summary(
+        &self,
+        direction: TransferDirection,
+        filter: store::ListFilter,
+    ) -> anyhow::Result<Vec<TransferStateCount>> {
+        self.ready().await?;
+        store::summary(self.database(), direction, filter).await
     }
 
     async fn find(
@@ -1681,10 +1682,18 @@ fn log_outcome(t: &Transfer, result: &soulseek::Result<PathBuf>) {
 }
 
 /// A failed transfer's error as shown and stored: the message, with peer addresses masked
-/// as stored, so the live and stored error agree.
+/// as stored, so the live and stored error agree. The transfer is listed under its user,
+/// so an offline user is not named (and is counted as one error in the reports).
 fn error_text(error: &Error) -> String {
-    store::mask_addresses(&error.to_string()).into_owned()
+    match error {
+        Error::UserOffline(_) => OFFLINE_ERROR.to_owned(),
+        _ => store::mask_addresses(&error.to_string()).into_owned(),
+    }
 }
+
+/// The stored error of a transfer whose user was offline (`migrations/offline_errors.sql`
+/// rewrote the older, per-user messages to it).
+const OFFLINE_ERROR: &str = "User was offline";
 
 #[cfg(test)]
 mod tests {

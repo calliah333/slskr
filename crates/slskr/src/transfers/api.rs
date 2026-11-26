@@ -11,8 +11,9 @@ use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use slskr_types::transfers::{
-    Batch, CreateBatch, CreatedBatch, DownloadFile, EnqueueDownloads, EnqueueDownloadsRequest,
-    EnqueueFolder, EnqueuedDownloads, QueuePosition, Transfer, TransferDirection,
+    Batch, CompletedFilter, CreateBatch, CreatedBatch, DownloadFile, EnqueueDownloads,
+    EnqueueDownloadsRequest, EnqueueFolder, EnqueuedDownloads, QueuePosition, Transfer,
+    TransferDirection, TransferListSummary,
 };
 use uuid::Uuid;
 
@@ -30,6 +31,7 @@ const UPLOADS: bool = true;
 pub fn routes() -> Routes {
     Routes::new()
         .get("/api/transfers/downloads", list::<DOWNLOADS>)
+        .get("/api/transfers/downloads/summary", summary::<DOWNLOADS>)
         .post("/api/transfers/downloads", enqueue)
         .post("/api/transfers/downloads/folder", enqueue_folder)
         .delete(
@@ -41,6 +43,7 @@ pub fn routes() -> Routes {
         .post("/api/transfers/downloads/{id}/cancel", cancel::<DOWNLOADS>)
         .get("/api/transfers/downloads/{id}/position", position)
         .get("/api/transfers/uploads", list::<UPLOADS>)
+        .get("/api/transfers/uploads/summary", summary::<UPLOADS>)
         .delete(
             "/api/transfers/uploads/completed",
             clear_completed::<UPLOADS>,
@@ -66,6 +69,25 @@ struct ListQuery {
     username: Option<String>,
     include_removed: bool,
     recent_completed: Option<u32>,
+    completed_offset: u32,
+    completed: CompletedFilter,
+    query: Option<String>,
+}
+
+impl ListQuery {
+    fn filter(self) -> store::ListFilter {
+        store::ListFilter {
+            username: self.username.filter(|name| !name.is_empty()),
+            include_removed: self.include_removed,
+            recent_completed: self.recent_completed,
+            completed_offset: self.completed_offset,
+            completed: self.completed,
+            query: self
+                .query
+                .map(|query| query.trim().to_lowercase())
+                .filter(|query| !query.is_empty()),
+        }
+    }
 }
 
 fn bad_request(message: &str) -> ApiError {
@@ -105,29 +127,26 @@ async fn list<const UPLOAD: bool>(
     let transfers = &app.services.transfers;
     transfers.ready().await?;
     let direction = direction::<UPLOAD>();
-    let username = query.username.filter(|name| !name.is_empty());
+    let filter = query.filter();
+    let username = filter.username.clone();
     let revision = transfers.idle_list_revision(direction, username.as_deref());
     // A weak tag works across compression variants. Scope it to this list and daemon instance.
     let tag = revision.map(|revision| {
         let user = Sha256::digest(username.as_deref().unwrap_or_default().as_bytes());
+        let text = Sha256::digest(filter.query.as_deref().unwrap_or_default().as_bytes());
         format!(
-            "W/\"{}-{revision}-{UPLOAD}-{}-{}-{user:x}\"",
+            "W/\"{}-{revision}-{UPLOAD}-{}-{}-{}-{}-{user:x}-{text:x}\"",
             transfers.0.list_epoch,
-            query.include_removed,
-            query.recent_completed.map_or(-1, i64::from)
+            filter.include_removed,
+            filter.recent_completed.map_or(-1, i64::from),
+            filter.completed_offset,
+            filter.completed.as_str(),
         )
     });
     let (mut response, tag) = if if_none_match(&headers, tag.as_deref()) {
         (StatusCode::NOT_MODIFIED.into_response(), tag)
     } else {
-        let snapshot = transfers
-            .list(
-                direction,
-                username.clone(),
-                query.include_removed,
-                query.recent_completed,
-            )
-            .await?;
+        let snapshot = transfers.list(direction, filter).await?;
         // The SQL read and live overlay are separate. Only tag stable snapshots.
         let stable = revision.is_some()
             && revision == transfers.idle_list_revision(direction, username.as_deref())
@@ -147,6 +166,21 @@ async fn list<const UPLOAD: bool>(
         HeaderValue::from_static("private, no-store"),
     );
     Ok(response)
+}
+
+/// Counts of the list by state (`TransferListSummary`); `username` and `query` filter it
+/// like the list.
+async fn summary<const UPLOAD: bool>(
+    _: Authenticated,
+    State(app): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<TransferListSummary>> {
+    let states = app
+        .services
+        .transfers
+        .summary(direction::<UPLOAD>(), query.filter())
+        .await?;
+    Ok(Json(TransferListSummary { states }))
 }
 
 async fn get_one<const UPLOAD: bool>(

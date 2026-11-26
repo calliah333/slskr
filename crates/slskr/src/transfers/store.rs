@@ -8,7 +8,9 @@ use rusqlite::{
 };
 use slskr_types::{
     config::RetentionConfig,
-    transfers::{Batch, Transfer, TransferDirection, TransferState},
+    transfers::{
+        Batch, CompletedFilter, Transfer, TransferDirection, TransferState, TransferStateCount,
+    },
 };
 use uuid::Uuid;
 
@@ -61,6 +63,8 @@ CREATE INDEX ix_transfers_file ON transfers(direction, username, filename);
     include_str!("migrations/report_hours.sql"),
     include_str!("migrations/compact.sql"),
     include_str!("migrations/error_messages.sql"),
+    include_str!("migrations/offline_errors.sql"),
+    include_str!("migrations/list_counts.sql"),
 ];
 
 /// `error` with the IPv4 peer addresses in it (`a.b.c.d` or `a.b.c.d:port`) replaced by
@@ -211,29 +215,77 @@ macro_rules! select {
     };
 }
 
-// List queries per `(recent_completed, username)`. Separate statements, rather than
-// `(?n IS NULL OR username = ?n)`, let SQLite use the username and partial state indexes.
-const LIST: &str = select!("WHERE direction = ?1 AND (?2 OR NOT removed) ORDER BY seq");
-const LIST_USER: &str =
-    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?3 ORDER BY seq");
-const LIST_RECENT: &str = concat!(
-    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND (state & 16) = 0"),
-    " UNION ALL SELECT * FROM (",
-    select!(
-        "WHERE direction = ?1 AND (?2 OR NOT removed) AND (state & 16) != 0 ",
-        "ORDER BY ended_at DESC, seq DESC LIMIT ?3"
-    ),
-    ")"
-);
-const LIST_RECENT_USER: &str = concat!(
-    select!("WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?4 AND (state & 16) = 0"),
-    " UNION ALL SELECT * FROM (",
-    select!(
-        "WHERE direction = ?1 AND (?2 OR NOT removed) AND username = ?4 AND (state & 16) != 0 ",
-        "ORDER BY ended_at DESC, seq DESC LIMIT ?3"
-    ),
-    ")"
-);
+/// Which transfers a list returns: every active one, and the completed ones `completed`
+/// selects (all of them in list order, or a page of the newest with `recent_completed`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ListFilter {
+    pub(crate) username: Option<String>,
+    pub(crate) include_removed: bool,
+    pub(crate) recent_completed: Option<u32>,
+    pub(crate) completed_offset: u32,
+    pub(crate) completed: CompletedFilter,
+    /// Lower-case text the user name or the file name contains.
+    pub(crate) query: Option<String>,
+}
+
+impl ListFilter {
+    /// The `WHERE` clause every part of the list shares, with its parameters.
+    fn base(&self, direction: TransferDirection) -> (String, Vec<(&'static str, Value)>) {
+        let mut sql = String::from("WHERE direction = :direction AND (:removed OR NOT removed)");
+        let mut params = vec![
+            (":direction", Value::Text(direction_name(direction).into())),
+            (":removed", Value::Integer(self.include_removed.into())),
+        ];
+        if let Some(username) = &self.username {
+            sql.push_str(" AND username = :username");
+            params.push((":username", Value::Text(username.clone())));
+        }
+        if let Some(query) = &self.query {
+            sql.push_str(
+                " AND (instr(lower(username), :query) > 0 OR instr(lower(filename), :query) > 0)",
+            );
+            params.push((":query", Value::Text(query.clone())));
+        }
+        (sql, params)
+    }
+
+    /// The list query. The completed part keeps `(state & 16) != 0` so that SQLite can
+    /// page through the partial `ix_transfers_recent` index.
+    fn sql(&self, direction: TransferDirection) -> (String, Vec<(&'static str, Value)>) {
+        let (base, mut params) = self.base(direction);
+        let columns = select!("");
+        let completed = match self.completed {
+            CompletedFilter::All => Some("(state & 16) != 0"),
+            CompletedFilter::Succeeded => Some("(state & 16) != 0 AND (state & 32) != 0"),
+            CompletedFilter::Failed => Some("(state & 16) != 0 AND (state & 32) = 0"),
+            CompletedFilter::None => None,
+        };
+        let sql = match (self.recent_completed, completed) {
+            (_, None) => format!("{columns}{base} AND (state & 16) = 0 ORDER BY seq"),
+            (None, Some(completed)) => {
+                format!("{columns}{base} AND ((state & 16) = 0 OR ({completed})) ORDER BY seq")
+            }
+            (Some(limit), Some(completed)) => {
+                params.push((":limit", Value::Integer(limit.into())));
+                params.push((":offset", Value::Integer(self.completed_offset.into())));
+                format!(
+                    "{columns}{base} AND (state & 16) = 0 UNION ALL SELECT * FROM \
+                     ({columns}{base} AND {completed} \
+                     ORDER BY ended_at DESC, seq DESC LIMIT :limit OFFSET :offset)"
+                )
+            }
+        };
+        (sql, params)
+    }
+}
+
+/// Binds named parameters given as owned values.
+fn named<'a>(params: &'a [(&'static str, Value)]) -> Vec<(&'static str, &'a dyn rusqlite::ToSql)> {
+    params
+        .iter()
+        .map(|(name, value)| (*name, value as &dyn rusqlite::ToSql))
+        .collect()
+}
 
 pub(super) fn direction_name(direction: TransferDirection) -> &'static str {
     match direction {
@@ -465,33 +517,60 @@ pub(super) async fn save(db: &Database, snapshots: Vec<Snapshot>) -> anyhow::Res
 pub(super) async fn list(
     db: &Database,
     direction: TransferDirection,
-    username: Option<String>,
-    include_removed: bool,
-    recent_completed: Option<u32>,
+    filter: ListFilter,
 ) -> anyhow::Result<Vec<Transfer>> {
     db.call(move |db| {
-        let direction = direction_name(direction);
-        match (recent_completed, username) {
-            (None, None) => db
-                .prepare_cached(LIST)?
-                .query_map(params![direction, include_removed], transfer)?
-                .collect(),
-            (None, Some(username)) => db
-                .prepare_cached(LIST_USER)?
-                .query_map(params![direction, include_removed, username], transfer)?
-                .collect(),
-            (Some(limit), None) => db
-                .prepare_cached(LIST_RECENT)?
-                .query_map(params![direction, include_removed, limit], transfer)?
-                .collect(),
-            (Some(limit), Some(username)) => db
-                .prepare_cached(LIST_RECENT_USER)?
-                .query_map(
-                    params![direction, include_removed, limit, username],
-                    transfer,
-                )?
-                .collect(),
+        let (sql, params) = filter.sql(direction);
+        db.prepare_cached(&sql)?
+            .query_map(named(&params).as_slice(), transfer)?
+            .collect()
+    })
+    .await
+}
+
+/// How many transfers the list holds per state, and their size. Without a user or text
+/// filter this reads the counts the triggers keep (`migrations/list_counts.sql`).
+pub(super) async fn summary(
+    db: &Database,
+    direction: TransferDirection,
+    filter: ListFilter,
+) -> anyhow::Result<Vec<TransferStateCount>> {
+    db.call(move |db| {
+        let rows: Vec<(u32, u64, u64)> = if filter.username.is_none() && filter.query.is_none() {
+            db.prepare_cached(
+                "SELECT state, SUM(files), SUM(bytes) FROM transfer_list_counts
+                 WHERE direction = ?1 AND (?2 OR removed = 0) GROUP BY state",
+            )?
+            .query_map(
+                params![direction_name(direction), filter.include_removed],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?
+        } else {
+            let (base, params) = filter.base(direction);
+            db.prepare_cached(&format!(
+                "SELECT state, COUNT(*), SUM(size) FROM transfer_details {base} GROUP BY state"
+            ))?
+            .query_map(named(&params).as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        // Several stored bit patterns can mean one state.
+        let mut states = std::collections::BTreeMap::<TransferState, (u64, u64)>::new();
+        for (bits, files, bytes) in rows.into_iter().filter(|(_, files, _)| *files > 0) {
+            let total = states.entry(state_from_bits(bits)).or_default();
+            total.0 += files;
+            total.1 += bytes;
         }
+        Ok(states
+            .into_iter()
+            .map(|(state, (files, bytes))| TransferStateCount {
+                state,
+                files,
+                bytes,
+            })
+            .collect())
     })
     .await
 }
@@ -925,7 +1004,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            list(&db, TransferDirection::Download, None, false, None)
+            list(&db, TransferDirection::Download, ListFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -992,6 +1071,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_transfers_page_and_filter_and_the_summary_counts_them_all() {
+        let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
+        let start = Utc::now();
+        let mut rows = Vec::new();
+        for i in 0..6_i64 {
+            let mut t = new_transfer(
+                TransferDirection::Upload,
+                if i % 2 == 0 { "alice" } else { "Bob" },
+                format!("music\\Album {i}\\track.flac"),
+                10,
+                None,
+            );
+            insert(&db, vec![t.clone()]).await.unwrap();
+            if i < 5 {
+                t.state = if i == 4 {
+                    TransferState::Errored
+                } else {
+                    TransferState::Succeeded
+                };
+                t.ended_at = Some(start + chrono::Duration::seconds(i));
+                save(&db, vec![Snapshot::new(&t)]).await.unwrap();
+            }
+            rows.push(t);
+        }
+        let names = |list: Vec<Transfer>| {
+            list.into_iter()
+                .map(|t| t.filename[12..13].to_owned())
+                .collect::<String>()
+        };
+        let page = |offset, completed, query: Option<&str>| {
+            list(
+                &db,
+                TransferDirection::Upload,
+                ListFilter {
+                    recent_completed: Some(2),
+                    completed_offset: offset,
+                    completed,
+                    query: query.map(Into::into),
+                    ..ListFilter::default()
+                },
+            )
+        };
+        // The active one, then two completed ones per page, newest first.
+        assert_eq!(
+            names(page(0, CompletedFilter::All, None).await.unwrap()),
+            "543"
+        );
+        assert_eq!(
+            names(page(2, CompletedFilter::All, None).await.unwrap()),
+            "521"
+        );
+        assert_eq!(
+            names(page(4, CompletedFilter::All, None).await.unwrap()),
+            "50"
+        );
+        assert_eq!(
+            names(page(0, CompletedFilter::Succeeded, None).await.unwrap()),
+            "532"
+        );
+        assert_eq!(
+            names(page(0, CompletedFilter::Failed, None).await.unwrap()),
+            "54"
+        );
+        assert_eq!(
+            names(page(0, CompletedFilter::None, None).await.unwrap()),
+            "5"
+        );
+        // Text matches the user or the file name, either case (the API lowers it).
+        assert_eq!(
+            names(page(0, CompletedFilter::All, Some("bob")).await.unwrap()),
+            "531"
+        );
+        assert_eq!(
+            names(
+                page(0, CompletedFilter::All, Some("album 2"))
+                    .await
+                    .unwrap()
+            ),
+            "2"
+        );
+
+        let summary = |query: Option<&str>, include_removed| {
+            summary(
+                &db,
+                TransferDirection::Upload,
+                ListFilter {
+                    include_removed,
+                    query: query.map(Into::into),
+                    ..ListFilter::default()
+                },
+            )
+        };
+        let count = |state, files| TransferStateCount {
+            state,
+            files,
+            bytes: files * 10,
+        };
+        assert_eq!(
+            summary(None, false).await.unwrap(),
+            [
+                count(TransferState::QueuedLocally, 1),
+                count(TransferState::Succeeded, 4),
+                count(TransferState::Errored, 1)
+            ]
+        );
+        assert_eq!(
+            summary(Some("bob"), false).await.unwrap(),
+            [
+                count(TransferState::QueuedLocally, 1),
+                count(TransferState::Succeeded, 2)
+            ]
+        );
+        // Removing and deleting rows keeps the counts in step.
+        remove(&db, TransferDirection::Upload, None).await.unwrap();
+        assert_eq!(
+            summary(None, false).await.unwrap(),
+            [count(TransferState::QueuedLocally, 1)]
+        );
+        assert_eq!(summary(None, true).await.unwrap().len(), 3);
+        db.call(|db| db.execute("DELETE FROM transfers", []))
+            .await
+            .unwrap();
+        assert!(summary(None, true).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn lists_filter_by_user_and_removals_report_their_ids() {
         let db = Database::open(Path::new(":memory:"), MIGRATIONS).unwrap();
         let upload = |user: &str, file: &str| {
@@ -1015,9 +1220,11 @@ mod tests {
             list(
                 &db,
                 TransferDirection::Upload,
-                user.map(Into::into),
-                false,
-                recent,
+                ListFilter {
+                    username: user.map(Into::into),
+                    recent_completed: recent,
+                    ..ListFilter::default()
+                },
             )
         };
         assert_eq!(ids(list(None, None).await.unwrap()).len(), 3);
@@ -1152,6 +1359,109 @@ mod tests {
         assert_eq!(kept.filename, "music\\old-listed");
         assert_eq!(kept.error.as_deref(), Some("refused by <address>"));
         assert_eq!(purge(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn offline_errors_no_longer_name_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transfers.db");
+        let before = MIGRATIONS
+            .iter()
+            .position(|sql| *sql == include_str!("migrations/offline_errors.sql"))
+            .unwrap();
+        let failures = [
+            ("alice", "User alice appears to be offline"),
+            ("alice", "User alice appears to be offline"),
+            ("bob", "User bob appears to be offline"),
+            ("bob", "refused"),
+        ];
+        let rows: Vec<_> = failures
+            .iter()
+            .enumerate()
+            .map(|(i, (user, _))| {
+                new_transfer(
+                    TransferDirection::Upload,
+                    user,
+                    format!("music\\{i}.flac"),
+                    10,
+                    None,
+                )
+            })
+            .collect();
+        let failed: Vec<_> = rows
+            .iter()
+            .zip(failures)
+            .map(|(t, (_, error))| {
+                let mut t = t.clone();
+                t.state = TransferState::Errored;
+                t.error = Some(error.into());
+                t.ended_at = Some(Utc::now());
+                t
+            })
+            .collect();
+        let rollups = |db: &Database| {
+            db.call(|db| {
+                let mut stmt = db.prepare(
+                    "SELECT error, username, SUM(files) FROM transfer_error_hours
+                     GROUP BY error, username ORDER BY error, username",
+                )?;
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<rusqlite::Result<Vec<(String, String, i64)>>>()
+            })
+        };
+        let old = Database::open(&path, &MIGRATIONS[..before]).unwrap();
+        insert(&old, rows.clone()).await.unwrap();
+        save(&old, failed.iter().map(Snapshot::new).collect())
+            .await
+            .unwrap();
+        // A purged transfer's count, which has no row left to move.
+        old.call(|db| {
+            db.execute(
+                "INSERT INTO transfer_error_hours VALUES (0, 'Upload', 'User carol appears to be offline', 'carol', 3)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        drop(old);
+
+        let db = Database::open(&path, MIGRATIONS).unwrap();
+        let stored = db
+            .call(|db| {
+                let mut stmt = db.prepare("SELECT exception FROM transfer_errors ORDER BY 1")?;
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, ["User was offline", "refused"]);
+        for (row, error) in rows.iter().zip([
+            "User was offline",
+            "User was offline",
+            "User was offline",
+            "refused",
+        ]) {
+            let found = find(&db, TransferDirection::Upload, row.id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.error.as_deref(), Some(error));
+        }
+        let offline = |user: &str, files| ("User was offline".to_owned(), user.to_owned(), files);
+        assert_eq!(
+            rollups(&db).await.unwrap(),
+            [
+                offline("alice", 2),
+                offline("bob", 1),
+                offline("carol", 3),
+                ("refused".to_owned(), "bob".to_owned(), 1)
+            ]
+        );
+        // The delete trigger finds the moved rows under the new message.
+        db.call(|db| db.execute("DELETE FROM transfers", []))
+            .await
+            .unwrap();
+        assert_eq!(rollups(&db).await.unwrap(), [offline("carol", 3)]);
     }
 
     #[tokio::test]

@@ -148,7 +148,8 @@ purpose, so keep administrator access to trusted people.
 | DELETE | `/api/searches/{id}` | readwrite | | 204; stops the search if it is running |
 | POST | `/api/searches/{id}/cancel` | readwrite | | 204; the final state arrives as an event |
 | GET | `/api/searches/{id}/responses` | readonly | | `[SearchResponse]`, in arrival order |
-| GET | `/api/transfers/downloads` | readonly | `?username&include_removed=false&recent_completed` | `[Transfer]` or 304 when a matching `If-None-Match` validator is sent |
+| GET | `/api/transfers/downloads` | readonly | `?username&include_removed=false&recent_completed&completed_offset=0&completed=all&query` | `[Transfer]` or 304 when a matching `If-None-Match` validator is sent |
+| GET | `/api/transfers/downloads/summary` | readonly | `?username&include_removed=false&query` | `TransferListSummary` `{states: [{state, files, bytes}]}` |
 | POST | `/api/transfers/downloads` | readwrite | `EnqueueDownloadsRequest` `{username, files: [{filename, size}], root?}`; with `root`, each file is saved as `<downloads>/<last component of root>/<path below root>`, and a file not below `root` is a 400 | 201/207/200 `EnqueuedDownloads` `{enqueued, failed, files}` |
 | POST | `/api/transfers/downloads/folder` | readwrite | `EnqueueFolder` `{username, path, recursive=false}` | 201/207/200 `EnqueuedDownloads` for files saved as `<downloads>/<last component of path>/<path below it>`. Includes downloadable files in the peer's folder `path` and, with `recursive`, its subfolders. Returns 404 if the folder is missing or has no files, 409 if not logged in, and 504 if the peer does not answer. |
 | DELETE | `/api/transfers/downloads/completed` | readwrite | | 204; removes every completed download from the list |
@@ -156,7 +157,8 @@ purpose, so keep administrator access to trusted people.
 | DELETE | `/api/transfers/downloads/{id}` | readwrite | | 204; cancels if active and removes from the list |
 | POST | `/api/transfers/downloads/{id}/cancel` | readwrite | | 204; cancels if active |
 | GET | `/api/transfers/downloads/{id}/position` | readwrite | | `QueuePosition`, asked of the peer |
-| GET | `/api/transfers/uploads` | readonly | `?username&include_removed=false&recent_completed` | `[Transfer]` or 304 when a matching `If-None-Match` validator is sent |
+| GET | `/api/transfers/uploads` | readonly | `?username&include_removed=false&recent_completed&completed_offset=0&completed=all&query` | `[Transfer]` or 304 when a matching `If-None-Match` validator is sent |
+| GET | `/api/transfers/uploads/summary` | readonly | `?username&include_removed=false&query` | `TransferListSummary` |
 | DELETE | `/api/transfers/uploads/completed` | readwrite | | 204 |
 | GET | `/api/transfers/uploads/{id}` | readonly | | `Transfer` |
 | DELETE | `/api/transfers/uploads/{id}` | readwrite | | 204; cancels if active and removes from the list |
@@ -201,7 +203,12 @@ Outside `/api`: `GET {url_base}/health` answers `200` without authentication, an
 `metrics.username`/`metrics.password` when set).
 
 With `recent_completed`, transfer lists return every active transfer and at most that
-many completed transfers, newest first by end time.
+many completed transfers, newest first by end time, skipping the first `completed_offset`
+(pages). `completed` picks which completed transfers: `all`, `succeeded`, `failed` (every
+other final state) or `none`. `query` keeps transfers whose user or file name contains
+the text, ignoring case. The summary counts every transfer in the list by state, as
+stored; without `username` and `query` it reads counts kept as rows change, so it stays
+cheap on lists with hundreds of thousands of rows.
 
 Transfer lists include a weak `ETag` when the snapshot is stable. Clients that still
 hold that snapshot can send the tag as `If-None-Match` on the same list URL and keep

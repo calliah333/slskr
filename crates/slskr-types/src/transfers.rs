@@ -304,6 +304,45 @@ pub struct CreatedBatch {
     pub failed: Vec<EnqueueFailure>,
 }
 
+/// Which completed transfers a list returns (`completed=` on the list routes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletedFilter {
+    #[default]
+    All,
+    Succeeded,
+    /// Every other final state: cancelled, timed out, errored, rejected, aborted.
+    Failed,
+    /// Only active transfers.
+    None,
+}
+
+impl CompletedFilter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::None => "none",
+        }
+    }
+}
+
+/// `GET /api/transfers/{downloads,uploads}/summary` response: how many transfers the list
+/// holds in each state, and their total size, as stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferListSummary {
+    /// States without transfers are left out.
+    pub states: Vec<TransferStateCount>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferStateCount {
+    pub state: TransferState,
+    pub files: u64,
+    pub bytes: u64,
+}
+
 /// `GET /api/transfers/downloads/{id}/position` response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuePosition {
