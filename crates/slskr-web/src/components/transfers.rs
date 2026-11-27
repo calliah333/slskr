@@ -422,7 +422,6 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     let loading = RwSignal::new(true);
     let load_error = RwSignal::new(None::<String>);
     let action_error = RwSignal::new(None::<String>);
-    let history = RwSignal::new(false);
     let working = RwSignal::new(None::<Operation>);
     let selected = RwSignal::new(HashSet::<String>::new());
     let details = RwSignal::new(None::<String>);
@@ -492,12 +491,10 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             .div_ceil(PAGE)
             .max(1)
     });
-    let history_revision = RwSignal::new(0_u64);
     // Another view starts at its first page.
     Effect::new(move |previous: Option<()>| {
         filter.track();
         server_query.track();
-        history_revision.track();
         if previous.is_some() {
             page_index.set(0);
         }
@@ -536,9 +533,8 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         let ticket = summaries.get_value().wrapping_add(1);
         summaries.set_value(ticket);
         let url = format!(
-            "{}/summary?include_removed={}{}",
+            "{}/summary?include_removed=false{}",
             collection(direction),
-            history.get_untracked(),
             text_param()
         );
         in_page(Box::new(move || {
@@ -553,16 +549,14 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
             });
         }));
     };
-    let validator = StoredValue::new(None::<(String, u64, String)>);
+    let validator = StoredValue::new(None::<(String, String)>);
     let fetches = StoredValue::new(0_u64);
     let fetch = move || {
         let ticket = fetches.get_value().wrapping_add(1);
         fetches.set_value(ticket);
-        let include_removed = history.get_untracked();
-        let revision = history_revision.get_untracked();
         let page = page_index.get_untracked();
         let url = format!(
-            "{}?include_removed={include_removed}&recent_completed={PAGE}&completed_offset={}&completed={}{}",
+            "{}?include_removed=false&recent_completed={PAGE}&completed_offset={}&completed={}{}",
             collection(direction),
             page.saturating_mul(PAGE),
             filter.get_untracked().completed().as_str(),
@@ -571,8 +565,8 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         let etag = validator.with_value(|validator| {
             validator
                 .as_ref()
-                .filter(|(path, version, _)| *path == url && *version == revision)
-                .map(|(_, _, etag)| etag.clone())
+                .filter(|(path, _)| *path == url)
+                .map(|(_, etag)| etag.clone())
         });
         live.update_value(|live| {
             live.set_first_page(page == 0);
@@ -590,7 +584,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                     Ok(Some((list, etag))) => {
                         live.update_value(|live| live.finish_fetch(list));
                         render();
-                        validator.set_value(etag.map(|etag| (url, revision, etag)));
+                        validator.set_value(etag.map(|etag| (url, etag)));
                         if load_error.with_untracked(Option::is_some) {
                             load_error.set(None);
                         }
@@ -626,7 +620,6 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
     });
     // The first load, and again when the view changes.
     Effect::new(move |_| {
-        history_revision.track();
         page_index.track();
         filter.track();
         server_query.track();
@@ -863,20 +856,6 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
                             }
                         }).collect_view()}
                     </div>
-                    <label class="switch transfers-history">
-                        <input type="checkbox" role="switch" prop:checked=history on:change=move |event| {
-                            let checked = event_target_checked(&event);
-                            history.set(checked);
-                            live.update_value(|live| live.reset(checked));
-                            history_revision.update(|revision| *revision = revision.wrapping_add(1));
-                            loading.set(true);
-                            apply_snapshot(&[], rows, index, speed);
-                            summary.set(None);
-                            load_error.set(None);
-                        }/>
-                        <span class="switch__track" aria-hidden="true"></span>
-                        <span class="switch__label">"Show removed"</span>
-                    </label>
                     <div class="btn-group transfers-view">
                         <Button variant="ghost"
                             icon=Signal::derive(move || if page.collapse.get() { "chevrons-up-down".to_owned() } else { "chevrons-down-up".to_owned() })

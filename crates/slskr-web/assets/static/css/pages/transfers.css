@@ -22,11 +22,9 @@
   background: hsl(var(--primary) / 0.12);
   color: hsl(var(--primary));
 }
-.transfers-history { margin-left: auto; padding-inline: var(--space-2) var(--space-3); white-space: nowrap; }
-.transfers-view { gap: 0; }
+.transfers-view { margin-left: auto; }
 @media (max-width: 639px) {
   .transfers-toolbar .input-icon { flex-basis: 100%; }
-  .transfers-history { margin-left: 0; }
 }
 
 .transfers-empty .empty-state { padding-block: var(--space-10); }

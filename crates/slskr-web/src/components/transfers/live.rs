@@ -12,7 +12,6 @@ use slskr_types::transfers::{Transfer, TransferDirection};
 
 pub(super) struct LiveList {
     direction: TransferDirection,
-    include_removed: bool,
     /// Whether the newest completed transfers are shown: only then do transfers that
     /// complete join the list (on later pages they belong to page one).
     first_page: bool,
@@ -27,7 +26,6 @@ impl LiveList {
     pub(super) fn new(direction: TransferDirection) -> Self {
         Self {
             direction,
-            include_removed: false,
             first_page: true,
             list: Vec::new(),
             since_fetch: None,
@@ -40,13 +38,6 @@ impl LiveList {
 
     pub(super) fn is_fetching(&self) -> bool {
         self.since_fetch.is_some()
-    }
-
-    /// Empties the list for a different view (removed transfers shown or not).
-    pub(super) fn reset(&mut self, include_removed: bool) {
-        self.include_removed = include_removed;
-        self.list.clear();
-        self.since_fetch = None;
     }
 
     /// Whether the page shown is the first one (see `first_page`).
@@ -66,9 +57,7 @@ impl LiveList {
 
     /// Replaces the list with a fetched one plus the changes received meanwhile.
     pub(super) fn finish_fetch(&mut self, mut list: Vec<Transfer>) {
-        if !self.include_removed {
-            list.retain(|file| !file.removed);
-        }
+        list.retain(|file| !file.removed);
         self.list = list;
         for (id, change) in self.since_fetch.take().unwrap_or_default() {
             match change {
@@ -109,15 +98,11 @@ impl LiveList {
         let Some(position) = self.list.iter().position(|file| file.id == id) else {
             return;
         };
-        if self.include_removed {
-            self.list[position].removed = true;
-        } else {
-            self.list.remove(position);
-        }
+        self.list.remove(position);
     }
 
     fn upsert(&mut self, file: Transfer) {
-        if file.removed && !self.include_removed {
+        if file.removed {
             self.remove_one(&file.id);
             return;
         }
@@ -195,17 +180,6 @@ mod tests {
         gone.removed = true;
         live.update(&[gone]);
         assert_eq!(ids(&live), ["c"]);
-
-        // With removed transfers shown, removal only marks them.
-        live.reset(true);
-        live.begin_fetch();
-        live.finish_fetch(vec![down("a", Succeeded)]);
-        live.remove(&["a".into()]);
-        assert_eq!(ids(&live), ["a"]);
-        assert!(live.list()[0].removed);
-        live.begin_fetch();
-        live.end_fetch();
-        assert_eq!(ids(&live), ["a"]);
     }
 
     #[test]
