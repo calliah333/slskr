@@ -2,7 +2,7 @@
 .browse-form .card__content > * + * { margin-top: var(--space-4); }
 .browse-error .alert__body p + p { margin-top: var(--space-1); }
 
-/* Browsed user: avatar, name and counts, actions on the right. */
+/* Browsed user: name and counts, actions on the right. */
 .browse-summary { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
 .browse-summary__text { flex: 1 1 12rem; min-width: 0; }
 .browse-summary__name { font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; }
@@ -186,7 +186,6 @@
 .users-error .alert__body p + p { margin-top: var(--space-1); }
 .users-error__actions { margin-top: var(--space-2); }
 .users-profile__identity { display: flex; align-items: center; gap: var(--space-4); flex: 1 1 16rem; min-width: 0; }
-.users-profile__identity > .avatar { width: 3.5rem; height: 3.5rem; font-size: 1.125rem; }
 .users-profile__name { min-width: 0; }
 .users-presence .status-dot { margin-right: 0.125rem; box-shadow: none; }
 .users-profile__about { display: flex; flex-wrap: wrap; gap: var(--space-6); align-items: flex-start; }

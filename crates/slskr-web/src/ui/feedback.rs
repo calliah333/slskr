@@ -1,5 +1,4 @@
-//! Status and feedback: `Alert`, `Badge`, `Loading`, `Progress`, `Toast`, `StatusDot`,
-//! `Avatar`.
+//! Status and feedback: `Alert`, `Badge`, `Loading`, `Progress`, `Toast`, `StatusDot`.
 
 use leptos::prelude::*;
 
@@ -218,33 +217,5 @@ pub fn StatusDot(
             aria-label=move || label.map(|l| l.get())
             title=move || label.map(|l| l.get())
         ></span>
-    }
-}
-
-/// A round avatar with the first letters of `name` (or an image).
-#[component]
-pub fn Avatar(
-    #[prop(into)] name: Signal<String>,
-    #[prop(into, optional)] src: Option<Signal<String>>,
-    /// `"sm"` or `"lg"`.
-    #[prop(optional)]
-    size: Option<&'static str>,
-) -> impl IntoView {
-    let class = size.map_or_else(|| "avatar".to_owned(), |s| format!("avatar avatar--{s}"));
-    let initials = move || {
-        name.with(|n| {
-            n.split(|c: char| c.is_whitespace() || c == '_' || c == '-')
-                .filter_map(|part| part.chars().next())
-                .take(2)
-                .collect::<String>()
-        })
-    };
-    view! {
-        <span class=class aria-hidden="true">
-            {move || match src.map(|s| s.get()).filter(|s| !s.is_empty()) {
-                Some(src) => view! { <img src=src alt=""/> }.into_any(),
-                None => initials().into_any(),
-            }}
-        </span>
     }
 }

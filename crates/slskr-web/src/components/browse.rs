@@ -11,8 +11,8 @@ use crate::{
     config,
     services::{api, util},
     ui::{
-        Alert, Avatar, Button, Card, ContextMenu, ContextMenuState, EmptyState, Icon, PageHeader,
-        Progress, Toast,
+        Alert, Button, Card, ContextMenu, ContextMenuState, EmptyState, Icon, PageHeader, Progress,
+        Toast,
     },
 };
 use leptos::prelude::*;
@@ -302,7 +302,6 @@ pub fn Browse() -> impl IntoView {
         Some(view! {
             <div class="browse-result stack">
                 <div class="browse-summary">
-                    <Avatar name=user.clone()/>
                     <div class="browse-summary__text">
                         <h2 class="browse-summary__name">{user.clone()}</h2>
                         <p class="muted text-sm">

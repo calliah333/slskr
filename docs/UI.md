@@ -339,9 +339,8 @@ scrolls (logs), `code--plain` uses body colour. Inline `<code>` gets a muted chi
 `<kbd class="kbd">Ctrl</kbd>`. `<dl class="dl"><dt>Version</dt><dd>0.1.0</dd></dl>` is a
 two-column key/value list (stacks on phones).
 
-### Avatar, status dot
+### Status dot
 
-`<span class="avatar">AB</span>` (`avatar--sm|lg`, or an `<img>` inside).
 `<span class="status-dot status-dot--online"></span>`: `online` (green), `away` (amber),
 `busy` (amber, no halo), `offline` (red), none (grey); `status-dot--pulse` blinks.
 
@@ -385,7 +384,6 @@ All take an extra `class` where it makes sense. Optional props can be left out.
 | `Progress` | `value: Option<Signal<f64>>` (None = indeterminate), `total` (100), `variant: Signal<&str>`, `large`, `label` | `.progress` |
 | `Toast` | `variant`, `icon`, `on_dismiss`, children | `.toast` (inside your `.toast-region`) |
 | `StatusDot` | `status: Signal<&'static str>` ("online", "away", "busy", "offline"), `label`, `pulse` | `.status-dot` |
-| `Avatar` | `name`, `src`, `size` | `.avatar` with initials |
 | `Switch` | `checked`, `on_change: Callback<bool>`, `label` or `aria_label`, `disabled`, `id`, `class` | `label.switch` |
 | `Tabs` | `items: Vec<TabItem>` (`TabItem::new(value, label).icon("…")`), `value`, `on_change`, `underline`, `label` | button tablist with arrow-key focus |
 | `DropdownMenu` | `label` (accessible name), `text`, `icon`, `variant`, `size`, `align` ("end"), children (menu items) | `.dropdown` + `.menu`; closes on item click, outside click, Escape |

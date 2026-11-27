@@ -2,7 +2,7 @@ use super::browse::group_digits;
 use crate::{
     config,
     services::{api, util},
-    ui::{Alert, Avatar, Badge, Button, Card, Icon, Loading, PageHeader, Stat, StatusDot},
+    ui::{Alert, Badge, Button, Card, Icon, Loading, PageHeader, Stat, StatusDot},
 };
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_url};
@@ -165,7 +165,6 @@ fn UserProfile(profile: Profile) -> impl IntoView {
         <section class="card users-profile" aria-labelledby="users-profile-name">
             <div class="card__header">
                 <div class="users-profile__identity">
-                    <Avatar name=username.clone() size="lg"/>
                     <div class="stack stack--xs users-profile__name">
                         <h2 class="card__title break-all" id="users-profile-name">{username.clone()}</h2>
                         <div class="cluster">

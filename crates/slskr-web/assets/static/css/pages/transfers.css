@@ -173,7 +173,6 @@
 .transfers--compact .transfers-groups { gap: var(--space-2); }
 .transfers--compact .transfer-group__header { padding-block: var(--space-1); }
 .transfers--compact .transfer-group__title { flex-direction: row; align-items: baseline; gap: var(--space-2); }
-.transfers--compact .transfer-group__header .avatar { display: none; }
 .transfers--compact .transfer-table thead th { padding-block: 0.25rem; }
 .transfers--compact .transfer-dir__row > td,
 .transfers--compact .transfer-row > td { padding-block: 0.125rem; }

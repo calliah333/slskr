@@ -13,7 +13,7 @@ use slskr_types::transfers::{QueuePosition, Transfer, TransferDirection, Transfe
 
 use crate::{
     services::{api, util},
-    ui::{Avatar, Badge, Button, DropdownMenu, Icon, Modal},
+    ui::{Badge, Button, DropdownMenu, Icon, Modal},
 };
 
 use super::{
@@ -298,7 +298,6 @@ pub(super) fn TransferGroup(username: String, page: Page) -> impl IntoView {
                     on:click=move |_| folded.update(|folded| *folded = !*folded)>
                     <Icon name=Signal::derive(move || if folded.get() { "chevron-right".to_owned() } else { "chevron-down".to_owned() })/>
                 </button>
-                <Avatar name=username.clone() size="sm"/>
                 <div class="transfer-group__title">
                     <a class="transfer-group__user" href=user_href.clone()>{username.clone()}</a>
                     <span class="transfer-group__totals muted text-xs tabular">
