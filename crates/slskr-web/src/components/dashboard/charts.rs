@@ -143,8 +143,54 @@ fn date_formats(first: DateTime<Utc>, last: DateTime<Utc>) -> (&'static str, &'s
     }
 }
 
+/// The series toggles. With `totals`, each also shows its total over the period.
+fn legend_items(
+    errors: bool,
+    visible: RwSignal<[bool; 2]>,
+    totals: Option<[String; 2]>,
+) -> impl IntoView {
+    series(errors)
+        .into_iter()
+        .enumerate()
+        .map(|(index, series)| {
+            let total = totals.as_ref().map(|totals| totals[index].clone());
+            view! {
+                <button type="button" class="chart__legend-item"
+                    aria-pressed=move || visible.with(|shown| shown[index]).to_string()
+                    title=move || if visible.with(|shown| shown[index]) { format!("Hide {}", series.label) } else { format!("Show {}", series.label) }
+                    on:click=move |_| visible.update(|shown| {
+                        // Keep at least one series on.
+                        if !shown[index] || shown[1 - index] { shown[index] = !shown[index]; }
+                    })>
+                    <span class=format!("chart__swatch {}", series.class) aria-hidden="true"></span>
+                    {series.label}
+                    {total.map(|total| view! { <span class="chart__legend-total tabular">{total}</span> })}
+                </button>
+            }
+        })
+        .collect_view()
+}
+
+/// The legend of a [`HistoryChart`] given `visible`, for a spot outside the chart (the
+/// History header, where the totals already stand in the cards above the chart).
 #[component]
-pub fn HistoryChart(histogram: TransferHistogram, errors: bool) -> impl IntoView {
+pub fn ChartLegend(visible: RwSignal<[bool; 2]>) -> impl IntoView {
+    view! {
+        <div class="chart__legend" role="group" aria-label="Chart series">
+            {legend_items(false, visible, None)}
+        </div>
+    }
+}
+
+/// `visible`: which series are shown, when the legend is drawn elsewhere ([`ChartLegend`]);
+/// without it the chart draws its own legend, with totals.
+#[component]
+pub fn HistoryChart(
+    histogram: TransferHistogram,
+    errors: bool,
+    #[prop(optional)] visible: Option<RwSignal<[bool; 2]>>,
+) -> impl IntoView {
+    let own_legend = visible.is_none();
     let definitions = series(errors);
     let stamps = histogram.keys().copied().collect::<Vec<_>>();
     let amounts = histogram
@@ -174,7 +220,7 @@ pub fn HistoryChart(histogram: TransferHistogram, errors: bool) -> impl IntoView
     let count = amounts.len();
     let amounts = StoredValue::new(amounts);
     let stamps = StoredValue::new(stamps);
-    let visible = RwSignal::new([true, true]);
+    let visible = visible.unwrap_or_else(|| RwSignal::new([true, true]));
     let hovered = RwSignal::new(None::<usize>);
     let (axis_format, tip_format) = stamps.with_value(|stamps| {
         date_formats(
@@ -255,24 +301,11 @@ pub fn HistoryChart(histogram: TransferHistogram, errors: bool) -> impl IntoView
 
     view! {
         <figure class="chart" aria-label=title>
-            <div class="chart__legend" role="group" aria-label="Series">
-                {definitions.iter().enumerate().map(|(index, series)| {
-                    let series = *series;
-                    view! {
-                        <button type="button" class="chart__legend-item"
-                            aria-pressed=move || visible.with(|shown| shown[index]).to_string()
-                            title=move || if visible.with(|shown| shown[index]) { format!("Hide {}", series.label) } else { format!("Show {}", series.label) }
-                            on:click=move |_| visible.update(|shown| {
-                                // Keep at least one series on.
-                                if !shown[index] || shown[1 - index] { shown[index] = !shown[index]; }
-                            })>
-                            <span class=format!("chart__swatch {}", series.class) aria-hidden="true"></span>
-                            {series.label}
-                            <span class="chart__legend-total tabular">{format_amount(totals[index], bytes)}</span>
-                        </button>
-                    }
-                }).collect_view()}
-            </div>
+            {own_legend.then(|| view! {
+                <div class="chart__legend" role="group" aria-label="Series">
+                    {legend_items(errors, visible, Some(totals.map(|total| format_amount(total, bytes))))}
+                </div>
+            })}
             <div class="chart__body">
                 <div class="chart__y" aria-hidden="true">
                     {move || scale.with(|(top, ticks)| {

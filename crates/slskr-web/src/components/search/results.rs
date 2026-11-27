@@ -548,8 +548,7 @@ pub(super) fn SearchResults(
                 } else if *count == 0 && done.get() && ready.get() {
                     view! {
                         <div class="card">
-                            <EmptyState icon="search" title="No results"
-                                description="Nobody answered this search. Try fewer or different words."/>
+                            <EmptyState icon="search" title="No results"/>
                         </div>
                     }.into_any()
                 } else { ().into_any() }

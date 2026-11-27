@@ -13,9 +13,9 @@
 .series-download { color: hsl(var(--chart-download)); }
 .series-upload { color: hsl(var(--chart-upload)); }
 
-/* Live tiles: six across on wide screens, two per row on phones. */
+/* Live tiles: four across on wide screens, two per row on phones. */
 .dashboard .live-stats { grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr)); }
-@media (min-width: 1024px) { .dashboard .live-stats { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+@media (min-width: 1024px) { .dashboard .live-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 @media (max-width: 639px) { .dashboard .live-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .live-stat__head,
 .summary-stat__head {
@@ -162,7 +162,6 @@
   gap: var(--space-3);
 }
 .report__title { font-size: 0.9375rem; font-weight: 600; }
-.report__description { margin-top: 0.125rem; color: hsl(var(--muted-foreground)); font-size: 0.8125rem; }
 .report__user > a { display: block; max-width: 14rem; }
 .report__path > .truncate,
 .report__file > .truncate { display: block; max-width: 20rem; }

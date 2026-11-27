@@ -136,7 +136,6 @@
 .browse-folder__notice + .card__content { padding-top: var(--space-4); }
 .browse-folder > .card__header + .browse-folder__notice { padding-top: 0; }
 @media (max-width: 639px) { .browse-folder__notice { padding-inline: var(--space-4); } }
-.browse-folder__hint { padding: 0 var(--space-6) var(--space-3); font-size: 0.75rem; color: hsl(var(--muted-foreground)); }
 .browse-folder__split > .btn + .btn { border-left: 1px solid hsl(var(--primary-foreground) / 0.35); margin-left: 0; padding-inline: var(--space-2); }
 
 /* Files: rows select like a file manager (no checkboxes). */

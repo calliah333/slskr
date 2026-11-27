@@ -52,11 +52,10 @@ impl Step {
 
     fn description(self) -> &'static str {
         match self {
-            Step::Welcome => "slskr is almost ready to use.",
-            Step::Web => "You sign in to this web UI with these.",
+            Step::Welcome | Step::Web => "",
             Step::Soulseek => "Optional: the account slskr uses on the Soulseek network.",
             Step::Shares => "Optional: folders other users can browse and download from.",
-            Step::Review => "Check your choices, then finish. Everything can be changed later.",
+            Step::Review => "Everything can be changed later.",
         }
     }
 
@@ -177,7 +176,6 @@ pub fn SetupWizard(on_done: Callback<()>) -> impl IntoView {
             <div class="setup stack stack--lg">
                 <div class="setup-intro">
                     <h1 class="setup-title">"Set up slskr"</h1>
-                    <p class="muted">"A few steps and slskr is ready to use."</p>
                 </div>
                 {move || load_error.get().map(|message| view! {
                     <FormMessage kind="danger"><p>{"Could not load the setup status: "}{message}</p></FormMessage>
@@ -448,15 +446,15 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
             Step::Welcome => view! {
                 <ul class="setup-overview">
                     <li><span class="setup-overview__icon"><Icon name="lock"/></span>
-                        <div><p class="font-medium">"A web sign-in"</p><p class="help">"So only you can use this UI."</p></div></li>
+                        <div><p class="font-medium">"A web sign-in"</p></div></li>
                     <li><span class="setup-overview__icon"><Icon name="plug"/></span>
-                        <div><p class="font-medium">"Your Soulseek account"</p><p class="help">"Optional; connect later in Settings."</p></div></li>
+                        <div><p class="font-medium">"Your Soulseek account"</p><p class="help">"Optional"</p></div></li>
                     <li><span class="setup-overview__icon"><Icon name="folder-open"/></span>
-                        <div><p class="font-medium">"Folders to share"</p><p class="help">"Optional; add more at any time."</p></div></li>
+                        <div><p class="font-medium">"Folders to share"</p><p class="help">"Optional"</p></div></li>
                 </ul>
                 {status.code_required.then(|| view! {
                     <Field id="setup-code" label="Setup code" error=error_of("code")
-                        help="This browser is not on the slskr machine, so prove you can read its log: the code is printed in the daemon log (with Docker: docker compose logs slskr).">
+                        help="Printed in the daemon log (with Docker: docker compose logs slskr).">
                         <TextInput value=code on_input=move |t: String| { code.set(t); clear_error("code"); }
                             placeholder="XXXX-XXXX-XXXX" autocomplete="one-time-code" name="code" mono=true/>
                     </Field>
@@ -524,7 +522,7 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
             }.into_any(),
             Step::Shares => view! {
                 <Field id="setup-shares" label="Shared folders" error=error_of("shares")
-                    help="Folders on the slskr machine. In the folder dialog you can also type a path.">
+                    help="Folders on the slskr machine.">
                     <FolderList items=shares
                         on_change=Callback::new(move |items: Vec<String>| { shares.set(items); clear_error("shares"); })/>
                 </Field>
@@ -586,9 +584,8 @@ fn Wizard(status: SetupStatus, on_done: Callback<()>) -> impl IntoView {
                 on:submit=move |event| { event.prevent_default(); advance(); }>
                 <div class="card__header">
                     <div>
-                        <p class="setup-step-count">{format!("Step {} of {}", current.index() + 1, Step::ALL.len())}</p>
                         <h2 class="card__title" id="setup-step-title" tabindex="-1" node_ref=heading>{current.title()}</h2>
-                        <p class="card__description">{current.description()}</p>
+                        {(!current.description().is_empty()).then(|| view! { <p class="card__description">{current.description()}</p> })}
                     </div>
                 </div>
                 <div class="card__content setup-step-body">{body}</div>

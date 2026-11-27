@@ -309,11 +309,6 @@ pub fn Selection(
                 </div>
             })}
             <div class="card__content">
-                {(file_count > 0).then(|| view! {
-                    <p class="browse-folder__hint hide-sm">
-                        "Click to select, Ctrl/Cmd+click to add, Shift+click for a range; double-click or Enter downloads."
-                    </p>
-                })}
                 <div class="table-wrap">
                     <table class="table table--compact browse-files" role="grid" aria-multiselectable="true"
                         aria-labelledby="browse-folder-title" on:keydown=on_keydown>

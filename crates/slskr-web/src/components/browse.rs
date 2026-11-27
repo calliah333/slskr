@@ -385,7 +385,6 @@ pub fn Browse() -> impl IntoView {
                 {move || error.get().map(|(name, message)| view! {
                     <Alert variant="danger" title=format!("Could not browse {name}") class="browse-error">
                         <p>{message}</p>
-                        <p class="muted">"The user may be offline, or their client is not accepting connections. Try again later."</p>
                     </Alert>
                 })}
             </Card>

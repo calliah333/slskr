@@ -598,8 +598,7 @@ fn SearchDetail(
                 }.into_any(),
                 None => view! {
                     <Card>
-                        <EmptyState icon="search" title="Search not found"
-                            description="It may have been deleted. Start a new search from the search page.">
+                        <EmptyState icon="search" title="Search not found">
                             <A href=history.get_value() attr:class="btn btn--primary"><Icon name="search"/>"Go to search"</A>
                         </EmptyState>
                     </Card>

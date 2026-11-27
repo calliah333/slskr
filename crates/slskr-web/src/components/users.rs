@@ -100,7 +100,6 @@ pub fn Users() -> impl IntoView {
                 Lookup::Failed(name, message) => view! {
                     <Alert variant="danger" title=format!("Could not look up {name}") class="users-error">
                         <p>{message}</p>
-                        <p class="muted">"Check the spelling and that slskr is connected to the Soulseek network."</p>
                         <div class="users-error__actions">
                             <Button size="sm" icon="rotate-cw" text="Try again" on_click=Callback::new(move |_| load(name.clone()))/>
                         </div>

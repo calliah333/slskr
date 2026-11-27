@@ -22,7 +22,7 @@ use crate::{
     services::util,
     ui::{Alert, Badge, Card, Icon, PageHeader, TabItem, Tabs},
 };
-use charts::{HistoryChart, Sparkline};
+use charts::{ChartLegend, HistoryChart, Sparkline};
 
 #[derive(Clone, Copy)]
 struct Period {
@@ -174,6 +174,15 @@ fn plural(count: u64, one: &str, many: &str) -> String {
     )
 }
 
+/// The hint of a live tile: files moving and the users they are with.
+fn active(files: u64, users: u64) -> String {
+    format!(
+        "{} active · {}",
+        util::group_digits(files),
+        plural(users, "user", "users")
+    )
+}
+
 /// "just now", "5m ago", "3h ago", "2d ago", or the date when older than a month.
 pub(crate) fn relative_time(time: DateTime<Utc>) -> String {
     let seconds = (Utc::now() - time).num_seconds();
@@ -286,18 +295,21 @@ pub fn Dashboard() -> impl IntoView {
         }
     });
 
+    // Which series the history chart shows; its legend sits in the History header.
+    let series_visible = RwSignal::new([true, true]);
     view! {
         <div class="dashboard stack">
             <PageHeader title="Overview"/>
             <LiveStats/>
             <Card title="History" title_id="history-heading"
                 class="history" actions=ViewFn::from(move || view! {
+                    <ChartLegend visible=series_visible/>
                     <Tabs items=period_items.clone() value=period_value on_change=pick_period label="History range"/>
                 })>
                 <div class="stack stack--lg">
                     <SummaryStats summary=data.summary/>
                     {move || slot_view(data.histogram.get(), chart_skeleton, |histogram| view! {
-                        <HistoryChart histogram errors=false/>
+                        <HistoryChart histogram errors=false visible=series_visible/>
                     }.into_any())}
                     <div class="stack">
                         <Tabs underline=true label="History reports" value=tab on_change=Callback::new(move |value| tab.set(value))
@@ -426,7 +438,7 @@ fn format_speed(speed: f64) -> String {
 /// Samples of the live speed kept for the sparklines (one per metrics push, about 1s).
 const SPARK_SAMPLES: usize = 60;
 
-/// Live transfer tiles: speed, active and queued files per direction, from the live
+/// Live transfer tiles: speed with active files, and queued files, per direction, from the live
 /// metrics the daemon pushes over the events socket.
 #[component]
 fn LiveStats() -> impl IntoView {
@@ -482,16 +494,18 @@ fn LiveStats() -> impl IntoView {
     };
     view! {
         <section class="stats live-stats" aria-label="Live transfers">
-            {tile("Download speed", "download", false, |m| format_speed(m.downloads.in_progress.total_speed),
-                view! { <Sparkline values=spark(false) class="series-download"/> }.into_any())}
-            {tile("Active downloads", "activity", false, |m| m.downloads.in_progress.files.to_string(),
-                hint(|m| plural(m.downloads.in_progress.users, "user", "users")))}
+            {tile("Downloading", "download", false, |m| format_speed(m.downloads.in_progress.total_speed),
+                view! {
+                    {hint(|m| active(m.downloads.in_progress.files, m.downloads.in_progress.users))}
+                    <Sparkline values=spark(false) class="series-download"/>
+                }.into_any())}
             {tile("Queued downloads", "clock", false, |m| m.downloads.queued.files.to_string(),
                 hint(|m| format!("{} · {}", pretty_bytes(m.downloads.queued.bytes), plural(m.downloads.queued.users, "user", "users"))))}
-            {tile("Upload speed", "upload", true, |m| format_speed(m.uploads.in_progress.total_speed),
-                view! { <Sparkline values=spark(true) class="series-upload"/> }.into_any())}
-            {tile("Active uploads", "activity", true, |m| m.uploads.in_progress.files.to_string(),
-                hint(|m| plural(m.uploads.in_progress.users, "user", "users")))}
+            {tile("Uploading", "upload", true, |m| format_speed(m.uploads.in_progress.total_speed),
+                view! {
+                    {hint(|m| active(m.uploads.in_progress.files, m.uploads.in_progress.users))}
+                    <Sparkline values=spark(true) class="series-upload"/>
+                }.into_any())}
             {tile("Queued uploads", "clock", true, |m| m.uploads.queued.files.to_string(),
                 hint(|m| format!("{} · {}", pretty_bytes(m.uploads.queued.bytes), plural(m.uploads.queued.users, "user", "users"))))}
         </section>
@@ -508,15 +522,12 @@ fn leaderboard_view(
 ) -> impl IntoView {
     let base = config::url_base();
     let base = base.trim_end_matches('/').to_owned();
-    let section = move |title: &'static str,
-                        description: &'static str,
-                        slot: Slot<TransferLeaderboard>| {
+    let section = move |title: &'static str, slot: Slot<TransferLeaderboard>| {
         let base = base.clone();
         view! {
             <section class="report">
                 <div class="report__head">
                     <h3 class="report__title">{title}</h3>
-                    <p class="report__description">{description}</p>
                 </div>
                 {move || {
                     let base = base.clone();
@@ -549,8 +560,8 @@ fn leaderboard_view(
     };
     view! {
         <div class="grid grid--2 reports-grid">
-            {section("Uploads", "Users you uploaded to most.", uploads)}
-            {section("Downloads", "Users you downloaded from most.", downloads)}
+            {section("Users you uploaded to most", uploads)}
+            {section("Users you downloaded from most", downloads)}
         </div>
     }
 }
@@ -559,13 +570,12 @@ fn directories_view(directories: Slot<Vec<TransferDirectorySummary>>) -> impl In
     view! {
         <section class="report">
             <div class="report__head">
-                <h3 class="report__title">"Popular directories"</h3>
-                <p class="report__description">"Your shared directories downloaded most often."</p>
+                <h3 class="report__title">"Your most downloaded folders"</h3>
             </div>
             {move || slot_view(directories.get(), || table_skeleton(4), |rows| view! {
                 <div class="table-wrap">
                     <table class="table table--compact">
-                        <thead><tr><th class="shrink num">"#"</th><th>"Directory"</th><th class="num">"Downloads"</th><th class="num">"Users"</th></tr></thead>
+                        <thead><tr><th class="shrink num">"#"</th><th>"Folder"</th><th class="num">"Downloads"</th><th class="num">"Users"</th></tr></thead>
                         <tbody>
                             {if rows.is_empty() { empty_row(4, "No data for this period") } else {
                                 rows.into_iter().enumerate().map(|(index, row)| {
@@ -640,10 +650,7 @@ fn errors_view(data: Reports) -> impl IntoView {
             }.into_any())}
             <section class="report">
                 <div class="report__head report__head--row">
-                    <div>
-                        <h3 class="report__title">"Errors by type"</h3>
-                        <p class="report__description">"Failures grouped by their error message."</p>
-                    </div>
+                    <h3 class="report__title">"Failures by error"</h3>
                     {direction_tabs(pareto_direction, "Error type direction")}
                 </div>
                 {move || {
@@ -674,10 +681,7 @@ fn errors_view(data: Reports) -> impl IntoView {
             </section>
             <section class="report">
                 <div class="report__head report__head--row">
-                    <div>
-                        <h3 class="report__title">"Recent errors"</h3>
-                        <p class="report__description">"The latest failed transfers."</p>
-                    </div>
+                    <h3 class="report__title">"Recent failed transfers"</h3>
                     {direction_tabs(recent_direction, "Recent error direction")}
                 </div>
                 {move || {
