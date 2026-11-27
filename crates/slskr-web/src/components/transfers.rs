@@ -825,7 +825,7 @@ pub fn Transfers(direction: TransferDirection) -> impl IntoView {
         <div class="transfers stack" class:transfers--busy=busy class:transfers--compact=compact>
             <div class="page-header transfers-header">
                 <div class="stack stack--sm">
-                    <h1 class="page-header__title">{title}</h1>
+                    <h1 class="sr-only">{title}</h1>
                     <div class="cluster transfers-summary" aria-live="polite">
                         {move || counts.with(|c| summary_badges(*c, speed.get(), is_download))}
                     </div>

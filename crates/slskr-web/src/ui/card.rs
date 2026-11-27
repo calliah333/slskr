@@ -67,22 +67,29 @@ pub fn Card(
     }
 }
 
-/// The heading row of a page: title and description on the left, actions on the right.
+/// The heading row of a page: description on the left, actions on the right. The title is
+/// for screen readers only, since the selected nav tab already names the page; pass
+/// `show_title` on pages without a tab (Settings).
 #[component]
 pub fn PageHeader(
     #[prop(into)] title: Signal<String>,
     #[prop(into, optional)] description: Option<Signal<String>>,
     #[prop(optional)] actions: Option<ViewFn>,
+    #[prop(optional)] show_title: bool,
 ) -> impl IntoView {
+    if !show_title && description.is_none() && actions.is_none() {
+        return view! { <h1 class="sr-only">{move || title.get()}</h1> }.into_any();
+    }
     view! {
         <div class="page-header">
             <div>
-                <h1 class="page-header__title">{move || title.get()}</h1>
+                <h1 class="page-header__title" class:sr-only=!show_title>{move || title.get()}</h1>
                 {description.map(|d| view! { <p class="page-header__description">{move || d.get()}</p> })}
             </div>
             {actions.map(|a| view! { <div class="page-header__actions">{a.run()}</div> })}
         </div>
     }
+    .into_any()
 }
 
 /// A centered placeholder for "nothing here yet": icon in a tinted circle, title,

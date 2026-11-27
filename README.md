@@ -10,7 +10,7 @@ chat from a web UI. It is a single binary with the UI built in, written in Rust.
 
 <table>
   <tr>
-    <td><img src="docs/screenshots/uploads.png" alt="Uploads grouped by user and folder, dark theme"></td>
+    <td><img src="docs/screenshots/uploads.png" alt="Uploads grouped by user and folder"></td>
     <td><img src="docs/screenshots/settings.png" alt="Settings page with the Soulseek account section"></td>
   </tr>
 </table>

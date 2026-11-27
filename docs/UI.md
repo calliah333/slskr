@@ -86,7 +86,9 @@ monitor). Read the resolved state with `expect_context::<ui::theme::Theme>().dar
 ### Page pattern
 
 Pages render inside `<main class="container app-main">`. A page is a `stack` of a page
-header and cards:
+header and cards. The header's title is for screen readers only (`.sr-only`), because the
+selected nav tab already names the page; Settings, which has no tab, shows it
+(`show_title=true`).
 
 ```rust
 view! {
@@ -103,7 +105,7 @@ view! {
 ```html
 <div class="page-header">
   <div>
-    <h1 class="page-header__title">Downloads</h1>
+    <h1 class="page-header__title sr-only">Downloads</h1>
     <p class="page-header__description">Files you are downloading.</p>
   </div>
   <div class="page-header__actions"><button class="btn">…</button></div>
@@ -374,7 +376,7 @@ All take an extra `class` where it makes sense. Optional props can be left out.
 | `Icon` | `name`, `size` ("xs".."2xl"), `spin: Signal<bool>`, `class`, `label` (makes it an `img`) | `<svg class="icon">` |
 | `Button` | `variant` ("primary", "secondary", "ghost", "destructive", "danger-outline", "link", "action"), `size` ("xs", "sm", "lg"), `icon`, `text` or children, `label` (aria-label + title; required for icon-only), `disabled`, `loading`, `pressed`, `block`, `button_type`, `href`, `on_click` | `<button class="btn …">` or `<a>` |
 | `Card` | `title`, `description`, `actions: ViewFn`, `footer: ViewFn`, `flush`, `compact`, `heading` ("h2"/"h3"), `title_id`, `id`, children | `.card` |
-| `PageHeader` | `title`, `description`, `actions: ViewFn` | `.page-header` |
+| `PageHeader` | `title` (screen readers only unless `show_title`), `description`, `actions: ViewFn` | `.page-header` |
 | `EmptyState` | `icon`, `title`, `description`, `dashed`, children (actions) | `.empty-state` |
 | `Stat` | `label`, `value: Signal<String>`, `hint`, `large`, children | `.stat` |
 | `Badge` | `variant`, `icon`, `text` or children, `title` | `.badge` |

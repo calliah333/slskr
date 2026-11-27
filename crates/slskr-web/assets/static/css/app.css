@@ -427,6 +427,15 @@ summary { cursor: pointer; }
 .page-header__title { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
 .page-header__description { margin-top: var(--space-1); color: hsl(var(--muted-foreground)); }
 .page-header__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+/* Nothing visible (the title is for screen readers and the actions are empty): take no space. */
+.page-header:not(:has(.page-header__title:not(.sr-only), .page-header__description)):not(:has(.page-header__actions:not(:empty))) {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
 .section-title { font-size: 0.875rem; font-weight: 600; margin-bottom: var(--space-2); }
 
 /* ---------- form controls ---------- */

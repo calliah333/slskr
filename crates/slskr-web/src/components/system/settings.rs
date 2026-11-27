@@ -300,7 +300,7 @@ pub fn SettingsPage() -> impl IntoView {
     let base = crate::config::url_base().trim_end_matches('/').to_owned();
     view! {
         <div class="settings">
-            <PageHeader title="Settings"/>
+            <PageHeader title="Settings" show_title=true/>
             <PendingRestart/>
             {move || form.top_error.get().map(|message| view! {
                 <FormMessage kind="danger" role="alert" title="Could not save the settings"><p>{message}</p></FormMessage>
