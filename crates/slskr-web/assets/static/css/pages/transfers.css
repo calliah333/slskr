@@ -69,7 +69,8 @@
 .transfer-table { min-width: 56rem; table-layout: fixed; }
 .transfer-table .check-col { width: 2.5rem; }
 .transfer-table__name { width: auto; }
-.transfer-table__size { width: 8.5rem; }
+/* Left-aligned like the columns beside it; tabular figures keep sizes readable. */
+.transfer-table .transfer-table__size { width: 8.5rem; text-align: left; }
 .transfer-table__progress { width: 13rem; }
 .transfer-table__status { width: 10rem; }
 .transfer-table th.actions,
@@ -82,7 +83,7 @@
 .transfer-dir__row,
 .table tbody tr.transfer-dir__row:hover { background: hsl(var(--secondary) / 0.4); }
 .transfer-dir__row > td { padding-top: 0.375rem; padding-bottom: 0.375rem; }
-.transfer-dir__row > td[colspan] { padding-inline-start: calc(var(--space-3) + var(--transfer-indent, 0ch)); }
+.transfer-dir__row > td.transfer-dir__cell { padding-inline-start: calc(var(--space-3) + var(--transfer-indent, 0ch)); }
 .transfer-dir__toggle {
   display: flex;
   align-items: center;
@@ -105,7 +106,7 @@
 .transfer-dir__name { flex: 0 1 auto; min-width: 2rem; overflow: hidden; text-overflow: ellipsis; }
 .transfer-dir__parent:empty { display: none; }
 .transfer-dir__icon { color: hsl(var(--warning)); flex-shrink: 0; }
-.transfer-dir__count { margin-left: auto; flex-shrink: 0; font-weight: 400; }
+.transfer-dir__count { font-size: 0.8125rem; font-weight: 400; }
 .transfer-dir__status { gap: var(--space-1); }
 
 /* File rows. */

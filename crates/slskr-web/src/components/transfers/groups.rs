@@ -464,7 +464,7 @@ fn TransferDirectory(
                 <td class="check-col">
                     <SelectAll ids selected=page.selected label=format!("Select all transfers in {short}")/>
                 </td>
-                <td colspan="3">
+                <td class="transfer-dir__cell">
                     <button type="button" class="transfer-dir__toggle"
                         aria-expanded=move || (!folded.get()).to_string()
                         on:click=move |_| dir.with_value(|dir| toggled_folders.update(|toggled| {
@@ -476,13 +476,20 @@ fn TransferDirectory(
                             <span class="transfer-dir__parent">{lead}</span>
                             <span class="transfer-dir__name">{name}</span>
                         </span>
-                        <span class="transfer-dir__count muted text-xs tabular">
-                            {move || dir.with_value(|dir| folders.with(|folders| {
-                                let (n, bytes) = folders.get(dir).map_or((0, 0), |folder| (folder.count, folder.counts.bytes));
-                                format!("{n} {} · {}", if n == 1 { "file" } else { "files" }, util::format_bytes(bytes as f64))
-                            }))}
-                        </span>
                     </button>
+                </td>
+                // Same columns as the file rows: the folder's total under Size, its file
+                // count under Progress.
+                <td class="num transfer-table__size transfer-dir__count muted tabular">
+                    {move || dir.with_value(|dir| folders.with(|folders| {
+                        util::format_bytes(folders.get(dir).map_or(0, |folder| folder.counts.bytes) as f64)
+                    }))}
+                </td>
+                <td class="transfer-table__progress transfer-dir__count muted">
+                    {move || dir.with_value(|dir| folders.with(|folders| {
+                        let n = folders.get(dir).map_or(0, |folder| folder.count);
+                        format!("{n} {}", if n == 1 { "file" } else { "files" })
+                    }))}
                 </td>
                 <td class="transfer-table__status">
                     {move || dir.with_value(|dir| folders.with(|folders| {
