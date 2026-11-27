@@ -114,28 +114,24 @@ pub fn Events() -> impl IntoView {
         });
     });
 
+    let count = move || events.with(|e| e.as_ref().map_or(0, Vec::len));
     let range = move || {
-        let count = events.with(|e| e.as_ref().map_or(0, Vec::len));
         let start = page.get() * PAGE_SIZE;
-        if count == 0 {
-            format!("Page {}", page.get() + 1)
-        } else {
-            format!("{}–{}", start + 1, start + count)
-        }
+        (count() > 0).then(|| format!("{}–{}", start + 1, start + count()))
     };
+    // Paging only when there is more than one page.
+    let paged = move || page.get() > 0 || has_next.get();
 
     view! {
-        <Card title="Event history" flush=true class="events-card"
-            actions=ViewFn::from(move || view! {
+        <Card flush=true class="events-card"
+            footer=ViewFn::from(move || view! {
                 <button type="button" class="btn btn--sm btn--icon" aria-label="Refresh events" title="Refresh"
                     disabled=move || loading.get() on:click=move |_| revision.update(|r| *r += 1)>
                     <Icon name="refresh-cw" spin=Signal::derive(move || loading.get())/>
                 </button>
-            })
-            footer=ViewFn::from(move || view! {
                 <span class="muted text-sm tabular events-range">{range}</span>
                 {move || loading.get().then(|| view! { <span class="spinner muted" role="status" aria-label="Loading"></span> })}
-                <div class="btn-group ml-auto">
+                <div class="btn-group ml-auto" hidden=move || !paged()>
                     <button type="button" class="btn btn--sm events-prev"
                         disabled=move || page.get() == 0 || loading.get()
                         on:click=move |_| page.update(|p| *p = p.saturating_sub(1))>

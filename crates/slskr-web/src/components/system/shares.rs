@@ -6,7 +6,7 @@ use slskr_types::{application::ShareState, shares::Share};
 use crate::{
     components::app::AppContext,
     config,
-    services::api,
+    services::{api, util},
     ui::{Alert, Badge, Card, EmptyState, Icon, Progress, Stat},
 };
 
@@ -18,7 +18,7 @@ fn scan_status(scan: &ShareState) -> (&'static str, String) {
             if scan.scan_files == 0 {
                 "Scanning…".to_owned()
             } else {
-                format!("Scanning · {} files", scan.scan_files)
+                format!("Scanning · {} files", util::group_digits(scan.scan_files))
             },
         )
     } else if scan.faulted {
@@ -102,8 +102,8 @@ pub fn Shares() -> impl IntoView {
         <div class="system-shares stack">
             <div class="stats live-stats">
                 <Stat label="Shares" value=Signal::derive(move || shared.get().to_string())/>
-                <Stat label="Folders" value=Signal::derive(move || scan.with(|s| s.directories.to_string()))/>
-                <Stat label="Files" value=Signal::derive(move || scan.with(|s| s.files.to_string()))/>
+                <Stat label="Folders" value=Signal::derive(move || scan.with(|s| util::group_digits(s.directories)))/>
+                <Stat label="Files" value=Signal::derive(move || scan.with(|s| util::group_digits(s.files)))/>
                 <div class="stat">
                     <div class="stat__label">"Scan"</div>
                     <div class="stat__value">

@@ -460,7 +460,6 @@ pub fn Chat() -> impl IntoView {
                         class="messenger__back" on_click=Callback::new(move |_| show_buffer.set(false))/>
                     <Show when=move || has_target.get() fallback=|| view! {
                         <h2 class="topic__name">"Chat"</h2>
-                        <span class="topic__text"><span class="truncate">"Private messages \u{b7} type /query nick to start"</span></span>
                     }>
                         <h2 class="topic__name">
                             <span class=move || format!("truncate {}", buffer::nick_color(&target.get()))>{move || target.get()}</span>

@@ -15,7 +15,7 @@ use crate::{
     services::{
         api,
         events::{Event, Topic, use_events},
-        util::{download_file, encode_uri_component, format_bytes},
+        util::{self, download_file, encode_uri_component, format_bytes},
     },
     ui::{Alert, Card, EmptyState, Icon, Modal},
 };
@@ -311,9 +311,9 @@ fn LiveLog() -> impl IntoView {
                     let shown = visible.with(Vec::len);
                     let total = lines.with(Vec::len);
                     if shown == total {
-                        format!("{total} records (up to {MAX_LINES} are kept)")
+                        format!("{} records", util::group_digits(total))
                     } else {
-                        format!("{shown} of {total} records shown")
+                        format!("{} of {} records", util::group_digits(shown), util::group_digits(total))
                     }
                 }}
             </div>

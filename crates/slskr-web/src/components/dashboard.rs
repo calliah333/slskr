@@ -499,14 +499,14 @@ fn LiveStats() -> impl IntoView {
                     {hint(|m| active(m.downloads.in_progress.files, m.downloads.in_progress.users))}
                     <Sparkline values=spark(false) class="series-download"/>
                 }.into_any())}
-            {tile("Queued downloads", "clock", false, |m| m.downloads.queued.files.to_string(),
+            {tile("Queued downloads", "clock", false, |m| util::group_digits(m.downloads.queued.files),
                 hint(|m| format!("{} · {}", pretty_bytes(m.downloads.queued.bytes), plural(m.downloads.queued.users, "user", "users"))))}
             {tile("Uploading", "upload", true, |m| format_speed(m.uploads.in_progress.total_speed),
                 view! {
                     {hint(|m| active(m.uploads.in_progress.files, m.uploads.in_progress.users))}
                     <Sparkline values=spark(true) class="series-upload"/>
                 }.into_any())}
-            {tile("Queued uploads", "clock", true, |m| m.uploads.queued.files.to_string(),
+            {tile("Queued uploads", "clock", true, |m| util::group_digits(m.uploads.queued.files),
                 hint(|m| format!("{} · {}", pretty_bytes(m.uploads.queued.bytes), plural(m.uploads.queued.users, "user", "users"))))}
         </section>
     }
@@ -543,7 +543,7 @@ fn leaderboard_view(
                                             view! {
                                                 <tr>
                                                     <td class="report__user"><A href=href attr:class="truncate">{username}</A></td>
-                                                    <td class="num">{row.count}</td>
+                                                    <td class="num">{util::group_digits(row.count)}</td>
                                                     <td class="num">{pretty_bytes(row.total_bytes)}</td>
                                                     <td class="num">{util::format_speed(row.average_speed)}</td>
                                                 </tr>
@@ -585,8 +585,8 @@ fn directories_view(directories: Slot<Vec<TransferDirectorySummary>>) -> impl In
                                         <tr>
                                             <td class="num muted">{index + 1}</td>
                                             <td class="report__path"><span class="mono truncate" title=path>{label}</span></td>
-                                            <td class="num">{row.count}</td>
-                                            <td class="num">{row.distinct_users}</td>
+                                            <td class="num">{util::group_digits(row.count)}</td>
+                                            <td class="num">{util::group_digits(row.distinct_users)}</td>
                                         </tr>
                                     }
                                 }).collect_view().into_any()
@@ -667,8 +667,8 @@ fn errors_view(data: Reports) -> impl IntoView {
                                             view! {
                                                 <tr>
                                                     <td class="report__error"><span class="truncate" title=error.clone()>{util::truncate(&error, 160)}</span></td>
-                                                    <td class="num">{row.count}</td>
-                                                    <td class="num">{row.distinct_users}</td>
+                                                    <td class="num">{util::group_digits(row.count)}</td>
+                                                    <td class="num">{util::group_digits(row.distinct_users)}</td>
                                                 </tr>
                                             }
                                         }).collect_view().into_any()

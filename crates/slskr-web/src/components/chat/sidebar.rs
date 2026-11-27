@@ -53,7 +53,7 @@ pub(crate) fn BufferList(
                 <Show when=move || rooms_loaded.get() fallback=|| view! { <p class="buffers__empty">"Loading\u{2026}"</p> }>
                     <Show when=move || !rooms.with(Vec::is_empty) fallback=move || view! {
                         <button type="button" class="buffers__empty buffers__empty--action" on:click=move |_| on_join.run(())>
-                            "No rooms joined. Join one\u{2026}"
+                            "No rooms joined"
                         </button>
                     }>
                         <ul class="buffers__list room-menu" role="list">
@@ -96,7 +96,7 @@ pub(crate) fn BufferList(
                 <Show when=move || queries_loaded.get() fallback=|| view! { <p class="buffers__empty">"Loading\u{2026}"</p> }>
                     <Show when=move || !queries.with(Vec::is_empty) fallback=move || view! {
                         <button type="button" class="buffers__empty buffers__empty--action" on:click=move |_| on_new.run(())>
-                            "No conversations. Message someone\u{2026}"
+                            "No conversations"
                         </button>
                     }>
                         <ul class="buffers__list conversation-menu" role="list">
